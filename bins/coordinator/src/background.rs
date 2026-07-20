@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use anyhow::Result;
 use chrono::Utc;
-use scheduler_core::{ExecutionAssignment, ExecutionOutcome, ExecutionResult, ExecutionSnapshot};
+use scheduler_core::{
+    ExecutionAssignment, ExecutionOutcome, ExecutionResult, ExecutionSnapshot, FailureCode,
+    FailureDiagnostic, FailureOrigin, FailureStage, OutputMetadata,
+};
 use scheduler_protocol::control::{
     Assignment, CancelAttempt, CoordinatorMessage, coordinator_message,
 };
@@ -106,6 +109,14 @@ async fn expire_leases(state: &AppState) -> Result<()> {
             started_at: now,
             finished_at: now,
             error: Some("agent stopped renewing the execution lease".into()),
+            output: OutputMetadata::default(),
+            diagnostic: Some(FailureDiagnostic::new(
+                FailureCode::AgentLeaseExpired,
+                FailureOrigin::Agent,
+                FailureStage::Lease,
+                "agent disconnected or stopped renewing the execution lease",
+                true,
+            )),
         };
         let encrypted = state.cipher.encrypt(&serde_json::to_vec(&result)?)?;
         let expired = state
@@ -113,6 +124,7 @@ async fn expire_leases(state: &AppState) -> Result<()> {
             .finish_expired_attempt(
                 attempt.id,
                 &attempt.lease_token,
+                &result,
                 encrypted,
                 state.cipher.key_id(),
             )

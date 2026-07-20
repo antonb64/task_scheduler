@@ -218,16 +218,29 @@ async fn main() -> Result<()> {
                 .await?
             }
             RunCommand::Show { id } => {
-                request(
-                    &client,
-                    &cli.url,
-                    &token,
-                    Method::GET,
-                    &format!("/api/v1/runs/{id}"),
-                    None,
-                    None,
-                )
-                .await?
+                let run_path = format!("/api/v1/runs/{id}");
+                let attempts_path = format!("/api/v1/runs/{id}/attempts");
+                let (run, attempts) = tokio::try_join!(
+                    request(
+                        &client,
+                        &cli.url,
+                        &token,
+                        Method::GET,
+                        &run_path,
+                        None,
+                        None,
+                    ),
+                    request(
+                        &client,
+                        &cli.url,
+                        &token,
+                        Method::GET,
+                        &attempts_path,
+                        None,
+                        None,
+                    )
+                )?;
+                serde_json::json!({"run": run, "attempts": attempts})
             }
             RunCommand::Cancel { id } => {
                 request(

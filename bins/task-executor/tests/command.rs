@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, process::Stdio};
 
 use scheduler_core::{
     CommandSpec, ExecutionAssignment, ExecutionOutcome, ExecutionPolicy, ExecutionSnapshot,
-    ExecutorSpec,
+    ExecutorSpec, FailureCode, FailureOrigin, FailureStage,
 };
 use tokio::{io::AsyncWriteExt, process::Command};
 use uuid::Uuid;
@@ -63,6 +63,8 @@ async fn command_output_and_success_are_reported() {
     assert_eq!(result.outcome, ExecutionOutcome::Succeeded);
     assert_eq!(result.exit_code, Some(0));
     assert_eq!(result.stdout, "hello\n");
+    assert!(result.diagnostic.is_none());
+    assert_eq!(result.output.stdout_bytes, 6);
 }
 
 #[tokio::test]
@@ -100,6 +102,10 @@ async fn completed_command_exits_while_agent_control_pipe_remains_open() {
 async fn missing_keepalive_expires_the_process_tree() {
     let result = execute(assignment("/bin/sleep", vec!["5".into()], 1)).await;
     assert_eq!(result.outcome, ExecutionOutcome::LeaseExpired);
+    assert_eq!(
+        result.diagnostic.expect("diagnostic").code,
+        FailureCode::AgentLeaseExpired
+    );
 }
 
 #[tokio::test]
@@ -107,6 +113,41 @@ async fn nonzero_exit_is_a_task_failure() {
     let result = execute(assignment("false", Vec::new(), 10)).await;
     assert_eq!(result.outcome, ExecutionOutcome::Failed);
     assert_eq!(result.exit_code, Some(1));
+    let diagnostic = result.diagnostic.expect("diagnostic");
+    assert_eq!(diagnostic.code, FailureCode::ProcessExitedNonZero);
+    assert_eq!(diagnostic.origin, FailureOrigin::CommandProcess);
+    assert_eq!(diagnostic.stage, FailureStage::Execution);
+    assert_eq!(diagnostic.status.expect("status").status_code, Some(1));
+}
+
+#[tokio::test]
+async fn signal_crash_is_distinguished_from_a_nonzero_exit() {
+    let result = execute(assignment(
+        "/bin/sh",
+        vec!["-c".into(), "kill -SEGV $$".into()],
+        10,
+    ))
+    .await;
+    assert_eq!(result.outcome, ExecutionOutcome::InfrastructureError);
+    assert_eq!(result.exit_code, None);
+    let diagnostic = result.diagnostic.expect("diagnostic");
+    assert_eq!(diagnostic.code, FailureCode::ProcessCrashed);
+    assert_eq!(diagnostic.origin, FailureOrigin::CommandProcess);
+    assert!(diagnostic.status.expect("status").signal.is_some());
+}
+
+#[tokio::test]
+async fn missing_program_reports_the_process_start_stage() {
+    let result = execute(assignment(
+        "/definitely/not/a/scheduler-command",
+        Vec::new(),
+        10,
+    ))
+    .await;
+    assert_eq!(result.outcome, ExecutionOutcome::InfrastructureError);
+    let diagnostic = result.diagnostic.expect("diagnostic");
+    assert_eq!(diagnostic.code, FailureCode::ProcessSpawnFailed);
+    assert_eq!(diagnostic.stage, FailureStage::ProcessStart);
 }
 
 #[tokio::test]
@@ -115,6 +156,10 @@ async fn configured_timeout_terminates_the_command() {
     task.snapshot.policy.timeout_seconds = 1;
     let result = execute(task).await;
     assert_eq!(result.outcome, ExecutionOutcome::TimedOut);
+    assert_eq!(
+        result.diagnostic.expect("diagnostic").code,
+        FailureCode::ProcessTimedOut
+    );
 }
 
 #[tokio::test]
@@ -142,6 +187,10 @@ async fn cancellation_terminates_the_command() {
     let result: scheduler_core::ExecutionResult =
         serde_json::from_slice(&output.stdout).expect("result");
     assert_eq!(result.outcome, ExecutionOutcome::Cancelled);
+    assert_eq!(
+        result.diagnostic.expect("diagnostic").code,
+        FailureCode::Cancelled
+    );
 }
 
 #[tokio::test]
@@ -151,6 +200,7 @@ async fn noisy_output_is_bounded_and_marked_as_truncated() {
     let result = execute(task).await;
     assert_eq!(result.outcome, ExecutionOutcome::TimedOut);
     assert!(result.stdout.len() <= 1_048_576);
+    assert!(result.output.stdout_truncated);
     assert!(
         result
             .error

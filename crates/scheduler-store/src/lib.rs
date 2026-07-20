@@ -5,7 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use rand::Rng;
 use scheduler_core::{
-    AgentView, GlobalSettings, NodeSettings, RunState, RunView, ScheduleSpec, ScheduleView,
+    AgentView, ExecutionResult, FailureDiagnostic, GlobalSettings, NodeSettings, OutputMetadata,
+    RunState, RunView, ScheduleSpec, ScheduleView,
 };
 use serde_json::Value;
 use sqlx::{
@@ -74,6 +75,24 @@ pub struct AttemptRecord {
     pub attempt_number: u32,
     pub lease_token: String,
     pub lease_expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AttemptView {
+    pub id: Uuid,
+    pub run_id: Uuid,
+    pub agent_id: String,
+    pub attempt_number: u32,
+    pub state: String,
+    pub outcome: Option<String>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub diagnostic: Option<FailureDiagnostic>,
+    pub output: Option<OutputMetadata>,
+    pub accepted_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -430,6 +449,14 @@ impl Store {
         row.map(run_view_from_row).transpose()
     }
 
+    pub async fn run_attempts(&self, run_id: Uuid) -> Result<Vec<AttemptView>> {
+        let rows = sqlx::query("SELECT id,run_id,agent_id,attempt_number,state,outcome,exit_code,signal,duration_ms,diagnostic_json,output_metadata_json,accepted_at,finished_at,created_at FROM attempts WHERE run_id=? ORDER BY attempt_number")
+            .bind(run_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(attempt_view_from_row).collect()
+    }
+
     pub async fn get_run_record(&self, id: Uuid) -> Result<Option<RunRecord>> {
         let row = sqlx::query("SELECT id,schedule_id,state,trigger_kind,scheduled_at,attempt_count,created_at,updated_at,encrypted_snapshot,key_id,max_attempts,initial_backoff_seconds,backoff_cap_seconds,not_before FROM runs WHERE id=?")
             .bind(id.to_string())
@@ -593,14 +620,14 @@ impl Store {
         &self,
         attempt_id: Uuid,
         lease_token: &str,
-        outcome: &str,
+        result: &ExecutionResult,
         encrypted_result: Vec<u8>,
         key_id: &str,
     ) -> Result<RunState> {
         self.finish_attempt_inner(
             attempt_id,
             lease_token,
-            outcome,
+            result,
             encrypted_result,
             key_id,
             false,
@@ -614,13 +641,14 @@ impl Store {
         &self,
         attempt_id: Uuid,
         lease_token: &str,
+        result: &ExecutionResult,
         encrypted_result: Vec<u8>,
         key_id: &str,
     ) -> Result<Option<RunState>> {
         self.finish_attempt_inner(
             attempt_id,
             lease_token,
-            "lease_expired",
+            result,
             encrypted_result,
             key_id,
             true,
@@ -632,12 +660,22 @@ impl Store {
         &self,
         attempt_id: Uuid,
         lease_token: &str,
-        outcome: &str,
+        result: &ExecutionResult,
         encrypted_result: Vec<u8>,
         key_id: &str,
         require_expired_lease: bool,
     ) -> Result<Option<RunState>> {
         let now = Utc::now();
+        let outcome = result.outcome.as_str();
+        let diagnostic_json = result
+            .diagnostic
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        let output_metadata_json = serde_json::to_string(&result.output)?;
+        let duration_ms = (result.finished_at - result.started_at)
+            .num_milliseconds()
+            .max(0) as u64;
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT a.run_id,a.state AS attempt_state,r.attempt_count,r.max_attempts,r.initial_backoff_seconds,r.backoff_cap_seconds,r.state AS run_state FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.lease_token=?")
             .bind(attempt_id.to_string()).bind(lease_token).fetch_optional(&mut *tx).await?;
@@ -662,21 +700,21 @@ impl Store {
             return parse_state(&current_state).map(Some);
         }
         if current_state == "cancelled" {
-            sqlx::query("UPDATE attempts SET state='late_result',outcome=?,encrypted_result=?,result_key_id=?,finished_at=?,updated_at=? WHERE id=?")
-                .bind(outcome).bind(encrypted_result).bind(key_id).bind(format_time(now)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
+            sqlx::query("UPDATE attempts SET state='late_result',outcome=?,encrypted_result=?,result_key_id=?,diagnostic_json=?,output_metadata_json=?,exit_code=?,signal=?,duration_ms=?,started_at=?,finished_at=?,updated_at=? WHERE id=?")
+                .bind(outcome).bind(encrypted_result).bind(key_id).bind(&diagnostic_json).bind(&output_metadata_json).bind(result.exit_code).bind(&result.signal).bind(duration_ms as i64).bind(format_time(result.started_at)).bind(format_time(result.finished_at)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
             append_audit_tx(
                 &mut tx,
                 "run",
                 &run_id,
                 "attempt.late_result",
-                serde_json::json!({"attempt_id": attempt_id, "outcome": outcome}),
+                serde_json::json!({"attempt_id": attempt_id, "outcome": outcome, "diagnostic": result.diagnostic, "exit_code": result.exit_code, "signal": result.signal, "duration_ms": duration_ms}),
             )
             .await?;
             tx.commit().await?;
             return Ok(Some(RunState::Cancelled));
         }
-        sqlx::query("UPDATE attempts SET state='finished',outcome=?,encrypted_result=?,result_key_id=?,finished_at=?,updated_at=? WHERE id=?")
-            .bind(outcome).bind(encrypted_result).bind(key_id).bind(format_time(now)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("UPDATE attempts SET state='finished',outcome=?,encrypted_result=?,result_key_id=?,diagnostic_json=?,output_metadata_json=?,exit_code=?,signal=?,duration_ms=?,started_at=?,finished_at=?,updated_at=? WHERE id=?")
+            .bind(outcome).bind(encrypted_result).bind(key_id).bind(&diagnostic_json).bind(&output_metadata_json).bind(result.exit_code).bind(&result.signal).bind(duration_ms as i64).bind(format_time(result.started_at)).bind(format_time(result.finished_at)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
         let successful = outcome == "succeeded";
         let attempt_count = row.get::<i64, _>("attempt_count") as u32;
         let max_attempts = row.get::<i64, _>("max_attempts") as u32;
@@ -711,7 +749,7 @@ impl Store {
             } else {
                 "run.failed"
             },
-            serde_json::json!({"attempt_id": attempt_id, "outcome": outcome}),
+            serde_json::json!({"attempt_id": attempt_id, "outcome": outcome, "diagnostic": result.diagnostic, "exit_code": result.exit_code, "signal": result.signal, "duration_ms": duration_ms}),
         )
         .await?;
         tx.commit().await?;
@@ -1135,6 +1173,43 @@ fn attempt_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AttemptRecord> {
     })
 }
 
+fn attempt_view_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AttemptView> {
+    let diagnostic = row
+        .get::<Option<String>, _>("diagnostic_json")
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?;
+    let output = row
+        .get::<Option<String>, _>("output_metadata_json")
+        .map(|json| serde_json::from_str(&json))
+        .transpose()?;
+    let accepted_at = row
+        .get::<Option<String>, _>("accepted_at")
+        .map(parse_time)
+        .transpose()?;
+    let finished_at = row
+        .get::<Option<String>, _>("finished_at")
+        .map(parse_time)
+        .transpose()?;
+    Ok(AttemptView {
+        id: Uuid::parse_str(row.get::<String, _>("id").as_str())?,
+        run_id: Uuid::parse_str(row.get::<String, _>("run_id").as_str())?,
+        agent_id: row.get("agent_id"),
+        attempt_number: row.get::<i64, _>("attempt_number") as u32,
+        state: row.get("state"),
+        outcome: row.get("outcome"),
+        exit_code: row.get("exit_code"),
+        signal: row.get("signal"),
+        duration_ms: row
+            .get::<Option<i64>, _>("duration_ms")
+            .map(|value| value.max(0) as u64),
+        diagnostic,
+        output,
+        accepted_at,
+        finished_at,
+        created_at: parse_time(row.get("created_at"))?,
+    })
+}
+
 fn agent_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AgentView> {
     Ok(AgentView {
         id: row.get("id"),
@@ -1210,6 +1285,26 @@ mod tests {
             cron: None,
             webhook_enabled: false,
             enabled: true,
+        }
+    }
+
+    fn completion(outcome: scheduler_core::ExecutionOutcome) -> ExecutionResult {
+        let now = Utc::now();
+        ExecutionResult {
+            outcome,
+            exit_code: if outcome == scheduler_core::ExecutionOutcome::Succeeded {
+                Some(0)
+            } else {
+                Some(1)
+            },
+            signal: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            started_at: now,
+            finished_at: now,
+            error: None,
+            output: OutputMetadata::default(),
+            diagnostic: None,
         }
     }
 
@@ -1334,16 +1429,79 @@ mod tests {
             .accept_attempt(attempt.id, &attempt.lease_token, 60)
             .await
             .expect("accept");
+        let success = completion(scheduler_core::ExecutionOutcome::Succeeded);
         let first = store
-            .finish_attempt(attempt.id, &attempt.lease_token, "succeeded", vec![4], "v1")
+            .finish_attempt(attempt.id, &attempt.lease_token, &success, vec![4], "v1")
             .await
             .expect("finish");
         let second = store
-            .finish_attempt(attempt.id, &attempt.lease_token, "succeeded", vec![4], "v1")
+            .finish_attempt(attempt.id, &attempt.lease_token, &success, vec![4], "v1")
             .await
             .expect("duplicate");
         assert_eq!(first, RunState::Succeeded);
         assert_eq!(second, RunState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn attempt_diagnostics_are_queryable_without_decrypting_task_output() {
+        let (_directory, store) = test_store().await;
+        let (_, run_id) = schedule_and_run(&store).await;
+        let attempt = store
+            .create_attempt(run_id, "node-a", 60)
+            .await
+            .expect("attempt")
+            .expect("present");
+        store
+            .accept_attempt(attempt.id, &attempt.lease_token, 60)
+            .await
+            .expect("accept");
+        let mut result = completion(scheduler_core::ExecutionOutcome::InfrastructureError);
+        result.exit_code = None;
+        result.signal = Some("11".into());
+        result.output = OutputMetadata {
+            stdout_bytes: 12,
+            stderr_bytes: 34,
+            stdout_truncated: false,
+            stderr_truncated: true,
+        };
+        result.diagnostic = Some(FailureDiagnostic::new(
+            scheduler_core::FailureCode::ProcessCrashed,
+            scheduler_core::FailureOrigin::CommandProcess,
+            scheduler_core::FailureStage::Execution,
+            "command process crashed or was terminated by the operating system",
+            true,
+        ));
+        store
+            .finish_attempt(attempt.id, &attempt.lease_token, &result, vec![9], "v1")
+            .await
+            .expect("finish");
+
+        let attempts = store.run_attempts(run_id).await.expect("attempt views");
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].signal.as_deref(), Some("11"));
+        assert_eq!(
+            attempts[0].diagnostic.as_ref().expect("diagnostic").code,
+            scheduler_core::FailureCode::ProcessCrashed
+        );
+        assert!(
+            attempts[0]
+                .output
+                .as_ref()
+                .expect("output")
+                .stderr_truncated
+        );
+        let events = store
+            .audit_events("run", &run_id.to_string(), 20)
+            .await
+            .expect("events");
+        let finished = events
+            .iter()
+            .find(|event| event["event_type"] == "run.retry_scheduled")
+            .expect("retry event");
+        assert_eq!(
+            finished["metadata"]["diagnostic"]["code"],
+            "process_crashed"
+        );
     }
 
     #[tokio::test]
@@ -1444,7 +1602,13 @@ mod tests {
             .expect("expired offers");
         assert!(expired.iter().any(|attempt| attempt.id == offer.id));
         let state = store
-            .finish_expired_attempt(offer.id, &offer.lease_token, vec![3], "v1")
+            .finish_expired_attempt(
+                offer.id,
+                &offer.lease_token,
+                &completion(scheduler_core::ExecutionOutcome::LeaseExpired),
+                vec![3],
+                "v1",
+            )
             .await
             .expect("expire")
             .expect("still expired");
@@ -1503,7 +1667,13 @@ mod tests {
                 .await
                 .expect("accept");
             store
-                .finish_attempt(attempt.id, &attempt.lease_token, "failed", vec![4], "v1")
+                .finish_attempt(
+                    attempt.id,
+                    &attempt.lease_token,
+                    &completion(scheduler_core::ExecutionOutcome::Failed),
+                    vec![4],
+                    "v1",
+                )
                 .await
                 .expect("finish");
         }
@@ -1538,7 +1708,13 @@ mod tests {
             1
         );
         let state = store
-            .finish_attempt(next.id, &next.lease_token, "failed", vec![4], "v1")
+            .finish_attempt(
+                next.id,
+                &next.lease_token,
+                &completion(scheduler_core::ExecutionOutcome::Failed),
+                vec![4],
+                "v1",
+            )
             .await
             .expect("finish");
         assert_eq!(state, RunState::Queued);

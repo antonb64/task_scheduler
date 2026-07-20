@@ -21,9 +21,15 @@ Manual trigger requests may include `Idempotency-Key`.
 ## Runs and nodes
 
 - `GET /api/v1/runs?limit=100`
-- `GET /api/v1/runs/{id}` and `/events`
+- `GET /api/v1/runs/{id}`, `/attempts`, and `/events`
 - `POST /api/v1/runs/{id}/cancel|retry`
 - `GET /api/v1/agents`
+
+`/attempts` returns each attempt's node, outcome, duration, exit code, signal, safe output sizes/truncation flags, and structured diagnostic. Diagnostics have a stable `code`, `origin`, `stage`, operator-safe `summary`, `retryable` flag, and optional status details such as hexadecimal process status and Excel HRESULT. Raw stdout, stderr, exception messages, parameters, and environment values are not returned.
+
+`taskctl runs show <run-id>` combines the run and its attempt diagnostics.
+
+API errors use the envelope `{"error":"message","code":"stable_code","status":400}`. The HTTP response carries the same status number. Parameter schema failures use `422`; missing/stale settings preconditions use `428`/`412`.
 
 ## Settings locks
 

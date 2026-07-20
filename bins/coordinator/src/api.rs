@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/v1/runs", get(list_runs))
         .route("/api/v1/runs/{id}", get(get_run))
+        .route("/api/v1/runs/{id}/attempts", get(run_attempts))
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/retry", post(retry_run))
@@ -358,6 +359,20 @@ async fn run_events(
             .store
             .audit_events("run", &id.to_string(), 500)
             .await?,
+    )?))
+}
+
+async fn run_attempts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    if state.store.get_run(id).await?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    Ok(Json(serde_json::to_value(
+        state.store.run_attempts(id).await?,
     )?))
 }
 
@@ -686,6 +701,7 @@ fn new_secret() -> String {
 #[derive(Debug)]
 pub struct ApiError {
     status: StatusCode,
+    code: &'static str,
     message: String,
 }
 
@@ -693,6 +709,7 @@ impl ApiError {
     fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
+            code: "authentication_required",
             message: "authentication required".into(),
         }
     }
@@ -700,6 +717,7 @@ impl ApiError {
     fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
+            code: "resource_not_found",
             message: "resource not found".into(),
         }
     }
@@ -707,6 +725,7 @@ impl ApiError {
     fn precondition_required(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_REQUIRED,
+            code: "precondition_required",
             message: message.into(),
         }
     }
@@ -714,6 +733,7 @@ impl ApiError {
     fn precondition_failed(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
+            code: "precondition_failed",
             message: message.into(),
         }
     }
@@ -726,14 +746,26 @@ where
     fn from(error: E) -> Self {
         let error = error.into();
         let message = format!("{error:#}");
-        let status = if message.contains("conflict") || message.contains("currently being edited") {
-            StatusCode::CONFLICT
-        } else if message.contains("not found") {
-            StatusCode::NOT_FOUND
-        } else {
-            StatusCode::BAD_REQUEST
-        };
-        Self { status, message }
+        let (status, code) =
+            if message.contains("conflict") || message.contains("currently being edited") {
+                (StatusCode::CONFLICT, "conflict")
+            } else if message.contains("not found") {
+                (StatusCode::NOT_FOUND, "resource_not_found")
+            } else if message.contains("parameters failed validation") {
+                (
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "parameter_validation_failed",
+                )
+            } else if message.contains("artifact") || message.contains("blueprint") {
+                (StatusCode::BAD_REQUEST, "artifact_resolution_failed")
+            } else {
+                (StatusCode::BAD_REQUEST, "invalid_request")
+            };
+        Self {
+            status,
+            code,
+            message,
+        }
     }
 }
 
@@ -741,7 +773,11 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
             self.status,
-            Json(serde_json::json!({"error": self.message})),
+            Json(serde_json::json!({
+                "error": self.message,
+                "code": self.code,
+                "status": self.status.as_u16(),
+            })),
         )
             .into_response()
     }
@@ -783,18 +819,14 @@ mod tests {
     #[test]
     fn settings_updates_require_a_matching_if_match_revision() {
         let mut headers = HeaderMap::new();
-        assert_eq!(
-            require_if_match(&headers, 7)
-                .expect_err("header required")
-                .status,
-            StatusCode::PRECONDITION_REQUIRED
-        );
+        let missing = require_if_match(&headers, 7).expect_err("header required");
+        assert_eq!(missing.status, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(missing.code, "precondition_required");
 
         headers.insert(header::IF_MATCH, "\"7\"".parse().expect("header"));
         require_if_match(&headers, 7).expect("matching revision");
-        assert_eq!(
-            require_if_match(&headers, 8).expect_err("mismatch").status,
-            StatusCode::PRECONDITION_FAILED
-        );
+        let stale = require_if_match(&headers, 8).expect_err("mismatch");
+        assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
+        assert_eq!(stale.code, "precondition_failed");
     }
 }

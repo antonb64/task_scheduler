@@ -137,8 +137,16 @@ impl ArtifactAdapter for HttpAdapter {
             .client
             .get(uri.clone())
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .context("artifact HTTP transport failed")?;
+        let status = response.status();
+        if !status.is_success() {
+            bail!(
+                "artifact HTTP request failed with status {} ({})",
+                status.as_u16(),
+                status.canonical_reason().unwrap_or("unknown status")
+            );
+        }
         let length = response.content_length().unwrap_or(0);
         if length > max_size(kind) {
             bail!("artifact exceeds size limit");
@@ -257,6 +265,37 @@ mod tests {
             .expect("artifact");
         assert_eq!(artifact.bytes, b"{}");
         assert_eq!(artifact.source_version.as_deref(), Some("fixture-v1"));
+        server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn http_adapter_reports_upstream_status_code() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection");
+            let mut request = vec![0; 4096];
+            let _read = stream.read(&mut request).await.expect("request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .expect("response");
+        });
+        let registry =
+            AdapterRegistry::with_defaults(Vec::new(), HashMap::new()).expect("registry");
+
+        let error = registry
+            .fetch(
+                &format!("http://{address}/blueprint.yaml"),
+                ArtifactKind::Blueprint,
+            )
+            .await
+            .expect_err("upstream failure");
+        assert!(error.to_string().contains("status 503"));
         server.await.expect("server");
     }
 }

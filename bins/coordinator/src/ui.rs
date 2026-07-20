@@ -509,11 +509,12 @@ async fn run_detail(
             .store
             .audit_events("run", &id.to_string(), 500)
             .await?;
-        Ok::<_, anyhow::Error>((run, events))
+        let attempts = state.store.run_attempts(id).await?;
+        Ok::<_, anyhow::Error>((run, attempts, events))
     }
     .await;
     match result {
-        Ok((run, events)) => {
+        Ok((run, attempts, events)) => {
             let mut event_rows = String::new();
             for event in events {
                 event_rows.push_str(&format!(
@@ -523,6 +524,101 @@ async fn run_detail(
                     esc(&event["metadata"].to_string())
                 ));
             }
+            let mut attempt_rows = String::new();
+            for attempt in &attempts {
+                let diagnostic = attempt.diagnostic.as_ref();
+                let location = diagnostic
+                    .map(|value| {
+                        format!(
+                            "{} / {}",
+                            json_enum_name(value.origin),
+                            json_enum_name(value.stage)
+                        )
+                    })
+                    .unwrap_or_else(|| "—".into());
+                let code = diagnostic
+                    .map(|value| json_enum_name(value.code))
+                    .unwrap_or_else(|| "—".into());
+                let status = diagnostic
+                    .and_then(|value| value.status.as_ref())
+                    .map(|value| {
+                        let mut parts = Vec::new();
+                        if let Some(exit) = attempt.exit_code {
+                            parts.push(format!("exit={exit}"));
+                        }
+                        if let Some(hex) = &value.status_code_hex {
+                            parts.push(hex.clone());
+                        }
+                        if let Some(signal) = &attempt.signal {
+                            parts.push(format!("signal={signal}"));
+                        }
+                        if let Some(hresult) = &value.hresult_hex {
+                            parts.push(format!("HRESULT={hresult}"));
+                        }
+                        if let Some(pid) = value.process_id {
+                            parts.push(format!("pid={pid}"));
+                        }
+                        if parts.is_empty() {
+                            "—".into()
+                        } else {
+                            parts.join(" · ")
+                        }
+                    })
+                    .unwrap_or_else(|| {
+                        attempt
+                            .exit_code
+                            .map(|code| format!("exit={code}"))
+                            .unwrap_or_else(|| "—".into())
+                    });
+                let output = attempt
+                    .output
+                    .as_ref()
+                    .map(|value| {
+                        format!(
+                            "out={}B{} · err={}B{}",
+                            value.stdout_bytes,
+                            if value.stdout_truncated {
+                                " (truncated)"
+                            } else {
+                                ""
+                            },
+                            value.stderr_bytes,
+                            if value.stderr_truncated {
+                                " (truncated)"
+                            } else {
+                                ""
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| "—".into());
+                attempt_rows.push_str(&format!(
+                    r#"<tr><td>{}</td><td><code>{}</code></td><td>{}</td><td>{}</td><td><code>{}</code></td><td><code>{}</code></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+                    attempt.attempt_number,
+                    esc(&attempt.agent_id),
+                    esc(attempt.outcome.as_deref().unwrap_or(&attempt.state)),
+                    esc(&location),
+                    esc(&code),
+                    esc(&status),
+                    attempt.duration_ms.map(|value| format!("{value} ms")).unwrap_or_else(|| "—".into()),
+                    esc(&output),
+                    esc(diagnostic.map(|value| value.summary.as_str()).unwrap_or("—")),
+                ));
+            }
+            let latest_diagnosis = attempts
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.diagnostic.as_ref())
+                .map(|diagnostic| {
+                    format!(
+                        r#"<div class="notice"><b>Latest diagnosis:</b> <code>{}</code> at <b>{} / {}</b> — {} Retryable: <b>{}</b>.</div>"#,
+                        esc(&json_enum_name(diagnostic.code)),
+                        esc(&json_enum_name(diagnostic.origin)),
+                        esc(&json_enum_name(diagnostic.stage)),
+                        esc(&diagnostic.summary),
+                        if diagnostic.retryable { "yes" } else { "no" },
+                    )
+                })
+                .unwrap_or_default();
             let actions = match run.state {
                 scheduler_core::RunState::Queued | scheduler_core::RunState::Running => format!(
                     r#"<form method="post" action="/ui/runs/{id}/cancel"><input type="hidden" name="csrf" value="{}"><button class="danger">Cancel</button></form>"#,
@@ -538,7 +634,7 @@ async fn run_detail(
                 "Run detail",
                 &session.csrf,
                 &format!(
-                    r#"<div class="actions"><h1 style="margin-right:auto">Run <code>{id}</code></h1>{actions}</div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Attempts<b>{}</b></div><div class="metric">Trigger<b style="font-size:18px">{}</b></div></div><h2>Audit trail</h2><table><thead><tr><th>Time</th><th>Event</th><th>Metadata</th></tr></thead><tbody>{event_rows}</tbody></table>"#,
+                    r#"<div class="actions"><h1 style="margin-right:auto">Run <code>{id}</code></h1>{actions}</div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Attempts<b>{}</b></div><div class="metric">Trigger<b style="font-size:18px">{}</b></div></div>{latest_diagnosis}<h2>Attempts and diagnostics</h2><table><thead><tr><th>#</th><th>Node</th><th>Outcome</th><th>Where</th><th>Code</th><th>Status</th><th>Duration</th><th>Output</th><th>Summary</th></tr></thead><tbody>{attempt_rows}</tbody></table><h2>Audit trail</h2><table><thead><tr><th>Time</th><th>Event</th><th>Metadata</th></tr></thead><tbody>{event_rows}</tbody></table>"#,
                     run.state.as_str(),
                     run.attempt_count,
                     esc(&run.trigger_kind)
@@ -969,4 +1065,11 @@ fn error_page(csrf: &str, error: &dyn std::fmt::Display) -> Response {
 
 fn esc(value: &str) -> String {
     html_escape::encode_text(value).into_owned()
+}
+
+fn json_enum_name(value: impl serde::Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| "unknown".into())
 }

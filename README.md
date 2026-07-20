@@ -30,7 +30,7 @@ cargo run -p taskctl -- schedules create --spec examples/schedules/echo.example.
 cargo run -p taskctl -- schedules list
 ```
 
-The UI can create and edit cron expressions, preview their next five occurrences, pause/resume schedules, trigger runs, rotate webhook secrets, inspect audit history, and edit global or node settings.
+The UI can create and edit cron expressions, preview their next five occurrences, pause/resume schedules, trigger runs, rotate webhook secrets, inspect attempt diagnostics and audit history, and edit global or node settings. A failed run shows exactly which component and stage failed, including process exit/signal status or Excel HRESULT when available.
 
 ## Production configuration
 

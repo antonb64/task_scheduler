@@ -17,7 +17,8 @@ use config::Config;
 use futures::StreamExt;
 use ledger::Ledger;
 use scheduler_core::{
-    ExecutionAssignment, ExecutionOutcome, ExecutionResult, ExecutorSpec, NodeSettings,
+    ExecutionAssignment, ExecutionOutcome, ExecutionResult, ExecutorSpec, FailureCode,
+    FailureDiagnostic, FailureOrigin, FailureStage, FailureStatus, NodeSettings, OutputMetadata,
 };
 use scheduler_protocol::control::{
     AgentHello, AgentMessage, AttemptAccepted, AttemptResult, Heartbeat, SettingsApplied,
@@ -276,25 +277,43 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
             Ok(())
         }
     };
-    let result = match capacity.and_then(|_| validate_assignment(&settings, &assignment)) {
-        Ok(()) => run_executor(&runtime, &assignment, &cancel_rx).await,
-        Err(error) => Err(error),
-    };
-    let result = match result {
-        Ok(result) => result,
-        Err(error) => {
-            let now = Utc::now();
-            ExecutionResult {
-                outcome: ExecutionOutcome::InfrastructureError,
-                exit_code: None,
-                signal: None,
-                stdout: String::new(),
-                stderr: String::new(),
-                started_at: now,
-                finished_at: now,
-                error: Some(format!("{error:#}")),
-            }
-        }
+    let result = match capacity {
+        Err(error) => agent_failure_result(
+            error,
+            FailureCode::AssignmentRejected,
+            FailureStage::Placement,
+            "agent had no free execution slot for this assignment",
+            true,
+        ),
+        Ok(()) => match validate_assignment(&settings, &assignment) {
+            Err(error) => agent_failure_result(
+                error,
+                FailureCode::AssignmentRejected,
+                FailureStage::Validation,
+                "assignment was rejected by the agent's execution policy",
+                false,
+            ),
+            Ok(()) => match run_executor(&runtime, &assignment, &cancel_rx).await {
+                Ok(result) => result,
+                Err(error) => {
+                    let detail = format!("{error:#}");
+                    let (code, stage, summary) = if detail.contains("cannot start executor") {
+                        (
+                            FailureCode::ExecutorStartFailed,
+                            FailureStage::ExecutorStart,
+                            "agent could not start the task-executor process",
+                        )
+                    } else {
+                        (
+                            FailureCode::ExecutorProtocolError,
+                            FailureStage::ResultDecode,
+                            "agent could not communicate with the task-executor process",
+                        )
+                    };
+                    agent_failure_result(error, code, stage, summary, true)
+                }
+            },
+        },
     };
     export_task_observability(&assignment, &result);
     runtime.active.write().await.remove(&attempt_id);
@@ -343,6 +362,43 @@ fn export_task_observability(assignment: &ExecutionAssignment, result: &Executio
             ),
         ],
     );
+    if let Some(diagnostic) = &result.diagnostic {
+        tracing::warn!(
+            run_id = %assignment.run_id,
+            attempt_id = %assignment.attempt_id,
+            failure_code = ?diagnostic.code,
+            failure_origin = ?diagnostic.origin,
+            failure_stage = ?diagnostic.stage,
+            retryable = diagnostic.retryable,
+            "task attempt produced a diagnostic"
+        );
+        meter.u64_counter("scheduler.task.failures").build().add(
+            1,
+            &[
+                KeyValue::new(
+                    "code",
+                    serde_json::to_value(diagnostic.code)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+                KeyValue::new(
+                    "origin",
+                    serde_json::to_value(diagnostic.origin)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+                KeyValue::new(
+                    "stage",
+                    serde_json::to_value(diagnostic.stage)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_else(|| "unknown".into()),
+                ),
+            ],
+        );
+    }
     let duration = (result.finished_at - result.started_at)
         .num_milliseconds()
         .max(0) as f64;
@@ -375,6 +431,7 @@ async fn run_executor(
     assignment: &ExecutionAssignment,
     cancel: &watch::Receiver<bool>,
 ) -> Result<ExecutionResult> {
+    let started_at = Utc::now();
     let mut child = Command::new(&runtime.config.executor_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -387,6 +444,7 @@ async fn run_executor(
                 runtime.config.executor_path.display()
             )
         })?;
+    let executor_pid = child.id();
     let mut stdin = child.stdin.take().context("executor stdin unavailable")?;
     stdin
         .write_all(serde_json::to_string(assignment)?.as_bytes())
@@ -422,10 +480,47 @@ async fn run_executor(
     let output = child.wait_with_output().await?;
     controller.abort();
     if !output.status.success() && output.stdout.is_empty() {
-        bail!(
-            "executor failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        let exit_code = output.status.code();
+        let signal = exit_signal(&output.status);
+        let crashed = signal.is_some() || exit_code.is_some_and(|code| cfg!(windows) && code < 0);
+        let diagnostic = FailureDiagnostic::new(
+            if crashed {
+                FailureCode::ExecutorProcessCrashed
+            } else {
+                FailureCode::ExecutorProtocolError
+            },
+            FailureOrigin::TaskExecutor,
+            if crashed {
+                FailureStage::Execution
+            } else {
+                FailureStage::ResultDecode
+            },
+            if crashed {
+                "task-executor process crashed before returning a result"
+            } else {
+                "task-executor exited without returning a result"
+            },
+            true,
+        )
+        .with_status(failure_status(executor_pid, exit_code, signal.clone()));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        return Ok(ExecutionResult {
+            outcome: ExecutionOutcome::InfrastructureError,
+            exit_code,
+            signal,
+            stdout: String::new(),
+            stderr: stderr.clone(),
+            started_at,
+            finished_at: Utc::now(),
+            error: Some("task-executor exited before returning a result".into()),
+            output: OutputMetadata {
+                stdout_bytes: 0,
+                stderr_bytes: stderr.len() as u64,
+                stdout_truncated: false,
+                stderr_truncated: false,
+            },
+            diagnostic: Some(diagnostic),
+        });
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout
@@ -433,7 +528,97 @@ async fn run_executor(
         .rev()
         .find(|line| !line.trim().is_empty())
         .context("executor returned no result")?;
-    serde_json::from_str(line).context("executor returned invalid result JSON")
+    match serde_json::from_str(line) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            let exit_code = output.status.code();
+            let signal = exit_signal(&output.status);
+            Ok(ExecutionResult {
+                outcome: ExecutionOutcome::InfrastructureError,
+                exit_code,
+                signal: signal.clone(),
+                stdout: stdout.into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+                started_at,
+                finished_at: Utc::now(),
+                error: Some(format!("executor returned invalid result JSON: {error}")),
+                output: OutputMetadata {
+                    stdout_bytes: output.stdout.len() as u64,
+                    stderr_bytes: output.stderr.len() as u64,
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                },
+                diagnostic: Some(
+                    FailureDiagnostic::new(
+                        FailureCode::ExecutorProtocolError,
+                        FailureOrigin::TaskExecutor,
+                        FailureStage::ResultDecode,
+                        "task-executor returned an invalid result payload",
+                        true,
+                    )
+                    .with_status(failure_status(
+                        executor_pid,
+                        exit_code,
+                        signal,
+                    )),
+                ),
+            })
+        }
+    }
+}
+
+fn agent_failure_result(
+    error: anyhow::Error,
+    code: FailureCode,
+    stage: FailureStage,
+    summary: &'static str,
+    retryable: bool,
+) -> ExecutionResult {
+    let now = Utc::now();
+    ExecutionResult {
+        outcome: ExecutionOutcome::InfrastructureError,
+        exit_code: None,
+        signal: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        started_at: now,
+        finished_at: now,
+        error: Some(format!("{error:#}")),
+        output: OutputMetadata::default(),
+        diagnostic: Some(FailureDiagnostic::new(
+            code,
+            FailureOrigin::Agent,
+            stage,
+            summary,
+            retryable,
+        )),
+    }
+}
+
+fn failure_status(
+    process_id: Option<u32>,
+    exit_code: Option<i32>,
+    signal: Option<String>,
+) -> FailureStatus {
+    FailureStatus {
+        process_id,
+        status_code: exit_code.map(i64::from),
+        status_code_hex: exit_code.map(|code| format!("0x{:08X}", code as u32)),
+        signal,
+        hresult: None,
+        hresult_hex: None,
+    }
+}
+
+#[cfg(unix)]
+fn exit_signal(status: &std::process::ExitStatus) -> Option<String> {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map(|signal| signal.to_string())
+}
+
+#[cfg(not(unix))]
+fn exit_signal(_status: &std::process::ExitStatus) -> Option<String> {
+    None
 }
 
 fn validate_settings(settings: &NodeSettings) -> Result<()> {

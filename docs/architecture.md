@@ -24,6 +24,14 @@ The agent never loads task code. It starts `task-executor`, which starts the com
 
 Excel automation is implemented inside a Windows child PowerShell process using COM. That process and the Excel process it starts inherit the Job Object. This preserves Rust process isolation while avoiding in-process COM failures in the long-lived agent.
 
+## Failure diagnostics
+
+Every completed attempt records a safe diagnostic separately from its encrypted result. The diagnostic identifies the origin and lifecycle stage, provides a stable machine-readable failure code, indicates whether retrying may help, and carries process status information where available. Exit codes are stored in decimal and hexadecimal form; Unix signals and Excel COM HRESULT values are retained explicitly.
+
+The executor distinguishes command failures, operating-system process crashes, spawn/isolation failures, timeout, cancellation, and agent lease loss. Excel diagnostics distinguish application startup, workbook open, macro invocation/VBA failure, macro return `1`, invalid return values, Excel process/RPC disconnection, and cleanup failures. The management UI, REST attempt endpoint, CLI, audit events, logs, and OTLP metrics use the same classification.
+
+Only bounded sizes and truncation flags are included in this public diagnostic record. Raw stdout, stderr, PowerShell/COM exception text, resolved parameters, and environment values remain inside the encrypted result and are never copied into audit metadata or telemetry.
+
 ## Security
 
 - Resolved snapshots and results are encrypted with XChaCha20-Poly1305.

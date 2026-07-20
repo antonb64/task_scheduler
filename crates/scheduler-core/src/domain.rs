@@ -182,6 +182,123 @@ pub struct ExecutionResult {
     pub started_at: DateTime<Utc>,
     pub finished_at: DateTime<Utc>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub output: OutputMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<FailureDiagnostic>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OutputMetadata {
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureDiagnostic {
+    /// Stable machine-readable code suitable for alerting and automation.
+    pub code: FailureCode,
+    /// The scheduler component in which the failure originated.
+    pub origin: FailureOrigin,
+    /// The lifecycle stage that failed.
+    pub stage: FailureStage,
+    /// Safe, parameter-free operator summary. Detailed output remains encrypted.
+    pub summary: String,
+    pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<FailureStatus>,
+}
+
+impl FailureDiagnostic {
+    pub fn new(
+        code: FailureCode,
+        origin: FailureOrigin,
+        stage: FailureStage,
+        summary: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
+        Self {
+            code,
+            origin,
+            stage,
+            summary: summary.into(),
+            retryable,
+            status: None,
+        }
+    }
+
+    pub fn with_status(mut self, status: FailureStatus) -> Self {
+        self.status = Some(status);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FailureStatus {
+    pub process_id: Option<u32>,
+    pub status_code: Option<i64>,
+    pub status_code_hex: Option<String>,
+    pub signal: Option<String>,
+    pub hresult: Option<i64>,
+    pub hresult_hex: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureCode {
+    AssignmentRejected,
+    ExecutorStartFailed,
+    ExecutorProcessCrashed,
+    ExecutorProtocolError,
+    ProcessSpawnFailed,
+    ProcessIsolationFailed,
+    ProcessExitedNonZero,
+    ProcessCrashed,
+    ProcessTimedOut,
+    Cancelled,
+    AgentLeaseExpired,
+    ExcelUnsupported,
+    ExcelStartupFailed,
+    ExcelWorkbookOpenFailed,
+    ExcelMacroFailed,
+    ExcelMacroReturnedFailure,
+    ExcelInvalidReturn,
+    ExcelProcessCrashed,
+    ExcelCleanupFailed,
+    InfrastructureError,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureOrigin {
+    Coordinator,
+    Agent,
+    TaskExecutor,
+    CommandProcess,
+    ExcelHostProcess,
+    ExcelAutomation,
+    ExcelMacro,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureStage {
+    Placement,
+    Validation,
+    ExecutorStart,
+    ProcessStart,
+    Isolation,
+    Execution,
+    ExcelStartup,
+    WorkbookOpen,
+    MacroInvoke,
+    MacroResult,
+    Cleanup,
+    ResultDecode,
+    Lease,
+    Cancellation,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -193,6 +310,19 @@ pub enum ExecutionOutcome {
     TimedOut,
     Cancelled,
     LeaseExpired,
+}
+
+impl ExecutionOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::InfrastructureError => "infrastructure_error",
+            Self::TimedOut => "timed_out",
+            Self::Cancelled => "cancelled",
+            Self::LeaseExpired => "lease_expired",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

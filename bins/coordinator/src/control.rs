@@ -213,17 +213,14 @@ async fn handle_agent_message(
             ensure_agent(expected_agent_id, &result.agent_id)?;
             let attempt_id = Uuid::parse_str(&result.attempt_id)?;
             let parsed: ExecutionResult = serde_json::from_str(&result.result_json)?;
-            let outcome = serde_json::to_value(parsed.outcome)?
-                .as_str()
-                .unwrap_or("infrastructure_error")
-                .to_owned();
+            let outcome = parsed.outcome.as_str().to_owned();
             let encrypted = state.cipher.encrypt(result.result_json.as_bytes())?;
             state
                 .store
                 .finish_attempt(
                     attempt_id,
                     &result.lease_token,
-                    &outcome,
+                    &parsed,
                     encrypted,
                     state.cipher.key_id(),
                 )
@@ -235,6 +232,17 @@ async fn handle_agent_message(
                     1,
                     &[opentelemetry::KeyValue::new("outcome", outcome.clone())],
                 );
+            if let Some(diagnostic) = &parsed.diagnostic {
+                tracing::warn!(
+                    agent_id = expected_agent_id,
+                    %attempt_id,
+                    failure_code = ?diagnostic.code,
+                    failure_origin = ?diagnostic.origin,
+                    failure_stage = ?diagnostic.stage,
+                    retryable = diagnostic.retryable,
+                    "attempt diagnostic received"
+                );
+            }
             state.release_agent_slot(expected_agent_id).await;
             tx.send(Ok(CoordinatorMessage {
                 payload: Some(coordinator_message::Payload::ResultAcknowledged(
