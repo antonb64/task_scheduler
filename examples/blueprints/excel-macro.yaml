@@ -1,0 +1,31 @@
+api_version: scheduler/v1
+executor:
+  kind: excel_macro
+  workbook_path: "C:\\TaskWorkbooks\\Validation.xlsm"
+  macro_name: "ValidationModule.RunValidation"
+  args:
+    - "{{params.input_file}}"
+    - "{{params.batch_number}}"
+    - "{{params.strict}}"
+  read_only: true
+  save_changes: false
+  visible: false
+parameters_schema:
+  type: object
+  additionalProperties: false
+  required: [input_file, batch_number, strict]
+  properties:
+    input_file:
+      type: string
+    batch_number:
+      type: number
+    strict:
+      type: boolean
+required_labels:
+  os: windows
+  capability: excel
+policy:
+  max_attempts: 3
+  timeout_seconds: 900
+  initial_backoff_seconds: 30
+  backoff_cap_seconds: 300

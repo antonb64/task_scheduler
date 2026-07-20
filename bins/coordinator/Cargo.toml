@@ -1,0 +1,43 @@
+[package]
+name = "coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+argon2.workspace = true
+askama.workspace = true
+axum.workspace = true
+axum-server.workspace = true
+base64.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+hex.workspace = true
+html-escape.workspace = true
+opentelemetry.workspace = true
+opentelemetry-appender-tracing.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry_sdk.workspace = true
+rand.workspace = true
+reqwest.workspace = true
+scheduler-core = { path = "../../crates/scheduler-core" }
+scheduler-protocol = { path = "../../crates/scheduler-protocol" }
+scheduler-store = { path = "../../crates/scheduler-store" }
+scheduler-telemetry = { path = "../../crates/scheduler-telemetry" }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+subtle = "2.6"
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-opentelemetry.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

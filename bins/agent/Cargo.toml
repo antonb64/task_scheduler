@@ -1,0 +1,30 @@
+[package]
+name = "agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+clap.workspace = true
+futures.workspace = true
+hostname = "0.4"
+opentelemetry.workspace = true
+reqwest.workspace = true
+scheduler-core = { path = "../../crates/scheduler-core" }
+scheduler-protocol = { path = "../../crates/scheduler-protocol" }
+scheduler-telemetry = { path = "../../crates/scheduler-telemetry" }
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

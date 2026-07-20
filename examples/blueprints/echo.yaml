@@ -1,0 +1,20 @@
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: echo
+  args:
+    - "Hello, {{params.name}}"
+  env: {}
+parameters_schema:
+  type: object
+  additionalProperties: false
+  required: [name]
+  properties:
+    name:
+      type: string
+required_labels: {}
+policy:
+  max_attempts: 3
+  timeout_seconds: 30
+  initial_backoff_seconds: 5
+  backoff_cap_seconds: 300

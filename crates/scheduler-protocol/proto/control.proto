@@ -1,0 +1,91 @@
+syntax = "proto3";
+
+package scheduler.control.v1;
+
+service SchedulerControl {
+  rpc AgentStream(stream AgentMessage) returns (stream CoordinatorMessage);
+  rpc Manage(ManagementRequest) returns (ManagementResponse);
+}
+
+message AgentMessage {
+  oneof payload {
+    AgentHello hello = 1;
+    Heartbeat heartbeat = 2;
+    AttemptAccepted accepted = 3;
+    AttemptResult result = 4;
+    SettingsApplied settings_applied = 5;
+  }
+}
+
+message AgentHello {
+  string agent_id = 1;
+  string hostname = 2;
+  map<string, string> labels = 3;
+  uint32 capacity = 4;
+  uint32 running = 5;
+  string version = 6;
+}
+
+message Heartbeat {
+  string agent_id = 1;
+  repeated string active_attempt_ids = 2;
+  uint32 running = 3;
+}
+
+message AttemptAccepted {
+  string agent_id = 1;
+  string attempt_id = 2;
+  string lease_token = 3;
+}
+
+message AttemptResult {
+  string agent_id = 1;
+  string attempt_id = 2;
+  string lease_token = 3;
+  string result_json = 4;
+}
+
+message SettingsApplied {
+  string agent_id = 1;
+  int64 revision = 2;
+  optional string error = 3;
+}
+
+message CoordinatorMessage {
+  oneof payload {
+    Assignment assignment = 1;
+    CancelAttempt cancel = 2;
+    SettingsUpdate settings = 3;
+    ResultAcknowledged result_acknowledged = 4;
+  }
+}
+
+message Assignment {
+  string assignment_json = 1;
+}
+
+message CancelAttempt {
+  string attempt_id = 1;
+}
+
+message SettingsUpdate {
+  int64 revision = 1;
+  string settings_json = 2;
+}
+
+message ResultAcknowledged {
+  string attempt_id = 1;
+}
+
+message ManagementRequest {
+  string method = 1;
+  string path = 2;
+  string body = 3;
+  map<string, string> headers = 4;
+}
+
+message ManagementResponse {
+  uint32 status = 1;
+  string body = 2;
+  map<string, string> headers = 3;
+}

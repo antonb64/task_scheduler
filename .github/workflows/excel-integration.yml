@@ -1,0 +1,16 @@
+name: excel-integration
+
+on:
+  workflow_dispatch:
+
+jobs:
+  excel:
+    runs-on: [self-hosted, windows, excel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Run interactive Excel contract test
+        shell: powershell
+        env:
+          SCHEDULER_TEST_XLSM: ${{ vars.SCHEDULER_TEST_XLSM }}
+        run: cargo test -p task-executor --test excel_windows -- --ignored

@@ -1,0 +1,13 @@
+{
+  "name": "echo example",
+  "blueprint_ref": {
+    "uri": "file:///absolute/path/to/task_scheduler/examples/blueprints/echo.yaml"
+  },
+  "parameters_ref": {
+    "uri": "file:///absolute/path/to/task_scheduler/examples/parameters/echo.json"
+  },
+  "required_labels": {},
+  "cron": null,
+  "webhook_enabled": true,
+  "enabled": true
+}
