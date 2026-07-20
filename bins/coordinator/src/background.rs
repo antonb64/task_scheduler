@@ -45,6 +45,7 @@ pub fn spawn(state: AppState) {
 }
 
 async fn dispatch(state: &AppState) -> Result<()> {
+    let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
     for run in state.store.queued_runs(100).await? {
         let plaintext = state.cipher.decrypt(&run.encrypted_snapshot)?;
         let snapshot: ExecutionSnapshot = serde_json::from_slice(&plaintext)?;
@@ -53,7 +54,7 @@ async fn dispatch(state: &AppState) -> Result<()> {
         };
         let Some(attempt) = state
             .store
-            .create_attempt(run.view.id, &agent_id, 60)
+            .create_attempt(run.view.id, &agent_id, lease_seconds)
             .await?
         else {
             state.release_agent_slot(&agent_id).await;
@@ -65,7 +66,7 @@ async fn dispatch(state: &AppState) -> Result<()> {
             attempt_id: attempt.id,
             attempt_number: attempt.attempt_number,
             lease_token: attempt.lease_token,
-            lease_seconds: 60,
+            lease_seconds,
             snapshot,
         };
         let message = CoordinatorMessage {
@@ -89,7 +90,12 @@ async fn dispatch(state: &AppState) -> Result<()> {
 }
 
 async fn expire_leases(state: &AppState) -> Result<()> {
-    for attempt in state.store.expired_attempts().await? {
+    let heartbeat_seconds = state.store.get_global_settings().await?.heartbeat_seconds;
+    for attempt in state
+        .store
+        .claim_expired_attempts(500, heartbeat_seconds)
+        .await?
+    {
         let now = Utc::now();
         let result = ExecutionResult {
             outcome: ExecutionOutcome::LeaseExpired,
@@ -102,16 +108,19 @@ async fn expire_leases(state: &AppState) -> Result<()> {
             error: Some("agent stopped renewing the execution lease".into()),
         };
         let encrypted = state.cipher.encrypt(&serde_json::to_vec(&result)?)?;
-        state
+        let expired = state
             .store
-            .finish_attempt(
+            .finish_expired_attempt(
                 attempt.id,
                 &attempt.lease_token,
-                "lease_expired",
                 encrypted,
                 state.cipher.key_id(),
             )
             .await?;
+        if expired.is_none() {
+            // The attempt was renewed or completed after the expiry scan.
+            continue;
+        }
         state
             .send_to_agent(
                 &attempt.agent_id,

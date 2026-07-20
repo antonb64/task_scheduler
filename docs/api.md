@@ -31,4 +31,4 @@ Manual trigger requests may include `Idempotency-Key`.
 - `GET|PUT /api/v1/settings/nodes/{agent_id}`
 - `POST|PUT|DELETE /api/v1/settings/locks/{document_key}` to acquire, renew, or release a lock
 
-Settings updates carry `expected_revision`, `lock_token`, and the new `document`. Reads return an `ETag` containing the current revision.
+Settings updates carry `expected_revision`, `lock_token`, and the new `document`, and must send the same revision in `If-Match` (for example, `If-Match: "4"`). Reads and successful updates return an `ETag` containing the current revision. Missing preconditions return `428`; mismatched preconditions return `412`.

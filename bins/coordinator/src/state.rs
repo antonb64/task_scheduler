@@ -4,8 +4,9 @@ use std::{
     time::Instant,
 };
 
+use anyhow::{Result, bail};
 use scheduler_core::{AdapterRegistry, SnapshotCipher};
-use scheduler_protocol::control::CoordinatorMessage;
+use scheduler_protocol::control::{CoordinatorMessage, SettingsUpdate, coordinator_message};
 use scheduler_store::Store;
 use tokio::sync::{RwLock, mpsc};
 
@@ -25,6 +26,7 @@ pub struct AppState {
 #[derive(Clone)]
 pub struct AgentSession {
     pub tx: mpsc::Sender<Result<CoordinatorMessage, tonic::Status>>,
+    pub enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub capacity: u32,
     pub running: u32,
@@ -43,7 +45,8 @@ impl AppState {
         let selected = sessions
             .iter()
             .filter(|(_, session)| {
-                session.running < session.capacity
+                session.enabled
+                    && session.running < session.capacity
                     && required
                         .iter()
                         .all(|(key, value)| session.labels.get(key) == Some(value))
@@ -80,5 +83,43 @@ impl AppState {
             Some(tx) => tx.send(Ok(message)).await.is_ok(),
             None => false,
         }
+    }
+
+    pub async fn push_node_settings(&self, agent_id: &str) -> Result<bool> {
+        let settings = self
+            .store
+            .get_node_settings(agent_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("node settings not found"))?;
+        let heartbeat_seconds = self.store.get_global_settings().await?.heartbeat_seconds;
+        Ok(self
+            .send_to_agent(
+                agent_id,
+                CoordinatorMessage {
+                    payload: Some(coordinator_message::Payload::Settings(SettingsUpdate {
+                        revision: settings.revision,
+                        settings_json: serde_json::to_string(&settings)?,
+                        heartbeat_seconds,
+                    })),
+                },
+            )
+            .await)
+    }
+
+    pub async fn push_all_node_settings(&self) -> Result<()> {
+        let agent_ids = self
+            .sessions
+            .read()
+            .await
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for agent_id in agent_ids {
+            if self.store.get_node_settings(&agent_id).await?.is_none() {
+                bail!("node settings not found for connected agent {agent_id}");
+            }
+            self.push_node_settings(&agent_id).await?;
+        }
+        Ok(())
     }
 }

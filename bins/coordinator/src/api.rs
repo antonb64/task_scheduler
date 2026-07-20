@@ -9,10 +9,10 @@ use axum::{
 use chrono::{DateTime, Utc};
 use scheduler_core::{
     ArtifactKind, GlobalSettings, NodeSettings, ResolvedScheduleSnapshot, ScheduleSpec,
-    blueprint::{merge_parameters, parse_blueprint},
+    blueprint::{merge_parameters, parse_blueprint_with_defaults},
     resolve_snapshot,
 };
-use scheduler_protocol::control::{CoordinatorMessage, SettingsUpdate, coordinator_message};
+use scheduler_protocol::control::{CoordinatorMessage, coordinator_message};
 use scheduler_store::{NewRun, NewSchedule, ScheduleRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -443,10 +443,12 @@ async fn update_global_settings(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(request): Json<UpdateSettingsRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(HeaderMap, Json<Value>), ApiError> {
     authorize(&state, &headers)?;
-    let _: GlobalSettings =
+    require_if_match(&headers, request.expected_revision)?;
+    let settings: GlobalSettings =
         serde_json::from_value(request.document.clone()).context("invalid global settings")?;
+    settings.validate()?;
     let revision = state
         .store
         .update_settings(
@@ -456,7 +458,8 @@ async fn update_global_settings(
             &request.lock_token,
         )
         .await?;
-    Ok(Json(serde_json::json!({"revision": revision})))
+    state.push_all_node_settings().await?;
+    settings_update_response(revision)
 }
 
 async fn update_node_settings(
@@ -464,9 +467,10 @@ async fn update_node_settings(
     headers: HeaderMap,
     Path(id): Path<String>,
     Json(request): Json<UpdateSettingsRequest>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(HeaderMap, Json<Value>), ApiError> {
     authorize(&state, &headers)?;
-    let mut settings: NodeSettings =
+    require_if_match(&headers, request.expected_revision)?;
+    let _: NodeSettings =
         serde_json::from_value(request.document.clone()).context("invalid node settings")?;
     let key = format!("node:{id}");
     let revision = state
@@ -478,15 +482,8 @@ async fn update_node_settings(
             &request.lock_token,
         )
         .await?;
-    settings.revision = revision;
-    let message = CoordinatorMessage {
-        payload: Some(coordinator_message::Payload::Settings(SettingsUpdate {
-            revision,
-            settings_json: serde_json::to_string(&settings)?,
-        })),
-    };
-    state.send_to_agent(&id, message).await;
-    Ok(Json(serde_json::json!({"revision": revision})))
+    state.push_node_settings(&id).await?;
+    settings_update_response(revision)
 }
 
 #[derive(Debug, Deserialize)]
@@ -561,9 +558,12 @@ pub async fn resolve_and_encrypt(
         .adapters
         .fetch(&spec.parameters_ref.uri, ArtifactKind::Parameters)
         .await?;
-    let blueprint = parse_blueprint(
+    let defaults = state.store.get_global_settings().await?;
+    let blueprint = parse_blueprint_with_defaults(
         &blueprint_artifact.bytes,
         blueprint_artifact.media_type.as_deref(),
+        defaults.default_max_attempts,
+        defaults.default_timeout_seconds,
     )?;
     let parameters: Value =
         serde_json::from_slice(&parameters_artifact.bytes).context("invalid parameters JSON")?;
@@ -655,6 +655,30 @@ fn idempotency_key(headers: &HeaderMap) -> Option<String> {
         .map(str::to_owned)
 }
 
+fn require_if_match(headers: &HeaderMap, expected_revision: i64) -> Result<(), ApiError> {
+    let raw = headers
+        .get(header::IF_MATCH)
+        .ok_or_else(|| ApiError::precondition_required("If-Match is required"))?
+        .to_str()
+        .map_err(|_| ApiError::precondition_failed("If-Match is invalid"))?;
+    let revision =
+        raw.trim().trim_matches('"').parse::<i64>().map_err(|_| {
+            ApiError::precondition_failed("If-Match must contain a settings revision")
+        })?;
+    if revision != expected_revision {
+        return Err(ApiError::precondition_failed(
+            "If-Match does not match expected_revision",
+        ));
+    }
+    Ok(())
+}
+
+fn settings_update_response(revision: i64) -> Result<(HeaderMap, Json<Value>), ApiError> {
+    let mut headers = HeaderMap::new();
+    headers.insert(header::ETAG, format!("\"{revision}\"").parse()?);
+    Ok((headers, Json(serde_json::json!({"revision": revision}))))
+}
+
 fn new_secret() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
@@ -677,6 +701,20 @@ impl ApiError {
         Self {
             status: StatusCode::NOT_FOUND,
             message: "resource not found".into(),
+        }
+    }
+
+    fn precondition_required(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_REQUIRED,
+            message: message.into(),
+        }
+    }
+
+    fn precondition_failed(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            message: message.into(),
         }
     }
 }
@@ -736,4 +774,27 @@ pub async fn materialize_cron(state: &AppState) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_updates_require_a_matching_if_match_revision() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(
+            require_if_match(&headers, 7)
+                .expect_err("header required")
+                .status,
+            StatusCode::PRECONDITION_REQUIRED
+        );
+
+        headers.insert(header::IF_MATCH, "\"7\"".parse().expect("header"));
+        require_if_match(&headers, 7).expect("matching revision");
+        assert_eq!(
+            require_if_match(&headers, 8).expect_err("mismatch").status,
+            StatusCode::PRECONDITION_FAILED
+        );
+    }
 }

@@ -486,6 +486,10 @@ try {
   $invokeArgs.Add($macro)
   foreach ($arg in $payload.args) { $invokeArgs.Add($arg) }
   $result = $excel.GetType().InvokeMember('Run', [Reflection.BindingFlags]::InvokeMethod, $null, $excel, $invokeArgs.ToArray())
+  $integerTypes = @([sbyte], [byte], [int16], [uint16], [int32], [uint32], [int64], [uint64])
+  if (-not ($integerTypes | Where-Object { $_.IsInstanceOfType($result) })) {
+    throw "Macro returned a non-integer value of type $($result.GetType().FullName)"
+  }
   $code = [Convert]::ToInt32($result)
   if ($code -ne 0 -and $code -ne 1) { throw "Macro returned unsupported value: $code" }
   exit $code

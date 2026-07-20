@@ -179,3 +179,84 @@ fn extension_media_type(extension: &str) -> &'static str {
         _ => "application/json",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+    use super::*;
+
+    #[tokio::test]
+    async fn file_adapter_allows_files_under_an_explicit_root() {
+        let root = tempfile::tempdir().expect("root");
+        let path = root.path().join("parameters.json");
+        std::fs::write(&path, b"{}").expect("fixture");
+        let registry = AdapterRegistry::with_defaults(vec![root.path().into()], HashMap::new())
+            .expect("registry");
+
+        let artifact = registry
+            .fetch(
+                url::Url::from_file_path(&path).expect("URL").as_str(),
+                ArtifactKind::Parameters,
+            )
+            .await
+            .expect("artifact");
+        assert_eq!(artifact.bytes, b"{}");
+        assert_eq!(artifact.media_type.as_deref(), Some("application/json"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_adapter_rejects_a_symlink_that_escapes_the_root() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::NamedTempFile::new().expect("outside");
+        let link = root.path().join("escape.json");
+        std::os::unix::fs::symlink(outside.path(), &link).expect("symlink");
+        let registry = AdapterRegistry::with_defaults(vec![root.path().into()], HashMap::new())
+            .expect("registry");
+
+        let error = registry
+            .fetch(
+                url::Url::from_file_path(&link).expect("URL").as_str(),
+                ArtifactKind::Parameters,
+            )
+            .await
+            .expect_err("escape must fail");
+        assert!(error.to_string().contains("outside configured file roots"));
+    }
+
+    #[tokio::test]
+    async fn http_adapter_sends_configured_authentication_headers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connection");
+            let mut request = vec![0; 4096];
+            let read = stream.read(&mut request).await.expect("request");
+            let request = String::from_utf8_lossy(&request[..read]);
+            assert!(request.contains("authorization: Bearer artifact-secret\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: fixture-v1\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                )
+                .await
+                .expect("response");
+        });
+        let mut headers = HashMap::new();
+        headers.insert("authorization".into(), "Bearer artifact-secret".into());
+        let registry = AdapterRegistry::with_defaults(Vec::new(), headers).expect("registry");
+
+        let artifact = registry
+            .fetch(
+                &format!("http://{address}/parameters.json"),
+                ArtifactKind::Parameters,
+            )
+            .await
+            .expect("artifact");
+        assert_eq!(artifact.bytes, b"{}");
+        assert_eq!(artifact.source_version.as_deref(), Some("fixture-v1"));
+        server.await.expect("server");
+    }
+}

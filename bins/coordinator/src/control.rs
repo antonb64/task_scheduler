@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, pin::Pin, time::Instant};
+use std::{pin::Pin, time::Instant};
 
 use futures::{Stream, StreamExt};
 use scheduler_core::ExecutionResult;
@@ -24,7 +24,13 @@ impl ControlService {
     pub fn new(state: AppState) -> Self {
         Self {
             state,
-            client: reqwest::Client::new(),
+            // Preserve coordinator redirects for the browser. Following them here
+            // would render the right page while leaving the agent-UI browser on a
+            // POST-only `/ui/...` URL, which then breaks refresh and navigation.
+            client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("static management proxy client configuration is valid"),
         }
     }
 }
@@ -69,16 +75,25 @@ impl SchedulerControl for ControlService {
             hello.agent_id.clone(),
             AgentSession {
                 tx: tx.clone(),
-                labels: hello.labels.clone().into_iter().collect::<BTreeMap<_, _>>(),
-                capacity: hello.capacity,
+                enabled: settings.enabled,
+                labels: settings.labels.clone(),
+                capacity: settings.max_parallel,
                 running: hello.running,
                 last_assigned: Instant::now(),
             },
         );
+        let heartbeat_seconds = self
+            .state
+            .store
+            .get_global_settings()
+            .await
+            .map_err(internal)?
+            .heartbeat_seconds;
         tx.send(Ok(CoordinatorMessage {
             payload: Some(coordinator_message::Payload::Settings(SettingsUpdate {
                 revision: settings.revision,
                 settings_json: serde_json::to_string(&settings).map_err(internal)?,
+                heartbeat_seconds,
             })),
         }))
         .await
@@ -168,12 +183,13 @@ async fn handle_agent_message(
     match message.payload {
         Some(agent_message::Payload::Heartbeat(heartbeat)) => {
             ensure_agent(expected_agent_id, &heartbeat.agent_id)?;
+            let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
             state
                 .store
                 .renew_attempts(
                     expected_agent_id,
                     &heartbeat.active_attempt_ids,
-                    60,
+                    lease_seconds,
                     heartbeat.running,
                 )
                 .await?;
@@ -183,12 +199,13 @@ async fn handle_agent_message(
         }
         Some(agent_message::Payload::Accepted(accepted)) => {
             ensure_agent(expected_agent_id, &accepted.agent_id)?;
+            let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
             state
                 .store
                 .accept_attempt(
                     Uuid::parse_str(&accepted.attempt_id)?,
                     &accepted.lease_token,
-                    60,
+                    lease_seconds,
                 )
                 .await?;
         }
@@ -241,6 +258,7 @@ async fn handle_agent_message(
             if applied.error.is_none() {
                 if let Some(settings) = state.store.get_node_settings(expected_agent_id).await? {
                     if let Some(session) = state.sessions.write().await.get_mut(expected_agent_id) {
+                        session.enabled = settings.enabled;
                         session.labels = settings.labels;
                         session.capacity = settings.max_parallel;
                     }

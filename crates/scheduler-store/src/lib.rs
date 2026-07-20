@@ -214,18 +214,23 @@ impl Store {
     }
 
     pub async fn set_schedule_enabled(&self, id: Uuid, enabled: bool) -> Result<()> {
-        let result = sqlx::query(
-            "UPDATE schedules SET enabled=?,revision=revision+1,updated_at=? WHERE id=?",
-        )
-        .bind(enabled)
-        .bind(now_string())
-        .bind(id.to_string())
-        .execute(&self.pool)
-        .await?;
-        if result.rows_affected() != 1 {
-            bail!("schedule not found");
-        }
-        self.append_audit(
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT spec_json FROM schedules WHERE id=?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("schedule not found")?;
+        let mut spec: ScheduleSpec = serde_json::from_str(row.get("spec_json"))?;
+        spec.enabled = enabled;
+        sqlx::query("UPDATE schedules SET enabled=?,spec_json=?,revision=revision+1,updated_at=? WHERE id=?")
+            .bind(enabled)
+            .bind(serde_json::to_string(&spec)?)
+            .bind(now_string())
+            .bind(id.to_string())
+            .execute(&mut *tx)
+            .await?;
+        append_audit_tx(
+            &mut tx,
             "schedule",
             &id.to_string(),
             if enabled {
@@ -235,7 +240,9 @@ impl Store {
             },
             Value::Null,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn rotate_webhook(
@@ -244,23 +251,32 @@ impl Store {
         public_id: String,
         secret_hash: String,
     ) -> Result<()> {
-        let result = sqlx::query("UPDATE schedules SET webhook_enabled=1,webhook_public_id=?,webhook_secret_hash=?,revision=revision+1,updated_at=? WHERE id=?")
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT spec_json FROM schedules WHERE id=?")
+            .bind(id.to_string())
+            .fetch_optional(&mut *tx)
+            .await?
+            .context("schedule not found")?;
+        let mut spec: ScheduleSpec = serde_json::from_str(row.get("spec_json"))?;
+        spec.webhook_enabled = true;
+        sqlx::query("UPDATE schedules SET webhook_enabled=1,spec_json=?,webhook_public_id=?,webhook_secret_hash=?,revision=revision+1,updated_at=? WHERE id=?")
+            .bind(serde_json::to_string(&spec)?)
             .bind(public_id)
             .bind(secret_hash)
             .bind(now_string())
             .bind(id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        if result.rows_affected() != 1 {
-            bail!("schedule not found");
-        }
-        self.append_audit(
+        append_audit_tx(
+            &mut tx,
             "schedule",
             &id.to_string(),
             "schedule.webhook_rotated",
             Value::Null,
         )
-        .await
+        .await?;
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<ScheduleView>> {
@@ -317,6 +333,7 @@ impl Store {
     pub async fn create_run(&self, new: NewRun) -> Result<RunView> {
         let now = now_string();
         let id = new.id.to_string();
+        let idempotency_key = new.idempotency_key.clone();
         let mut tx = self.pool.begin().await?;
         let insert = sqlx::query(
             "INSERT INTO runs(id,schedule_id,state,trigger_kind,scheduled_at,not_before,encrypted_snapshot,key_id,max_attempts,initial_backoff_seconds,backoff_cap_seconds,idempotency_key,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -332,7 +349,7 @@ impl Store {
         .bind(new.max_attempts)
         .bind(new.initial_backoff_seconds as i64)
         .bind(new.backoff_cap_seconds as i64)
-        .bind(new.idempotency_key)
+        .bind(&new.idempotency_key)
         .bind(&now)
         .bind(&now)
         .execute(&mut *tx)
@@ -341,6 +358,12 @@ impl Store {
             Ok(_) => {}
             Err(error) if is_unique_violation(&error) => {
                 tx.rollback().await?;
+                if let Some(key) = idempotency_key.as_deref()
+                    && let Some(existing) =
+                        self.get_run_by_idempotency(new.schedule_id, key).await?
+                {
+                    return Ok(existing);
+                }
                 if let Some(existing) = self
                     .find_existing_run(new.schedule_id, new.scheduled_at, &new.trigger_kind)
                     .await?
@@ -526,7 +549,7 @@ impl Store {
             .bind(format_time(now))
             .bind(attempt_id.to_string())
             .execute(&mut *tx).await?;
-        sqlx::query("UPDATE runs SET attempt_count=(SELECT COUNT(*) FROM attempts WHERE run_id=? AND accepted_at IS NOT NULL),updated_at=? WHERE id=?")
+        sqlx::query("UPDATE runs SET attempt_count=MAX(0,(SELECT COUNT(*) FROM attempts WHERE run_id=? AND accepted_at IS NOT NULL)-attempt_offset),updated_at=? WHERE id=?")
             .bind(&run_id).bind(format_time(now)).bind(&run_id).execute(&mut *tx).await?;
         append_audit_tx(
             &mut tx,
@@ -574,6 +597,46 @@ impl Store {
         encrypted_result: Vec<u8>,
         key_id: &str,
     ) -> Result<RunState> {
+        self.finish_attempt_inner(
+            attempt_id,
+            lease_token,
+            outcome,
+            encrypted_result,
+            key_id,
+            false,
+        )
+        .await?
+        .context("attempt unexpectedly stopped being eligible")
+    }
+
+    /// Finishes an attempt previously claimed by `claim_expired_attempts`.
+    pub async fn finish_expired_attempt(
+        &self,
+        attempt_id: Uuid,
+        lease_token: &str,
+        encrypted_result: Vec<u8>,
+        key_id: &str,
+    ) -> Result<Option<RunState>> {
+        self.finish_attempt_inner(
+            attempt_id,
+            lease_token,
+            "lease_expired",
+            encrypted_result,
+            key_id,
+            true,
+        )
+        .await
+    }
+
+    async fn finish_attempt_inner(
+        &self,
+        attempt_id: Uuid,
+        lease_token: &str,
+        outcome: &str,
+        encrypted_result: Vec<u8>,
+        key_id: &str,
+        require_expired_lease: bool,
+    ) -> Result<Option<RunState>> {
         let now = Utc::now();
         let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT a.run_id,a.state AS attempt_state,r.attempt_count,r.max_attempts,r.initial_backoff_seconds,r.backoff_cap_seconds,r.state AS run_state FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.lease_token=?")
@@ -584,9 +647,19 @@ impl Store {
         let run_id: String = row.get("run_id");
         let attempt_state: String = row.get("attempt_state");
         let current_state: String = row.get("run_state");
+        if require_expired_lease && attempt_state != "expiring" {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        if !require_expired_lease && attempt_state == "expiring" {
+            // The lease-expiry worker won the race. A result arriving after the
+            // atomic claim is acknowledged but cannot restore the lost lease.
+            tx.rollback().await?;
+            return parse_state(&current_state).map(Some);
+        }
         if matches!(attempt_state.as_str(), "finished" | "late_result") {
             tx.rollback().await?;
-            return parse_state(&current_state);
+            return parse_state(&current_state).map(Some);
         }
         if current_state == "cancelled" {
             sqlx::query("UPDATE attempts SET state='late_result',outcome=?,encrypted_result=?,result_key_id=?,finished_at=?,updated_at=? WHERE id=?")
@@ -600,7 +673,7 @@ impl Store {
             )
             .await?;
             tx.commit().await?;
-            return Ok(RunState::Cancelled);
+            return Ok(Some(RunState::Cancelled));
         }
         sqlx::query("UPDATE attempts SET state='finished',outcome=?,encrypted_result=?,result_key_id=?,finished_at=?,updated_at=? WHERE id=?")
             .bind(outcome).bind(encrypted_result).bind(key_id).bind(format_time(now)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
@@ -642,13 +715,49 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
-        Ok(state)
+        Ok(Some(state))
     }
 
-    pub async fn expired_attempts(&self) -> Result<Vec<AttemptRecord>> {
-        let rows = sqlx::query("SELECT id,run_id,agent_id,attempt_number,lease_token,lease_expires_at FROM attempts WHERE state='accepted' AND lease_expires_at<?")
-            .bind(now_string()).fetch_all(&self.pool).await?;
-        rows.into_iter().map(attempt_from_row).collect()
+    pub async fn claim_expired_attempts(
+        &self,
+        limit: u32,
+        heartbeat_grace_seconds: u64,
+    ) -> Result<Vec<AttemptRecord>> {
+        // Offers also need a deadline. If the transport delivers an assignment but
+        // the durable acceptance acknowledgement is lost, leaving it in `offered`
+        // forever would wedge the run in `running`. Expiring it does not consume an
+        // accepted-attempt retry because attempt_count is derived from accepted_at.
+        // Read the exact deadline and then claim it with compare-and-swap. If a
+        // concurrent heartbeat changes that deadline, the UPDATE affects no row;
+        // if this UPDATE changes the state first, the heartbeat's `accepted`
+        // predicate affects no row. This avoids a stale expiry scan revoking a
+        // lease which was renewed while SQLite was scheduling the two writers.
+        let rows = sqlx::query("SELECT id,run_id,agent_id,attempt_number,lease_token,lease_expires_at FROM attempts WHERE state IN ('offered','accepted') ORDER BY lease_expires_at LIMIT ?")
+            .bind(limit.min(500))
+            .fetch_all(&self.pool)
+            .await?;
+        let now = Utc::now();
+        let grace = Duration::seconds(heartbeat_grace_seconds.min(i64::MAX as u64) as i64);
+        let mut claimed = Vec::new();
+        for row in rows {
+            let lease_expires_at_text: String = row.get("lease_expires_at");
+            let lease_expires_at = parse_time(lease_expires_at_text.clone())?;
+            if lease_expires_at + grace >= now {
+                continue;
+            }
+            let attempt = attempt_from_row(row)?;
+            let result = sqlx::query("UPDATE attempts SET state='expiring',updated_at=? WHERE id=? AND lease_token=? AND state IN ('offered','accepted') AND lease_expires_at=?")
+                .bind(format_time(now))
+                .bind(attempt.id.to_string())
+                .bind(&attempt.lease_token)
+                .bind(lease_expires_at_text)
+                .execute(&self.pool)
+                .await?;
+            if result.rows_affected() == 1 {
+                claimed.push(attempt);
+            }
+        }
+        Ok(claimed)
     }
 
     pub async fn cancel_run(&self, run_id: Uuid) -> Result<Vec<(String, Uuid)>> {
@@ -683,7 +792,8 @@ impl Store {
     }
 
     pub async fn retry_run(&self, run_id: Uuid) -> Result<()> {
-        let result = sqlx::query("UPDATE runs SET state='queued',attempt_count=0,not_before=?,updated_at=? WHERE id=? AND state='failed'")
+        let result = sqlx::query("UPDATE runs SET state='queued',attempt_count=0,attempt_offset=(SELECT COUNT(*) FROM attempts WHERE run_id=? AND accepted_at IS NOT NULL),not_before=?,updated_at=? WHERE id=? AND state='failed'")
+            .bind(run_id.to_string())
             .bind(now_string()).bind(now_string()).bind(run_id.to_string()).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             bail!("only failed runs can be retried");
@@ -1136,6 +1246,23 @@ mod tests {
         (schedule_id, run_id)
     }
 
+    async fn create_schedule(store: &Store) -> Uuid {
+        let schedule_id = Uuid::new_v4();
+        store
+            .create_schedule(NewSchedule {
+                id: schedule_id,
+                spec: spec(),
+                encrypted_snapshot: vec![1],
+                snapshot_digest: "digest".into(),
+                key_id: "v1".into(),
+                webhook_public_id: None,
+                webhook_secret_hash: None,
+            })
+            .await
+            .expect("schedule");
+        schedule_id
+    }
+
     #[tokio::test]
     async fn settings_are_locked_and_revision_checked() {
         let (_directory, store) = test_store().await;
@@ -1217,5 +1344,203 @@ mod tests {
             .expect("duplicate");
         assert_eq!(first, RunState::Succeeded);
         assert_eq!(second, RunState::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_update_the_trigger_facing_schedule_document() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_schedule(&store).await;
+
+        store
+            .set_schedule_enabled(schedule_id, false)
+            .await
+            .expect("pause");
+        let paused = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(!paused.view.spec.enabled);
+
+        store
+            .set_schedule_enabled(schedule_id, true)
+            .await
+            .expect("resume");
+        let resumed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(resumed.view.spec.enabled);
+    }
+
+    #[tokio::test]
+    async fn webhook_rotation_updates_the_schedule_document() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_schedule(&store).await;
+
+        store
+            .rotate_webhook(schedule_id, "public".into(), "hash".into())
+            .await
+            .expect("rotate");
+        let schedule = store
+            .get_schedule(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(schedule.spec.webhook_enabled);
+        assert_eq!(schedule.webhook_public_id.as_deref(), Some("public"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_idempotent_run_creation_returns_the_existing_run() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_schedule(&store).await;
+        let create = |scheduled_at| NewRun {
+            id: Uuid::new_v4(),
+            schedule_id,
+            trigger_kind: "manual".into(),
+            scheduled_at,
+            encrypted_snapshot: vec![2],
+            key_id: "v1".into(),
+            max_attempts: 3,
+            initial_backoff_seconds: 1,
+            backoff_cap_seconds: 3,
+            idempotency_key: Some("same-key".into()),
+        };
+        let now = Utc::now();
+
+        let (first, second) = tokio::join!(
+            store.create_run(create(now)),
+            store.create_run(create(now + Duration::seconds(1)))
+        );
+        let first = first.expect("first request");
+        let second = second.expect("racing request");
+        assert_eq!(first.id, second.id);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM runs WHERE schedule_id=? AND idempotency_key='same-key'",
+        )
+        .bind(schedule_id.to_string())
+        .fetch_one(store.pool())
+        .await
+        .expect("count");
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_offer_expires_without_consuming_a_retry() {
+        let (_directory, store) = test_store().await;
+        let (_, run_id) = schedule_and_run(&store).await;
+        let offer = store
+            .create_attempt(run_id, "node-a", 0)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        let expired = store
+            .claim_expired_attempts(100, 0)
+            .await
+            .expect("expired offers");
+        assert!(expired.iter().any(|attempt| attempt.id == offer.id));
+        let state = store
+            .finish_expired_attempt(offer.id, &offer.lease_token, vec![3], "v1")
+            .await
+            .expect("expire")
+            .expect("still expired");
+        assert_eq!(state, RunState::Queued);
+        let run = store.get_run(run_id).await.expect("run").expect("present");
+        assert_eq!(run.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_renewal_before_the_atomic_expiry_claim_wins_the_race() {
+        let (_directory, store) = test_store().await;
+        let (_, run_id) = schedule_and_run(&store).await;
+        let attempt = store
+            .create_attempt(run_id, "node-a", 0)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        store
+            .accept_attempt(attempt.id, &attempt.lease_token, 0)
+            .await
+            .expect("accept");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+
+        store
+            .renew_attempts("node-a", &[attempt.id.to_string()], 60, 1)
+            .await
+            .expect("heartbeat renewal");
+
+        let claimed = store
+            .claim_expired_attempts(100, 0)
+            .await
+            .expect("atomic expiry claim");
+        assert!(
+            !claimed.iter().any(|found| found.id == attempt.id),
+            "the expiry claim must observe the renewed deadline"
+        );
+        let run = store.get_run(run_id).await.expect("run").expect("present");
+        assert_eq!(run.state, RunState::Running);
+        assert_eq!(run.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn manual_retry_starts_a_fresh_attempt_budget_without_losing_history() {
+        let (_directory, store) = test_store().await;
+        let (_, run_id) = schedule_and_run(&store).await;
+
+        for expected_number in 1..=3 {
+            let attempt = store
+                .create_attempt(run_id, "node-a", 60)
+                .await
+                .expect("offer")
+                .expect("attempt");
+            assert_eq!(attempt.attempt_number, expected_number);
+            store
+                .accept_attempt(attempt.id, &attempt.lease_token, 60)
+                .await
+                .expect("accept");
+            store
+                .finish_attempt(attempt.id, &attempt.lease_token, "failed", vec![4], "v1")
+                .await
+                .expect("finish");
+        }
+        assert_eq!(
+            store
+                .get_run(run_id)
+                .await
+                .expect("run")
+                .expect("present")
+                .state,
+            RunState::Failed
+        );
+
+        store.retry_run(run_id).await.expect("manual retry");
+        let next = store
+            .create_attempt(run_id, "node-a", 60)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        assert_eq!(next.attempt_number, 4, "history remains monotonic");
+        store
+            .accept_attempt(next.id, &next.lease_token, 60)
+            .await
+            .expect("accept");
+        assert_eq!(
+            store
+                .get_run(run_id)
+                .await
+                .expect("run")
+                .expect("present")
+                .attempt_count,
+            1
+        );
+        let state = store
+            .finish_attempt(next.id, &next.lease_token, "failed", vec![4], "v1")
+            .await
+            .expect("finish");
+        assert_eq!(state, RunState::Queued);
     }
 }

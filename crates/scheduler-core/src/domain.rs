@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use anyhow::{Result, bail};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -221,6 +222,37 @@ impl Default for GlobalSettings {
     }
 }
 
+impl GlobalSettings {
+    pub fn validate(&self) -> Result<()> {
+        if self.default_timezone.parse::<chrono_tz::Tz>().is_err() {
+            bail!("default_timezone must be a valid IANA timezone");
+        }
+        if self.default_max_attempts == 0 {
+            bail!("default_max_attempts must be at least one");
+        }
+        if self.default_timeout_seconds == 0 {
+            bail!("default_timeout_seconds must be at least one");
+        }
+        if self.heartbeat_seconds < 5 {
+            bail!("heartbeat_seconds must be at least five");
+        }
+        if self.lease_seconds < self.heartbeat_seconds.saturating_mul(3) {
+            bail!("lease_seconds must be at least three times heartbeat_seconds");
+        }
+        if self.audit_retention_days == 0 {
+            bail!("audit_retention_days must be at least one");
+        }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            let endpoint = url::Url::parse(endpoint)
+                .map_err(|_| anyhow::anyhow!("otlp_endpoint must be a valid URL"))?;
+            if !matches!(endpoint.scheme(), "http" | "https") || endpoint.host().is_none() {
+                bail!("otlp_endpoint must be an absolute http(s) URL");
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeSettings {
     pub revision: i64,
@@ -281,4 +313,22 @@ pub struct AgentView {
     pub desired_settings_revision: i64,
     pub applied_settings_revision: i64,
     pub last_seen_at: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn global_settings_reject_unsafe_lease_and_invalid_endpoints() {
+        let mut settings = GlobalSettings::default();
+        assert!(settings.validate().is_ok());
+
+        settings.lease_seconds = settings.heartbeat_seconds * 2;
+        assert!(settings.validate().is_err());
+
+        settings = GlobalSettings::default();
+        settings.otlp_endpoint = Some("file:///tmp/collector".into());
+        assert!(settings.validate().is_err());
+    }
 }

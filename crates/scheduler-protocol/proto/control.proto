@@ -71,6 +71,7 @@ message CancelAttempt {
 message SettingsUpdate {
   int64 revision = 1;
   string settings_json = 2;
+  uint64 heartbeat_seconds = 3;
 }
 
 message ResultAcknowledged {

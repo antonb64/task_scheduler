@@ -1,0 +1,20 @@
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: sleep
+  args:
+    - "{{params.seconds}}"
+parameters_schema:
+  type: object
+  additionalProperties: false
+  required: [seconds]
+  properties:
+    seconds:
+      type: integer
+      minimum: 1
+      maximum: 60
+policy:
+  max_attempts: 3
+  timeout_seconds: 60
+  initial_backoff_seconds: 1
+  backoff_cap_seconds: 1

@@ -7,13 +7,38 @@ use sha2::{Digest, Sha256};
 use crate::{Blueprint, ExecutionSnapshot, ExecutorSpec, ResolvedScheduleSnapshot};
 
 pub fn parse_blueprint(bytes: &[u8], media_type: Option<&str>) -> Result<Blueprint> {
-    let blueprint = if media_type.is_some_and(|value| value.contains("yaml")) {
+    let defaults = crate::ExecutionPolicy::default();
+    parse_blueprint_with_defaults(
+        bytes,
+        media_type,
+        defaults.max_attempts,
+        defaults.timeout_seconds,
+    )
+}
+
+pub fn parse_blueprint_with_defaults(
+    bytes: &[u8],
+    media_type: Option<&str>,
+    default_max_attempts: u32,
+    default_timeout_seconds: u64,
+) -> Result<Blueprint> {
+    let document: Value = if media_type.is_some_and(|value| value.contains("yaml")) {
         serde_yaml::from_slice(bytes).context("invalid YAML blueprint")?
     } else {
         serde_json::from_slice(bytes)
             .or_else(|_| serde_yaml::from_slice(bytes))
             .context("invalid blueprint document")?
     };
+    let uses_default_attempts = document.pointer("/policy/max_attempts").is_none();
+    let uses_default_timeout = document.pointer("/policy/timeout_seconds").is_none();
+    let mut blueprint: Blueprint =
+        serde_json::from_value(document).context("invalid blueprint document")?;
+    if uses_default_attempts {
+        blueprint.policy.max_attempts = default_max_attempts;
+    }
+    if uses_default_timeout {
+        blueprint.policy.timeout_seconds = default_timeout_seconds;
+    }
     validate_blueprint(&blueprint)?;
     Ok(blueprint)
 }
@@ -38,6 +63,16 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<()> {
             }
             if excel.args.len() > 30 {
                 bail!("Excel Application.Run supports at most 30 arguments");
+            }
+            for argument in &excel.args {
+                if !matches!(
+                    argument,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                ) {
+                    bail!(
+                        "Excel arguments must be JSON strings, numbers, booleans, null, or parameter expressions"
+                    );
+                }
             }
         }
         _ => {}
@@ -120,18 +155,29 @@ fn render_executor(executor: &ExecutorSpec, parameters: &Value) -> Result<Execut
                 .map(|value| render_string(value, parameters))
                 .transpose()?,
         })),
-        ExecutorSpec::ExcelMacro(excel) => Ok(ExecutorSpec::ExcelMacro(crate::ExcelMacroSpec {
-            workbook_path: render_string(&excel.workbook_path, parameters)?,
-            macro_name: render_string(&excel.macro_name, parameters)?,
-            args: excel
+        ExecutorSpec::ExcelMacro(excel) => {
+            let args = excel
                 .args
                 .iter()
                 .map(|value| render_value(value, parameters))
-                .collect::<Result<_>>()?,
-            read_only: excel.read_only,
-            save_changes: excel.save_changes,
-            visible: excel.visible,
-        })),
+                .collect::<Result<Vec<_>>>()?;
+            if args.iter().any(|argument| {
+                !matches!(
+                    argument,
+                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+                )
+            }) {
+                bail!("resolved Excel arguments must be JSON scalar values");
+            }
+            Ok(ExecutorSpec::ExcelMacro(crate::ExcelMacroSpec {
+                workbook_path: render_string(&excel.workbook_path, parameters)?,
+                macro_name: render_string(&excel.macro_name, parameters)?,
+                args,
+                read_only: excel.read_only,
+                save_changes: excel.save_changes,
+                visible: excel.visible,
+            }))
+        }
     }
 }
 
@@ -189,7 +235,37 @@ fn lookup<'a>(parameters: &'a Value, path: &str) -> Result<&'a Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CommandSpec, ExecutionPolicy};
+    use crate::{CommandSpec, ExcelMacroSpec, ExecutionPolicy};
+
+    #[test]
+    fn applies_runtime_policy_defaults_only_when_blueprint_fields_are_missing() {
+        let missing = br#"
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: runner
+policy:
+  initial_backoff_seconds: 2
+"#;
+        let blueprint = parse_blueprint_with_defaults(missing, Some("application/yaml"), 7, 42)
+            .expect("blueprint");
+        assert_eq!(blueprint.policy.max_attempts, 7);
+        assert_eq!(blueprint.policy.timeout_seconds, 42);
+
+        let explicit = br#"
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: runner
+policy:
+  max_attempts: 2
+  timeout_seconds: 9
+"#;
+        let blueprint = parse_blueprint_with_defaults(explicit, Some("application/yaml"), 7, 42)
+            .expect("blueprint");
+        assert_eq!(blueprint.policy.max_attempts, 2);
+        assert_eq!(blueprint.policy.timeout_seconds, 9);
+    }
 
     #[test]
     fn renders_structured_parameters_without_a_shell() {
@@ -220,5 +296,36 @@ mod tests {
             panic!("wrong executor");
         };
         assert_eq!(command.args, ["--name=Ada; rm -rf /"]);
+    }
+
+    #[test]
+    fn rejects_non_scalar_resolved_excel_arguments() {
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint: Blueprint {
+                api_version: "scheduler/v1".into(),
+                executor: ExecutorSpec::ExcelMacro(ExcelMacroSpec {
+                    workbook_path: "C:\\Tasks\\book.xlsm".into(),
+                    macro_name: "Module.Run".into(),
+                    args: vec![Value::String("{{params.payload}}".into())],
+                    read_only: true,
+                    save_changes: false,
+                    visible: false,
+                }),
+                parameters_schema: serde_json::json!({"type": "object"}),
+                required_labels: BTreeMap::new(),
+                policy: ExecutionPolicy::default(),
+            },
+            base_parameters: serde_json::json!({}),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+
+        let error = resolve_snapshot(
+            &resolved,
+            &serde_json::json!({"payload": {"nested": true}}),
+            &BTreeMap::new(),
+        )
+        .expect_err("object arguments are not COM scalar variants");
+        assert!(error.to_string().contains("scalar"));
     }
 }

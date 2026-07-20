@@ -1,0 +1,14 @@
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: yes
+  args:
+    - scheduler-output
+parameters_schema:
+  type: object
+  additionalProperties: false
+policy:
+  max_attempts: 1
+  timeout_seconds: 1
+  initial_backoff_seconds: 1
+  backoff_cap_seconds: 1

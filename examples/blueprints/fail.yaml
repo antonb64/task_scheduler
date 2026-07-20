@@ -1,0 +1,13 @@
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: "false"
+  args: []
+parameters_schema:
+  type: object
+  additionalProperties: false
+policy:
+  max_attempts: 2
+  timeout_seconds: 10
+  initial_backoff_seconds: 1
+  backoff_cap_seconds: 1

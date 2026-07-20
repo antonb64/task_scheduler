@@ -101,3 +101,60 @@ async fn missing_keepalive_expires_the_process_tree() {
     let result = execute(assignment("/bin/sleep", vec!["5".into()], 1)).await;
     assert_eq!(result.outcome, ExecutionOutcome::LeaseExpired);
 }
+
+#[tokio::test]
+async fn nonzero_exit_is_a_task_failure() {
+    let result = execute(assignment("false", Vec::new(), 10)).await;
+    assert_eq!(result.outcome, ExecutionOutcome::Failed);
+    assert_eq!(result.exit_code, Some(1));
+}
+
+#[tokio::test]
+async fn configured_timeout_terminates_the_command() {
+    let mut task = assignment("/bin/sleep", vec!["5".into()], 10);
+    task.snapshot.policy.timeout_seconds = 1;
+    let result = execute(task).await;
+    assert_eq!(result.outcome, ExecutionOutcome::TimedOut);
+}
+
+#[tokio::test]
+async fn cancellation_terminates_the_command() {
+    let task = assignment("/bin/sleep", vec!["5".into()], 10);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_task-executor"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+    let mut control_pipe = child.stdin.take().expect("stdin");
+    control_pipe
+        .write_all(serde_json::to_string(&task).expect("json").as_bytes())
+        .await
+        .expect("assignment");
+    control_pipe
+        .write_all(b"\n{\"cancel\":true}\n")
+        .await
+        .expect("cancel");
+    let output = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait_with_output())
+        .await
+        .expect("executor exits after cancellation")
+        .expect("wait");
+    let result: scheduler_core::ExecutionResult =
+        serde_json::from_slice(&output.stdout).expect("result");
+    assert_eq!(result.outcome, ExecutionOutcome::Cancelled);
+}
+
+#[tokio::test]
+async fn noisy_output_is_bounded_and_marked_as_truncated() {
+    let mut task = assignment("/usr/bin/yes", vec!["bounded".into()], 10);
+    task.snapshot.policy.timeout_seconds = 1;
+    let result = execute(task).await;
+    assert_eq!(result.outcome, ExecutionOutcome::TimedOut);
+    assert!(result.stdout.len() <= 1_048_576);
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("truncated"))
+    );
+}

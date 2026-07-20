@@ -40,6 +40,7 @@ struct Runtime {
     active: Arc<RwLock<HashMap<String, ActiveTask>>>,
     outgoing: Arc<RwLock<Option<mpsc::Sender<AgentMessage>>>>,
     connected: watch::Sender<bool>,
+    heartbeat_seconds: watch::Sender<u64>,
 }
 
 #[derive(Clone)]
@@ -54,6 +55,7 @@ async fn main() -> Result<()> {
     let _telemetry = scheduler_telemetry::init("scheduler-agent", config.otlp_endpoint.as_deref())?;
     let ledger = Ledger::connect(&config.database_url).await?;
     let (connected, _) = watch::channel(false);
+    let (heartbeat_seconds, _) = watch::channel(10);
     let runtime = Runtime {
         config: config.clone(),
         ledger,
@@ -64,6 +66,7 @@ async fn main() -> Result<()> {
         active: Arc::new(RwLock::new(HashMap::new())),
         outgoing: Arc::new(RwLock::new(None)),
         connected,
+        heartbeat_seconds,
     };
 
     let proxy_client = Arc::new(RwLock::new(None));
@@ -102,7 +105,7 @@ async fn run_connections(
                 }
                 *proxy_client.write().await = None;
                 *runtime.outgoing.write().await = None;
-                let _ = runtime.connected.send(false);
+                publish_connection_state(&runtime.connected, false);
                 backoff = 1;
             }
             Err(error) => warn!(%error, retry_seconds = backoff, "cannot connect to coordinator"),
@@ -133,13 +136,17 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
         .agent_stream(ReceiverStream::new(outgoing_rx))
         .await?
         .into_inner();
-    let _ = runtime.connected.send(true);
+    // `send` discards the new value when no receiver exists yet. The first task
+    // subscribes only after connecting, so retain connection state explicitly or
+    // its executor will never receive keepalives and will expire a healthy lease.
+    publish_connection_state(&runtime.connected, true);
     info!(
         agent_id = runtime.config.agent_id,
         "connected to coordinator"
     );
     send_pending(runtime, &outgoing_tx).await?;
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+    let mut heartbeat_seconds = runtime.heartbeat_seconds.subscribe();
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(*heartbeat_seconds.borrow()));
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
@@ -151,6 +158,10 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
                 })) }).await?;
                 send_pending(runtime, &outgoing_tx).await?;
             }
+            changed = heartbeat_seconds.changed() => {
+                changed?;
+                heartbeat = tokio::time::interval(Duration::from_secs(*heartbeat_seconds.borrow()));
+            }
             message = incoming.next() => {
                 let Some(message) = message else { break; };
                 handle_coordinator_message(runtime, message?).await?;
@@ -158,6 +169,10 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
         }
     }
     Ok(())
+}
+
+fn publish_connection_state(sender: &watch::Sender<bool>, connected: bool) {
+    sender.send_replace(connected);
 }
 
 async fn handle_coordinator_message(
@@ -203,6 +218,9 @@ async fn handle_coordinator_message(
             }
         }
         Some(coordinator_message::Payload::Settings(update)) => {
+            if update.heartbeat_seconds == 0 {
+                bail!("coordinator supplied an invalid zero heartbeat interval");
+            }
             let mut settings: NodeSettings = serde_json::from_str(&update.settings_json)?;
             let validation = validate_settings(&settings);
             let error = validation.as_ref().err().map(|error| format!("{error:#}"));
@@ -213,6 +231,7 @@ async fn handle_coordinator_message(
                     .save_settings(update.revision, &update.settings_json)
                     .await?;
                 *runtime.settings.write().await = settings;
+                let _ = runtime.heartbeat_seconds.send(update.heartbeat_seconds);
             }
             send(
                 runtime,
@@ -376,8 +395,10 @@ async fn run_executor(
     stdin.flush().await?;
     let mut connected = runtime.connected.subscribe();
     let mut cancel = cancel.clone();
+    let configured_heartbeat = *runtime.heartbeat_seconds.borrow();
+    let keepalive_seconds = configured_heartbeat.min((assignment.lease_seconds / 3).max(1));
     let controller = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        let mut interval = tokio::time::interval(Duration::from_secs(keepalive_seconds));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -554,4 +575,17 @@ async fn connect_channel(config: &Config) -> Result<Channel> {
         _ => bail!("agent TLS requires CA, certificate, and key together"),
     }
     Ok(endpoint.connect().await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_state_is_retained_before_the_first_executor_subscribes() {
+        let (sender, receiver) = watch::channel(false);
+        drop(receiver);
+        publish_connection_state(&sender, true);
+        assert!(*sender.subscribe().borrow());
+    }
 }

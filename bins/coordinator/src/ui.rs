@@ -185,11 +185,14 @@ async fn new_schedule(State(state): State<AppState>, headers: HeaderMap) -> Resp
     let Some(session) = state.auth.session(&headers).await else {
         return Redirect::to("/login").into_response();
     };
-    let _ = state;
+    let settings = match state.store.get_global_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return error_page(&session.csrf, &error),
+    };
     page(
         "New schedule",
         &session.csrf,
-        &schedule_form(None, &session.csrf),
+        &schedule_form(None, &session.csrf, &settings.default_timezone),
     )
 }
 
@@ -201,11 +204,15 @@ async fn edit_schedule(
     let Some(session) = state.auth.session(&headers).await else {
         return Redirect::to("/login").into_response();
     };
+    let settings = match state.store.get_global_settings().await {
+        Ok(settings) => settings,
+        Err(error) => return error_page(&session.csrf, &error),
+    };
     match state.store.get_schedule(id).await {
         Ok(Some(item)) => page(
             "Edit schedule",
             &session.csrf,
-            &schedule_form(Some(&item), &session.csrf),
+            &schedule_form(Some(&item), &session.csrf, &settings.default_timezone),
         ),
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(error) => error_page(&session.csrf, &error),
@@ -805,11 +812,13 @@ async fn save_global_settings(
         return StatusCode::FORBIDDEN.into_response();
     }
     let result = async {
-        let _: GlobalSettings = serde_json::from_str(&form.document)?;
+        let settings: GlobalSettings = serde_json::from_str(&form.document)?;
+        settings.validate()?;
         state
             .store
             .update_settings("global", form.revision, &form.document, &form.lock_token)
             .await?;
+        state.push_all_node_settings().await?;
         state
             .store
             .release_lock("global", &form.lock_token, false)
@@ -835,28 +844,17 @@ async fn save_node_settings(
         return StatusCode::FORBIDDEN.into_response();
     }
     let result = async {
-        let mut settings: NodeSettings = serde_json::from_str(&form.document)?;
+        let _: NodeSettings = serde_json::from_str(&form.document)?;
         let key = format!("node:{id}");
-        let revision = state
+        state
             .store
             .update_settings(&key, form.revision, &form.document, &form.lock_token)
             .await?;
-        settings.revision = revision;
         state
             .store
             .release_lock(&key, &form.lock_token, false)
             .await?;
-        let message = scheduler_protocol::control::CoordinatorMessage {
-            payload: Some(
-                scheduler_protocol::control::coordinator_message::Payload::Settings(
-                    scheduler_protocol::control::SettingsUpdate {
-                        revision,
-                        settings_json: serde_json::to_string(&settings)?,
-                    },
-                ),
-            ),
-        };
-        state.send_to_agent(&id, message).await;
+        state.push_node_settings(&id).await?;
         Ok::<_, anyhow::Error>(())
     }
     .await;
@@ -866,7 +864,11 @@ async fn save_node_settings(
     }
 }
 
-fn schedule_form(item: Option<&scheduler_core::ScheduleView>, csrf: &str) -> String {
+fn schedule_form(
+    item: Option<&scheduler_core::ScheduleView>,
+    csrf: &str,
+    default_timezone: &str,
+) -> String {
     let action = item
         .map(|item| format!("/ui/schedules/{}", item.id))
         .unwrap_or_else(|| "/ui/schedules".into());
@@ -912,7 +914,9 @@ fn schedule_form(item: Option<&scheduler_core::ScheduleView>, csrf: &str) -> Str
         esc(cron
             .map(|cron| cron.expression.as_str())
             .unwrap_or_default()),
-        esc(cron.map(|cron| cron.timezone.as_str()).unwrap_or("UTC")),
+        esc(cron
+            .map(|cron| cron.timezone.as_str())
+            .unwrap_or(default_timezone)),
         esc(&labels),
         checked,
         webhook_action
