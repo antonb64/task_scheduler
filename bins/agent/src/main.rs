@@ -3,7 +3,7 @@ mod ledger;
 mod proxy;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -21,8 +21,9 @@ use scheduler_core::{
     FailureDiagnostic, FailureOrigin, FailureStage, FailureStatus, NodeSettings, OutputMetadata,
 };
 use scheduler_protocol::control::{
-    AgentHello, AgentMessage, AttemptAccepted, AttemptResult, Heartbeat, SettingsApplied,
-    agent_message, coordinator_message, scheduler_control_client::SchedulerControlClient,
+    AgentHello, AgentMessage, AttemptAccepted, AttemptResult, Heartbeat, ResumeAttempt,
+    SettingsApplied, agent_message, coordinator_message,
+    scheduler_control_client::SchedulerControlClient,
 };
 use tokio::{
     io::AsyncWriteExt,
@@ -39,6 +40,7 @@ struct Runtime {
     ledger: Ledger,
     settings: Arc<RwLock<NodeSettings>>,
     active: Arc<RwLock<HashMap<String, ActiveTask>>>,
+    recovering: Arc<RwLock<HashSet<String>>>,
     outgoing: Arc<RwLock<Option<mpsc::Sender<AgentMessage>>>>,
     connected: watch::Sender<bool>,
     heartbeat_seconds: watch::Sender<u64>,
@@ -47,7 +49,9 @@ struct Runtime {
 #[derive(Clone)]
 struct ActiveTask {
     cancel: watch::Sender<bool>,
+    lease_freshness: watch::Sender<u64>,
     excel: bool,
+    started: bool,
 }
 
 #[tokio::main]
@@ -57,14 +61,25 @@ async fn main() -> Result<()> {
     let ledger = Ledger::connect(&config.database_url).await?;
     let (connected, _) = watch::channel(false);
     let (heartbeat_seconds, _) = watch::channel(10);
+    let initial_settings = match ledger.load_settings().await? {
+        Some((revision, json)) => {
+            let mut settings: NodeSettings =
+                serde_json::from_str(&json).context("persisted node settings are invalid")?;
+            settings.revision = revision;
+            validate_settings(&settings)?;
+            settings
+        }
+        None => NodeSettings {
+            max_parallel: config.capacity,
+            ..NodeSettings::default()
+        },
+    };
     let runtime = Runtime {
         config: config.clone(),
         ledger,
-        settings: Arc::new(RwLock::new(NodeSettings {
-            max_parallel: config.capacity,
-            ..NodeSettings::default()
-        })),
+        settings: Arc::new(RwLock::new(initial_settings)),
         active: Arc::new(RwLock::new(HashMap::new())),
+        recovering: Arc::new(RwLock::new(HashSet::new())),
         outgoing: Arc::new(RwLock::new(None)),
         connected,
         heartbeat_seconds,
@@ -120,6 +135,14 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
     *runtime.outgoing.write().await = Some(outgoing_tx.clone());
     let labels = runtime.config.labels()?;
+    let recoverable = runtime.ledger.recoverable_assignments().await?;
+    {
+        let mut recovering = runtime.recovering.write().await;
+        for row in &recoverable {
+            let assignment: ExecutionAssignment = serde_json::from_str(&row.assignment_json)?;
+            recovering.insert(assignment.attempt_id.to_string());
+        }
+    }
     let hostname = hostname::get()?.to_string_lossy().into_owned();
     outgoing_tx
         .send(AgentMessage {
@@ -128,7 +151,7 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
                 hostname,
                 labels,
                 capacity: runtime.config.capacity,
-                running: runtime.active.read().await.len() as u32,
+                running: recoverable.len() as u32,
                 version: env!("CARGO_PKG_VERSION").into(),
             })),
         })
@@ -145,16 +168,40 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
         agent_id = runtime.config.agent_id,
         "connected to coordinator"
     );
+    // The coordinator's first response is authoritative settings. Recovery is
+    // deliberately held until it is received, validated, and persisted.
+    loop {
+        let message = incoming
+            .next()
+            .await
+            .context("coordinator closed before initial settings")??;
+        let valid_settings = match &message.payload {
+            Some(coordinator_message::Payload::Settings(update))
+                if update.heartbeat_seconds > 0 =>
+            {
+                serde_json::from_str::<NodeSettings>(&update.settings_json)
+                    .ok()
+                    .is_some_and(|settings| validate_settings(&settings).is_ok())
+            }
+            _ => false,
+        };
+        handle_coordinator_message(runtime, message).await?;
+        if valid_settings {
+            break;
+        }
+    }
     send_pending(runtime, &outgoing_tx).await?;
+    request_recovery(runtime, &outgoing_tx, recoverable).await?;
     let mut heartbeat_seconds = runtime.heartbeat_seconds.subscribe();
     let mut heartbeat = tokio::time::interval(Duration::from_secs(*heartbeat_seconds.borrow()));
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
                 let active = runtime.active.read().await.keys().cloned().collect::<Vec<_>>();
+                let reserved = runtime.recovering.read().await.len() as u32;
                 outgoing_tx.send(AgentMessage { payload: Some(agent_message::Payload::Heartbeat(Heartbeat {
                     agent_id: runtime.config.agent_id.clone(),
-                    running: active.len() as u32,
+                    running: active.len() as u32 + reserved,
                     active_attempt_ids: active,
                 })) }).await?;
                 send_pending(runtime, &outgoing_tx).await?;
@@ -183,6 +230,15 @@ async fn handle_coordinator_message(
     match message.payload {
         Some(coordinator_message::Payload::Assignment(offer)) => {
             let assignment: ExecutionAssignment = serde_json::from_str(&offer.assignment_json)?;
+            if runtime
+                .ledger
+                .state(&assignment.attempt_id.to_string())
+                .await?
+                .as_deref()
+                == Some("acknowledged")
+            {
+                return Ok(());
+            }
             if let Some(pending) = runtime
                 .ledger
                 .result(&assignment.attempt_id.to_string())
@@ -191,10 +247,20 @@ async fn handle_coordinator_message(
                 send_result(runtime, pending).await?;
                 return Ok(());
             }
-            let inserted = runtime
+            runtime
                 .ledger
-                .accept(&assignment, &offer.assignment_json)
+                .record(&assignment, &offer.assignment_json)
                 .await?;
+            if matches!(
+                runtime
+                    .ledger
+                    .state(&assignment.attempt_id.to_string())
+                    .await?
+                    .as_deref(),
+                Some("cancelled" | "quarantined")
+            ) {
+                return Ok(());
+            }
             send(
                 runtime,
                 AgentMessage {
@@ -206,7 +272,11 @@ async fn handle_coordinator_message(
                 },
             )
             .await?;
-            if inserted {
+            if runtime
+                .ledger
+                .claim(&assignment, &offer.assignment_json)
+                .await?
+            {
                 let runtime = runtime.clone();
                 tokio::spawn(async move {
                     execute_assignment(runtime, assignment).await;
@@ -214,6 +284,8 @@ async fn handle_coordinator_message(
             }
         }
         Some(coordinator_message::Payload::Cancel(cancel)) => {
+            runtime.ledger.cancel(&cancel.attempt_id).await?;
+            runtime.recovering.write().await.remove(&cancel.attempt_id);
             if let Some(control) = runtime.active.read().await.get(&cancel.attempt_id) {
                 let _ = control.cancel.send(true);
             }
@@ -249,6 +321,58 @@ async fn handle_coordinator_message(
         Some(coordinator_message::Payload::ResultAcknowledged(ack)) => {
             runtime.ledger.acknowledge(&ack.attempt_id).await?;
         }
+        Some(coordinator_message::Payload::ResumeDecision(decision)) => {
+            if !decision.granted {
+                runtime
+                    .recovering
+                    .write()
+                    .await
+                    .remove(&decision.attempt_id);
+                runtime.ledger.cancel(&decision.attempt_id).await?;
+                warn!(
+                    attempt_id = decision.attempt_id,
+                    reason = decision.reason.as_deref().unwrap_or("not authorized"),
+                    "discarded stale recovered assignment"
+                );
+                return Ok(());
+            }
+            let Some(json) = runtime
+                .ledger
+                .assignment(&decision.attempt_id, &decision.lease_token)
+                .await?
+            else {
+                runtime
+                    .recovering
+                    .write()
+                    .await
+                    .remove(&decision.attempt_id);
+                warn!(
+                    attempt_id = decision.attempt_id,
+                    "ignored resume grant for an assignment no longer recoverable locally"
+                );
+                return Ok(());
+            };
+            let assignment: ExecutionAssignment = serde_json::from_str(&json)?;
+            if runtime.ledger.claim(&assignment, &json).await? {
+                let runtime = runtime.clone();
+                tokio::spawn(async move { execute_assignment(runtime, assignment).await });
+            } else {
+                runtime
+                    .recovering
+                    .write()
+                    .await
+                    .remove(&decision.attempt_id);
+            }
+        }
+        Some(coordinator_message::Payload::HeartbeatAcknowledged(ack)) => {
+            let active = runtime.active.read().await;
+            for attempt_id in ack.renewed_attempt_ids {
+                if let Some(task) = active.get(&attempt_id) {
+                    let next = (*task.lease_freshness.borrow()).wrapping_add(1);
+                    task.lease_freshness.send_replace(next);
+                }
+            }
+        }
         None => bail!("empty coordinator message"),
     }
     Ok(())
@@ -257,72 +381,114 @@ async fn handle_coordinator_message(
 async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
     let attempt_id = assignment.attempt_id.to_string();
     let (cancel_tx, cancel_rx) = watch::channel(false);
-    let settings = runtime.settings.read().await.clone();
+    let (lease_tx, lease_rx) = watch::channel(0_u64);
     let is_excel = matches!(&assignment.snapshot.executor, ExecutorSpec::ExcelMacro(_));
-    let capacity = {
+    {
         let mut active = runtime.active.write().await;
-        let excel_running = active.values().filter(|task| task.excel).count() as u32;
-        if active.len() as u32 >= settings.max_parallel {
-            Err(anyhow::anyhow!("agent has no free execution slot"))
-        } else if is_excel && excel_running >= settings.excel_max_parallel {
-            Err(anyhow::anyhow!("agent has no free Excel execution slot"))
-        } else {
-            active.insert(
-                attempt_id.clone(),
-                ActiveTask {
-                    cancel: cancel_tx,
-                    excel: is_excel,
-                },
-            );
-            Ok(())
+        active.insert(
+            attempt_id.clone(),
+            ActiveTask {
+                cancel: cancel_tx,
+                lease_freshness: lease_tx,
+                excel: is_excel,
+                started: false,
+            },
+        );
+    }
+    runtime.recovering.write().await.remove(&attempt_id);
+
+    let mut settings = runtime.settings.read().await.clone();
+    let policy_error = validate_assignment(&settings, &assignment).err();
+    let result = if let Some(error) = policy_error {
+        if !runtime.ledger.start(&attempt_id).await.unwrap_or(false) {
+            runtime.active.write().await.remove(&attempt_id);
+            return;
         }
-    };
-    let result = match capacity {
-        Err(error) => agent_failure_result(
+        agent_failure_result(
             error,
             FailureCode::AssignmentRejected,
-            FailureStage::Placement,
-            "agent had no free execution slot for this assignment",
-            true,
-        ),
-        Ok(()) => match validate_assignment(&settings, &assignment) {
-            Err(error) => agent_failure_result(
-                error,
-                FailureCode::AssignmentRejected,
-                FailureStage::Validation,
-                "assignment was rejected by the agent's execution policy",
-                false,
-            ),
-            Ok(()) => match run_executor(&runtime, &assignment, &cancel_rx).await {
-                Ok(result) => result,
-                Err(error) => {
-                    let detail = format!("{error:#}");
-                    let (code, stage, summary) = if detail.contains("cannot start executor") {
-                        (
-                            FailureCode::ExecutorStartFailed,
-                            FailureStage::ExecutorStart,
-                            "agent could not start the task-executor process",
-                        )
-                    } else {
-                        (
-                            FailureCode::ExecutorProtocolError,
-                            FailureStage::ResultDecode,
-                            "agent could not communicate with the task-executor process",
-                        )
-                    };
-                    agent_failure_result(error, code, stage, summary, true)
-                }
-            },
-        },
-    };
-    export_task_observability(&assignment, &result);
-    runtime.active.write().await.remove(&attempt_id);
-    match serde_json::to_string(&result) {
-        Ok(json) => {
-            if let Err(error) = runtime.ledger.save_result(&attempt_id, &json).await {
-                error!(%error, %attempt_id, "failed to persist task result");
+            FailureStage::Validation,
+            "assignment was rejected by the agent's execution policy",
+            false,
+        )
+    } else {
+        // Accepted recovery work is a durable reservation, not a placement
+        // failure. It waits within capacity and is included in heartbeats so
+        // fresh offers cannot overbook this node.
+        loop {
+            if *cancel_rx.borrow() {
+                runtime.active.write().await.remove(&attempt_id);
                 return;
             }
+            settings = runtime.settings.read().await.clone();
+            if let Err(error) = validate_assignment(&settings, &assignment) {
+                if !runtime.ledger.start(&attempt_id).await.unwrap_or(false) {
+                    runtime.active.write().await.remove(&attempt_id);
+                    return;
+                }
+                break agent_failure_result(
+                    error,
+                    FailureCode::AssignmentRejected,
+                    FailureStage::Validation,
+                    "assignment was rejected by updated node settings",
+                    false,
+                );
+            }
+            let acquired = {
+                let mut active = runtime.active.write().await;
+                if capacity_available(&active, &settings, is_excel) {
+                    if let Some(task) = active.get_mut(&attempt_id) {
+                        task.started = true;
+                    }
+                    true
+                } else {
+                    false
+                }
+            };
+            if acquired {
+                if !runtime.ledger.start(&attempt_id).await.unwrap_or(false) {
+                    runtime.active.write().await.remove(&attempt_id);
+                    return;
+                }
+                break match run_executor(&runtime, &assignment, &cancel_rx, lease_rx).await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        let detail = format!("{error:#}");
+                        let (code, stage, summary) = if detail.contains("cannot start executor") {
+                            (
+                                FailureCode::ExecutorStartFailed,
+                                FailureStage::ExecutorStart,
+                                "agent could not start the task-executor process",
+                            )
+                        } else {
+                            (
+                                FailureCode::ExecutorProtocolError,
+                                FailureStage::ResultDecode,
+                                "agent could not communicate with the task-executor process",
+                            )
+                        };
+                        agent_failure_result(error, code, stage, summary, true)
+                    }
+                };
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    };
+    export_task_observability(&assignment, &result);
+    match serde_json::to_string(&result) {
+        Ok(json) => {
+            let mut retry = Duration::from_millis(100);
+            loop {
+                match runtime.ledger.save_result(&attempt_id, &json).await {
+                    Ok(()) => break,
+                    Err(error) => {
+                        error!(%error, %attempt_id, "failed to persist task result; retrying before releasing capacity");
+                        tokio::time::sleep(retry).await;
+                        retry = (retry * 2).min(Duration::from_secs(5));
+                    }
+                }
+            }
+            runtime.active.write().await.remove(&attempt_id);
             if let Err(error) = send(
                 &runtime,
                 AgentMessage {
@@ -339,8 +505,24 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
                 warn!(%error, %attempt_id, "result retained for reconnect");
             }
         }
-        Err(error) => error!(%error, %attempt_id, "failed to serialize task result"),
+        Err(error) => {
+            error!(%error, %attempt_id, "failed to serialize task result");
+            runtime.active.write().await.remove(&attempt_id);
+        }
     }
+}
+
+fn capacity_available(
+    active: &HashMap<String, ActiveTask>,
+    settings: &NodeSettings,
+    is_excel: bool,
+) -> bool {
+    let running = active.values().filter(|task| task.started).count() as u32;
+    let excel_running = active
+        .values()
+        .filter(|task| task.started && task.excel)
+        .count() as u32;
+    running < settings.max_parallel && (!is_excel || excel_running < settings.excel_max_parallel)
 }
 
 fn export_task_observability(assignment: &ExecutionAssignment, result: &ExecutionResult) {
@@ -430,6 +612,7 @@ async fn run_executor(
     runtime: &Runtime,
     assignment: &ExecutionAssignment,
     cancel: &watch::Receiver<bool>,
+    mut lease_freshness: watch::Receiver<u64>,
 ) -> Result<ExecutionResult> {
     let started_at = Utc::now();
     let mut child = Command::new(&runtime.config.executor_path)
@@ -451,19 +634,16 @@ async fn run_executor(
         .await?;
     stdin.write_all(b"\n").await?;
     stdin.flush().await?;
-    let mut connected = runtime.connected.subscribe();
     let mut cancel = cancel.clone();
-    let configured_heartbeat = *runtime.heartbeat_seconds.borrow();
-    let keepalive_seconds = configured_heartbeat.min((assignment.lease_seconds / 3).max(1));
     let controller = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(keepalive_seconds));
         loop {
             tokio::select! {
-                _ = interval.tick() => {
-                    if *connected.borrow() {
-                        if stdin.write_all(b"{\"keepalive\":true}\n").await.is_err() { break; }
-                        let _ = stdin.flush().await;
-                    }
+                changed = lease_freshness.changed() => {
+                    if changed.is_err() { break; }
+                    // Keepalive means the coordinator positively renewed this
+                    // exact attempt, not merely that a half-open stream exists.
+                    if stdin.write_all(b"{\"keepalive\":true}\n").await.is_err() { break; }
+                    let _ = stdin.flush().await;
                 }
                 changed = cancel.changed() => {
                     if changed.is_err() { break; }
@@ -473,7 +653,6 @@ async fn run_executor(
                         break;
                     }
                 }
-                changed = connected.changed() => if changed.is_err() { break; },
             }
         }
     });
@@ -667,6 +846,9 @@ fn validate_assignment(settings: &NodeSettings, assignment: &ExecutionAssignment
             }
         }
         ExecutorSpec::ExcelMacro(excel) => {
+            if settings.excel_max_parallel == 0 {
+                bail!("Excel execution is disabled by node settings");
+            }
             #[cfg(not(windows))]
             {
                 let _ = excel;
@@ -711,6 +893,31 @@ async fn send_pending(runtime: &Runtime, tx: &mpsc::Sender<AgentMessage>) -> Res
             })),
         })
         .await?;
+    }
+    Ok(())
+}
+
+async fn request_recovery(
+    runtime: &Runtime,
+    tx: &mpsc::Sender<AgentMessage>,
+    recoverable_assignments: Vec<ledger::RecoverableAssignment>,
+) -> Result<()> {
+    for recoverable in recoverable_assignments {
+        let assignment: ExecutionAssignment = serde_json::from_str(&recoverable.assignment_json)
+            .context("stored assignment is invalid")?;
+        tx.send(AgentMessage {
+            payload: Some(agent_message::Payload::Resume(ResumeAttempt {
+                agent_id: runtime.config.agent_id.clone(),
+                attempt_id: assignment.attempt_id.to_string(),
+                lease_token: assignment.lease_token.clone(),
+            })),
+        })
+        .await?;
+        info!(
+            attempt_id = %assignment.attempt_id,
+            run_id = %assignment.run_id,
+            "requested authoritative recovery reauthorization"
+        );
     }
     Ok(())
 }
@@ -772,5 +979,39 @@ mod tests {
         drop(receiver);
         publish_connection_state(&sender, true);
         assert!(*sender.subscribe().borrow());
+    }
+
+    #[test]
+    fn accepted_recovery_reservations_queue_at_capacity_one_instead_of_failing() {
+        let (cancel_a, _) = watch::channel(false);
+        let (lease_a, _) = watch::channel(0);
+        let (cancel_b, _) = watch::channel(false);
+        let (lease_b, _) = watch::channel(0);
+        let mut active = HashMap::new();
+        active.insert(
+            "running".into(),
+            ActiveTask {
+                cancel: cancel_a,
+                lease_freshness: lease_a,
+                excel: false,
+                started: true,
+            },
+        );
+        active.insert(
+            "reserved".into(),
+            ActiveTask {
+                cancel: cancel_b,
+                lease_freshness: lease_b,
+                excel: false,
+                started: false,
+            },
+        );
+        let settings = NodeSettings {
+            max_parallel: 1,
+            ..NodeSettings::default()
+        };
+        assert!(!capacity_available(&active, &settings, false));
+        active.get_mut("running").expect("running").started = false;
+        assert!(capacity_available(&active, &settings, false));
     }
 }

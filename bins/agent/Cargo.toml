@@ -12,6 +12,7 @@ bytes.workspace = true
 chrono.workspace = true
 clap.workspace = true
 futures.workspace = true
+fs2.workspace = true
 hostname = "0.4"
 opentelemetry.workspace = true
 reqwest.workspace = true

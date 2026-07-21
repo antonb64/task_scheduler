@@ -3,8 +3,9 @@ use std::{pin::Pin, time::Instant};
 use futures::{Stream, StreamExt};
 use scheduler_core::ExecutionResult;
 use scheduler_protocol::control::{
-    AgentMessage, CoordinatorMessage, ManagementRequest, ManagementResponse, SettingsUpdate,
-    agent_message, coordinator_message, scheduler_control_server::SchedulerControl,
+    AgentMessage, CoordinatorMessage, HeartbeatAcknowledged, ManagementRequest, ManagementResponse,
+    ResumeDecision, SettingsUpdate, agent_message, coordinator_message,
+    scheduler_control_server::SchedulerControl,
 };
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -184,7 +185,7 @@ async fn handle_agent_message(
         Some(agent_message::Payload::Heartbeat(heartbeat)) => {
             ensure_agent(expected_agent_id, &heartbeat.agent_id)?;
             let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
-            state
+            let renewed_attempt_ids = state
                 .store
                 .renew_attempts(
                     expected_agent_id,
@@ -193,6 +194,14 @@ async fn handle_agent_message(
                     heartbeat.running,
                 )
                 .await?;
+            tx.send(Ok(CoordinatorMessage {
+                payload: Some(coordinator_message::Payload::HeartbeatAcknowledged(
+                    HeartbeatAcknowledged {
+                        renewed_attempt_ids,
+                    },
+                )),
+            }))
+            .await?;
             if let Some(session) = state.sessions.write().await.get_mut(expected_agent_id) {
                 session.running = heartbeat.running;
             }
@@ -272,6 +281,33 @@ async fn handle_agent_message(
                     }
                 }
             }
+        }
+        Some(agent_message::Payload::Resume(resume)) => {
+            ensure_agent(expected_agent_id, &resume.agent_id)?;
+            let attempt_id = Uuid::parse_str(&resume.attempt_id)?;
+            let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
+            let granted = state
+                .store
+                .reauthorize_attempt(
+                    attempt_id,
+                    expected_agent_id,
+                    &resume.lease_token,
+                    lease_seconds,
+                )
+                .await?;
+            tx.send(Ok(CoordinatorMessage {
+                payload: Some(coordinator_message::Payload::ResumeDecision(
+                    ResumeDecision {
+                        attempt_id: resume.attempt_id,
+                        lease_token: resume.lease_token,
+                        granted,
+                        reason: (!granted).then(|| {
+                            "attempt is stale, expired, cancelled, finished, or replaced".into()
+                        }),
+                    },
+                )),
+            }))
+            .await?;
         }
         Some(agent_message::Payload::Hello(_)) => anyhow::bail!("hello may only be sent once"),
         None => anyhow::bail!("empty agent message"),

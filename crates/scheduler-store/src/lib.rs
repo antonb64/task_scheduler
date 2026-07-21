@@ -5,8 +5,8 @@ use chrono::{DateTime, Duration, Utc};
 use fs2::FileExt;
 use rand::Rng;
 use scheduler_core::{
-    AgentView, ExecutionResult, FailureDiagnostic, GlobalSettings, NodeSettings, OutputMetadata,
-    RunState, RunView, ScheduleSpec, ScheduleView,
+    AgentView, CronSpec, ExecutionResult, FailureDiagnostic, GlobalSettings, NodeSettings,
+    OutputMetadata, RunState, RunView, ScheduleSpec, ScheduleView,
 };
 use serde_json::Value;
 use sqlx::{
@@ -65,6 +65,12 @@ pub struct NewRun {
     pub initial_backoff_seconds: u64,
     pub backoff_cap_seconds: u64,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CronOccurrenceResult {
+    Applied(RunView),
+    StaleSchedule,
 }
 
 #[derive(Debug, Clone)]
@@ -200,8 +206,11 @@ impl Store {
         key_id: String,
     ) -> Result<ScheduleView> {
         let now = now_string();
+        let cron_expression = spec.cron.as_ref().map(|cron| cron.expression.as_str());
+        let cron_timezone = spec.cron.as_ref().map(|cron| cron.timezone.as_str());
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE schedules SET name=?,spec_json=?,encrypted_snapshot=?,snapshot_digest=?,key_id=?,revision=revision+1,enabled=?,cron_expression=?,cron_timezone=?,webhook_enabled=?,updated_at=? WHERE id=? AND revision=?",
+            "UPDATE schedules SET name=?,spec_json=?,encrypted_snapshot=?,snapshot_digest=?,key_id=?,revision=revision+1,enabled=?,last_cron_at=CASE WHEN NOT (cron_expression IS ? AND cron_timezone IS ?) THEN ? ELSE last_cron_at END,cron_expression=?,cron_timezone=?,webhook_enabled=?,updated_at=? WHERE id=? AND revision=?",
         )
         .bind(&spec.name)
         .bind(serde_json::to_string(&spec)?)
@@ -209,24 +218,30 @@ impl Store {
         .bind(digest)
         .bind(key_id)
         .bind(spec.enabled)
-        .bind(spec.cron.as_ref().map(|cron| &cron.expression))
-        .bind(spec.cron.as_ref().map(|cron| &cron.timezone))
+        .bind(cron_expression)
+        .bind(cron_timezone)
+        .bind(&now)
+        .bind(cron_expression)
+        .bind(cron_timezone)
         .bind(spec.webhook_enabled)
         .bind(&now)
         .bind(id.to_string())
         .bind(expected_revision)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() != 1 {
+            tx.rollback().await?;
             bail!("schedule revision conflict or schedule not found");
         }
-        self.append_audit(
+        append_audit_tx(
+            &mut tx,
             "schedule",
             &id.to_string(),
             "schedule.updated",
             serde_json::json!({"revision": expected_revision + 1}),
         )
         .await?;
+        tx.commit().await?;
         self.get_schedule(id)
             .await?
             .context("updated schedule missing")
@@ -347,6 +362,94 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    /// Atomically creates (or returns) one cron run and advances its schedule cursor.
+    ///
+    /// The schedule revision and complete cron identity are fenced in the same SQLite write
+    /// transaction as the run insert. A caller holding a detached, stale `ScheduleRecord`
+    /// therefore cannot materialize an old snapshot after an edit commits.
+    pub async fn create_cron_occurrence(
+        &self,
+        new: NewRun,
+        expected_revision: i64,
+        expected_cron: &CronSpec,
+    ) -> Result<CronOccurrenceResult> {
+        if new.trigger_kind != "cron" {
+            bail!("cron occurrence must use the cron trigger kind");
+        }
+
+        let now = now_string();
+        let occurrence = format_time(new.scheduled_at);
+        let schedule_id = new.schedule_id.to_string();
+        let id = new.id.to_string();
+        let mut tx = self.pool.begin().await?;
+
+        // Take the SQLite writer lock and fence the detached schedule before inserting a run.
+        // This update and the insert either both commit or both roll back.
+        let fenced = sqlx::query(
+            "UPDATE schedules SET last_cron_at=CASE WHEN last_cron_at IS NULL OR last_cron_at < ? THEN ? ELSE last_cron_at END WHERE id=? AND revision=? AND enabled=1 AND cron_expression=? AND cron_timezone=?",
+        )
+        .bind(&occurrence)
+        .bind(&occurrence)
+        .bind(&schedule_id)
+        .bind(expected_revision)
+        .bind(&expected_cron.expression)
+        .bind(&expected_cron.timezone)
+        .execute(&mut *tx)
+        .await?;
+        if fenced.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(CronOccurrenceResult::StaleSchedule);
+        }
+
+        let insert = sqlx::query(
+            "INSERT INTO runs(id,schedule_id,state,trigger_kind,scheduled_at,not_before,encrypted_snapshot,key_id,max_attempts,initial_backoff_seconds,backoff_cap_seconds,idempotency_key,created_at,updated_at) VALUES (?,?, 'queued','cron',?,?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(&id)
+        .bind(&schedule_id)
+        .bind(&occurrence)
+        .bind(&occurrence)
+        .bind(new.encrypted_snapshot)
+        .bind(new.key_id)
+        .bind(new.max_attempts)
+        .bind(new.initial_backoff_seconds as i64)
+        .bind(new.backoff_cap_seconds as i64)
+        .bind(new.idempotency_key)
+        .bind(&now)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await;
+
+        let run_id = match insert {
+            Ok(_) => {
+                append_audit_tx(
+                    &mut tx,
+                    "run",
+                    &id,
+                    "run.queued",
+                    serde_json::json!({"trigger": "cron"}),
+                )
+                .await?;
+                id
+            }
+            Err(error) if is_unique_violation(&error) => sqlx::query_scalar::<_, String>(
+                "SELECT id FROM runs WHERE schedule_id=? AND scheduled_at=? AND trigger_kind='cron'",
+            )
+            .bind(&schedule_id)
+            .bind(&occurrence)
+            .fetch_one(&mut *tx)
+            .await?,
+            Err(error) => return Err(error.into()),
+        };
+
+        let row = sqlx::query("SELECT id,schedule_id,state,trigger_kind,scheduled_at,attempt_count,created_at,updated_at FROM runs WHERE id=?")
+            .bind(run_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        let run = run_view_from_row(row)?;
+        tx.commit().await?;
+        Ok(CronOccurrenceResult::Applied(run))
     }
 
     pub async fn create_run(&self, new: NewRun) -> Result<RunView> {
@@ -596,12 +699,16 @@ impl Store {
         attempt_ids: &[String],
         lease_seconds: u64,
         running: u32,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         let expires = format_time(Utc::now() + Duration::seconds(lease_seconds as i64));
         let mut tx = self.pool.begin().await?;
+        let mut renewed = Vec::new();
         for attempt_id in attempt_ids {
-            sqlx::query("UPDATE attempts SET lease_expires_at=?,updated_at=? WHERE id=? AND agent_id=? AND state='accepted'")
+            let result = sqlx::query("UPDATE attempts SET lease_expires_at=?,updated_at=? WHERE id=? AND agent_id=? AND state='accepted'")
                 .bind(&expires).bind(now_string()).bind(attempt_id).bind(agent_id).execute(&mut *tx).await?;
+            if result.rows_affected() == 1 {
+                renewed.push(attempt_id.clone());
+            }
         }
         sqlx::query(
             "UPDATE agents SET running=?,last_seen_at=?,updated_at=?,connected=1 WHERE id=?",
@@ -613,7 +720,57 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
-        Ok(())
+        Ok(renewed)
+    }
+
+    /// Atomically reauthorizes a durable agent-side assignment after restart.
+    /// A cancelled, completed, replaced, expired, or differently-owned attempt
+    /// can never be resurrected by replaying an old local ledger row.
+    pub async fn reauthorize_attempt(
+        &self,
+        attempt_id: Uuid,
+        agent_id: &str,
+        lease_token: &str,
+        lease_seconds: u64,
+    ) -> Result<bool> {
+        let now = Utc::now();
+        let expires = now + Duration::seconds(lease_seconds as i64);
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT a.lease_expires_at FROM attempts a JOIN runs r ON r.id=a.run_id \
+             WHERE a.id=? AND a.agent_id=? AND a.lease_token=? AND a.state='accepted' \
+             AND r.state='running'",
+        )
+        .bind(attempt_id.to_string())
+        .bind(agent_id)
+        .bind(lease_token)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let previous_expiry_text: String = row.get("lease_expires_at");
+        let previous_expiry = parse_time(previous_expiry_text.clone())?;
+        if previous_expiry <= now {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let result = sqlx::query(
+            "UPDATE attempts SET lease_expires_at=?,updated_at=? \
+             WHERE id=? AND agent_id=? AND lease_token=? AND state='accepted' \
+             AND lease_expires_at=?",
+        )
+        .bind(format_time(expires))
+        .bind(format_time(now))
+        .bind(attempt_id.to_string())
+        .bind(agent_id)
+        .bind(lease_token)
+        .bind(previous_expiry_text)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub async fn finish_attempt(
@@ -1259,6 +1416,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
+    use chrono::TimeZone;
     use scheduler_core::{ArtifactRef, ExecutionPolicy, ScheduleSpec};
     use tempfile::TempDir;
 
@@ -1356,6 +1514,43 @@ mod tests {
             .await
             .expect("schedule");
         schedule_id
+    }
+
+    async fn create_cron_schedule(store: &Store, expression: &str, timezone: &str) -> Uuid {
+        let schedule_id = Uuid::new_v4();
+        let mut schedule = spec();
+        schedule.cron = Some(CronSpec {
+            expression: expression.into(),
+            timezone: timezone.into(),
+        });
+        store
+            .create_schedule(NewSchedule {
+                id: schedule_id,
+                spec: schedule,
+                encrypted_snapshot: vec![1],
+                snapshot_digest: "digest".into(),
+                key_id: "v1".into(),
+                webhook_public_id: None,
+                webhook_secret_hash: None,
+            })
+            .await
+            .expect("cron schedule");
+        schedule_id
+    }
+
+    fn cron_run(schedule_id: Uuid, scheduled_at: DateTime<Utc>, snapshot: u8) -> NewRun {
+        NewRun {
+            id: Uuid::new_v4(),
+            schedule_id,
+            trigger_kind: "cron".into(),
+            scheduled_at,
+            encrypted_snapshot: vec![snapshot],
+            key_id: "v1".into(),
+            max_attempts: 3,
+            initial_backoff_seconds: 1,
+            backoff_cap_seconds: 3,
+            idempotency_key: None,
+        }
     }
 
     #[tokio::test]
@@ -1551,6 +1746,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cron_identity_edits_reset_cursor_but_other_edits_preserve_it() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_schedule(&store).await;
+
+        let before_add = Utc::now() - Duration::milliseconds(1);
+        let initial = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let mut added_spec = initial.view.spec.clone();
+        added_spec.cron = Some(CronSpec {
+            expression: "0 * * * * *".into(),
+            timezone: "UTC".into(),
+        });
+        store
+            .update_schedule(
+                schedule_id,
+                initial.view.revision,
+                added_spec,
+                vec![2],
+                "added".into(),
+                "v1".into(),
+            )
+            .await
+            .expect("add cron");
+        let added = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let add_cursor = added.last_cron_at.expect("add resets cursor");
+        assert!(add_cursor >= before_add && add_cursor <= Utc::now());
+
+        let sentinel =
+            DateTime::from_timestamp_millis((Utc::now() + Duration::days(30)).timestamp_millis())
+                .expect("valid sentinel");
+        store
+            .advance_cron_cursor(schedule_id, sentinel)
+            .await
+            .expect("set sentinel");
+        let mut snapshot_only = added.view.spec.clone();
+        snapshot_only.name = "same cron, new snapshot".into();
+        store
+            .update_schedule(
+                schedule_id,
+                added.view.revision,
+                snapshot_only,
+                vec![3],
+                "snapshot-only".into(),
+                "v2".into(),
+            )
+            .await
+            .expect("non-cron edit");
+        let unchanged = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert_eq!(unchanged.last_cron_at, Some(sentinel));
+
+        let before_expression = Utc::now() - Duration::milliseconds(1);
+        let mut changed_expression = unchanged.view.spec.clone();
+        changed_expression.cron.as_mut().expect("cron").expression = "30 * * * * *".into();
+        store
+            .update_schedule(
+                schedule_id,
+                unchanged.view.revision,
+                changed_expression,
+                vec![4],
+                "expression".into(),
+                "v2".into(),
+            )
+            .await
+            .expect("change expression");
+        let expression_changed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let expression_cursor = expression_changed.last_cron_at.expect("cursor");
+        assert!(expression_cursor >= before_expression && expression_cursor < sentinel);
+
+        let before_timezone = Utc::now() - Duration::milliseconds(1);
+        let mut changed_timezone = expression_changed.view.spec.clone();
+        changed_timezone.cron.as_mut().expect("cron").timezone = "Europe/Vienna".into();
+        store
+            .update_schedule(
+                schedule_id,
+                expression_changed.view.revision,
+                changed_timezone,
+                vec![5],
+                "timezone".into(),
+                "v2".into(),
+            )
+            .await
+            .expect("change timezone");
+        let timezone_changed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(timezone_changed.last_cron_at.expect("cursor") >= before_timezone);
+
+        let before_remove = Utc::now() - Duration::milliseconds(1);
+        let mut removed_spec = timezone_changed.view.spec.clone();
+        removed_spec.cron = None;
+        store
+            .update_schedule(
+                schedule_id,
+                timezone_changed.view.revision,
+                removed_spec,
+                vec![6],
+                "removed".into(),
+                "v2".into(),
+            )
+            .await
+            .expect("remove cron");
+        let removed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(removed.last_cron_at.expect("remove resets cursor") >= before_remove);
+
+        let before_readd = Utc::now() - Duration::milliseconds(1);
+        let mut readded_spec = removed.view.spec.clone();
+        readded_spec.cron = Some(CronSpec {
+            expression: "0 */5 * * * *".into(),
+            timezone: "UTC".into(),
+        });
+        store
+            .update_schedule(
+                schedule_id,
+                removed.view.revision,
+                readded_spec,
+                vec![7],
+                "readded".into(),
+                "v3".into(),
+            )
+            .await
+            .expect("re-add cron");
+        let readded = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(readded.last_cron_at.expect("re-add resets cursor") >= before_readd);
+    }
+
+    #[tokio::test]
+    async fn cron_occurrence_transaction_rejects_stale_revision_and_preserves_new_cursor() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
+        let detached = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let cron = detached.view.spec.cron.clone().expect("cron");
+
+        let mut edited_spec = detached.view.spec.clone();
+        edited_spec.name = "new revision".into();
+        store
+            .update_schedule(
+                schedule_id,
+                detached.view.revision,
+                edited_spec,
+                vec![9],
+                "new snapshot".into(),
+                "v2".into(),
+            )
+            .await
+            .expect("edit");
+        let current = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let occurrence = Utc::now() + Duration::hours(1);
+        let result = store
+            .create_cron_occurrence(
+                cron_run(schedule_id, occurrence, 0xaa),
+                detached.view.revision,
+                &cron,
+            )
+            .await
+            .expect("fenced create");
+        assert!(matches!(result, CronOccurrenceResult::StaleSchedule));
+        assert_eq!(
+            store
+                .get_schedule_record(schedule_id)
+                .await
+                .expect("read")
+                .expect("schedule")
+                .last_cron_at,
+            current.last_cron_at
+        );
+        let run_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE schedule_id=?")
+            .bind(schedule_id.to_string())
+            .fetch_one(store.pool())
+            .await
+            .expect("count");
+        assert_eq!(run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn cron_occurrence_transaction_fences_expression_and_timezone_identity() {
+        for (column, replacement) in [
+            ("cron_expression", "30 * * * * *"),
+            ("cron_timezone", "Europe/Vienna"),
+        ] {
+            let (_directory, store) = test_store().await;
+            let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
+            let detached = store
+                .get_schedule_record(schedule_id)
+                .await
+                .expect("read")
+                .expect("schedule");
+            let cron = detached.view.spec.cron.clone().expect("cron");
+            let statement = format!("UPDATE schedules SET {column}=? WHERE id=?");
+            sqlx::query(&statement)
+                .bind(replacement)
+                .bind(schedule_id.to_string())
+                .execute(store.pool())
+                .await
+                .expect("mutate identity without revision");
+
+            let result = store
+                .create_cron_occurrence(
+                    cron_run(schedule_id, Utc::now() + Duration::hours(1), 0xbb),
+                    detached.view.revision,
+                    &cron,
+                )
+                .await
+                .expect("fenced create");
+            assert!(
+                matches!(result, CronOccurrenceResult::StaleSchedule),
+                "identity column {column} was not fenced"
+            );
+            let run_count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM runs WHERE schedule_id=?")
+                    .bind(schedule_id.to_string())
+                    .fetch_one(store.pool())
+                    .await
+                    .expect("count");
+            assert_eq!(run_count, 0, "identity column {column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_occurrence_transaction_returns_unique_run_without_replacing_snapshot() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
+        let schedule = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        let cron = schedule.view.spec.cron.clone().expect("cron");
+        let occurrence = Utc.with_ymd_and_hms(2027, 1, 1, 0, 0, 0).unwrap();
+
+        let first = store
+            .create_cron_occurrence(
+                cron_run(schedule_id, occurrence, 0x11),
+                schedule.view.revision,
+                &cron,
+            )
+            .await
+            .expect("first");
+        let duplicate = store
+            .create_cron_occurrence(
+                cron_run(schedule_id, occurrence, 0x22),
+                schedule.view.revision,
+                &cron,
+            )
+            .await
+            .expect("duplicate");
+        let CronOccurrenceResult::Applied(first) = first else {
+            panic!("current schedule unexpectedly stale");
+        };
+        let CronOccurrenceResult::Applied(duplicate) = duplicate else {
+            panic!("current schedule unexpectedly stale");
+        };
+        assert_eq!(first.id, duplicate.id);
+        let encrypted: Vec<u8> =
+            sqlx::query_scalar("SELECT encrypted_snapshot FROM runs WHERE id=?")
+                .bind(first.id.to_string())
+                .fetch_one(store.pool())
+                .await
+                .expect("snapshot");
+        assert_eq!(encrypted, vec![0x11]);
+        assert_eq!(
+            store
+                .get_schedule_record(schedule_id)
+                .await
+                .expect("read")
+                .expect("schedule")
+                .last_cron_at,
+            Some(occurrence)
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_idempotent_run_creation_returns_the_existing_run() {
         let (_directory, store) = test_store().await;
         let schedule_id = create_schedule(&store).await;
@@ -1718,5 +2217,96 @@ mod tests {
             .await
             .expect("finish");
         assert_eq!(state, RunState::Queued);
+    }
+
+    #[tokio::test]
+    async fn recovery_reauthorization_rejects_wrong_expired_cancelled_and_finished_leases() {
+        let (_directory, store) = test_store().await;
+
+        let (_, live_run) = schedule_and_run(&store).await;
+        let live = store
+            .create_attempt(live_run, "node-a", 60)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        store
+            .accept_attempt(live.id, &live.lease_token, 60)
+            .await
+            .expect("accept");
+        assert!(
+            store
+                .reauthorize_attempt(live.id, "node-a", &live.lease_token, 60)
+                .await
+                .expect("valid resume")
+        );
+        assert!(
+            !store
+                .reauthorize_attempt(live.id, "node-a", "replacement-token", 60)
+                .await
+                .expect("wrong token")
+        );
+
+        let (_, expired_run) = schedule_and_run(&store).await;
+        let expired = store
+            .create_attempt(expired_run, "node-a", 0)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        store
+            .accept_attempt(expired.id, &expired.lease_token, 0)
+            .await
+            .expect("accept");
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        assert!(
+            !store
+                .reauthorize_attempt(expired.id, "node-a", &expired.lease_token, 60)
+                .await
+                .expect("expired")
+        );
+
+        let (_, cancelled_run) = schedule_and_run(&store).await;
+        let cancelled = store
+            .create_attempt(cancelled_run, "node-a", 60)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        store
+            .accept_attempt(cancelled.id, &cancelled.lease_token, 60)
+            .await
+            .expect("accept");
+        store.cancel_run(cancelled_run).await.expect("cancel run");
+        assert!(
+            !store
+                .reauthorize_attempt(cancelled.id, "node-a", &cancelled.lease_token, 60)
+                .await
+                .expect("cancelled")
+        );
+
+        let (_, finished_run) = schedule_and_run(&store).await;
+        let finished = store
+            .create_attempt(finished_run, "node-a", 60)
+            .await
+            .expect("offer")
+            .expect("attempt");
+        store
+            .accept_attempt(finished.id, &finished.lease_token, 60)
+            .await
+            .expect("accept");
+        store
+            .finish_attempt(
+                finished.id,
+                &finished.lease_token,
+                &completion(scheduler_core::ExecutionOutcome::Succeeded),
+                vec![1],
+                "v1",
+            )
+            .await
+            .expect("finish");
+        assert!(
+            !store
+                .reauthorize_attempt(finished.id, "node-a", &finished.lease_token, 60)
+                .await
+                .expect("finished")
+        );
     }
 }

@@ -14,6 +14,7 @@ message AgentMessage {
     AttemptAccepted accepted = 3;
     AttemptResult result = 4;
     SettingsApplied settings_applied = 5;
+    ResumeAttempt resume = 6;
   }
 }
 
@@ -51,12 +52,22 @@ message SettingsApplied {
   optional string error = 3;
 }
 
+// Recovery is never implicit. After a restart the agent asks the coordinator
+// to revalidate the exact durable attempt and lease before starting a process.
+message ResumeAttempt {
+  string agent_id = 1;
+  string attempt_id = 2;
+  string lease_token = 3;
+}
+
 message CoordinatorMessage {
   oneof payload {
     Assignment assignment = 1;
     CancelAttempt cancel = 2;
     SettingsUpdate settings = 3;
     ResultAcknowledged result_acknowledged = 4;
+    ResumeDecision resume_decision = 5;
+    HeartbeatAcknowledged heartbeat_acknowledged = 6;
   }
 }
 
@@ -76,6 +87,18 @@ message SettingsUpdate {
 
 message ResultAcknowledged {
   string attempt_id = 1;
+}
+
+message ResumeDecision {
+  string attempt_id = 1;
+  string lease_token = 2;
+  bool granted = 3;
+  optional string reason = 4;
+}
+
+// Only attempts in this list had their authoritative coordinator lease renewed.
+message HeartbeatAcknowledged {
+  repeated string renewed_attempt_ids = 1;
 }
 
 message ManagementRequest {

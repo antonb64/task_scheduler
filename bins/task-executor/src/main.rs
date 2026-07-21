@@ -135,6 +135,7 @@ async fn run_command(
         assignment.lease_seconds,
         control,
         false,
+        None,
     )
     .await
 }
@@ -156,6 +157,7 @@ async fn run_excel(
         "attempt_id": assignment.attempt_id,
     });
     let encoded_script = encode_powershell(EXCEL_SCRIPT);
+    let job_name = format!("Local\\TaskSchedulerExcel-{}", uuid::Uuid::new_v4());
     let mut command = Command::new("powershell.exe");
     command
         .args([
@@ -170,13 +172,15 @@ async fn run_excel(
         .env(
             "SCHEDULER_EXCEL_PAYLOAD_B64",
             STANDARD.encode(serde_json::to_vec(&payload)?),
-        );
+        )
+        .env("SCHEDULER_EXCEL_JOB_NAME", &job_name);
     run_process(
         command,
         assignment.snapshot.policy.timeout_seconds,
         assignment.lease_seconds,
         control,
         true,
+        Some(&job_name),
     )
     .await
 }
@@ -196,6 +200,7 @@ async fn run_process(
     lease_seconds: u64,
     mut control: watch::Receiver<ControlState>,
     excel_exit_codes: bool,
+    job_name: Option<&str>,
 ) -> Result<ExecutionResult> {
     command
         .stdout(Stdio::piped())
@@ -204,7 +209,7 @@ async fn run_process(
     configure_process_group(&mut command)?;
     let mut child = command.spawn().context("failed to start task process")?;
     let process_id = child.id().context("task process has no PID")?;
-    let guard = ProcessTree::attach(process_id)?;
+    let guard = ProcessTree::attach(process_id, job_name)?;
     let stdout = child.stdout.take().context("stdout pipe unavailable")?;
     let stderr = child.stderr.take().context("stderr pipe unavailable")?;
     let stdout_task = tokio::spawn(read_bounded(stdout));
@@ -241,8 +246,8 @@ async fn run_process(
     if !matches!(end, End::Exit(_)) {
         terminate(&mut child, &guard).await;
     }
-    let (stdout, stdout_truncated) = stdout_task.await??;
-    let (stderr, stderr_truncated) = stderr_task.await??;
+    let (stdout, stdout_truncated, stderr, stderr_truncated) =
+        collect_output(stdout_task, stderr_task, &guard).await?;
     let output = OutputMetadata {
         stdout_bytes: stdout.len() as u64,
         stderr_bytes: stderr.len() as u64,
@@ -542,6 +547,32 @@ async fn read_bounded(mut reader: impl AsyncRead + Unpin) -> Result<(String, boo
     Ok((String::from_utf8_lossy(&retained).into_owned(), truncated))
 }
 
+async fn collect_output(
+    mut stdout_task: tokio::task::JoinHandle<Result<(String, bool)>>,
+    mut stderr_task: tokio::task::JoinHandle<Result<(String, bool)>>,
+    guard: &ProcessTree,
+) -> Result<(String, bool, String, bool)> {
+    // A leader may exit after starting a descendant which inherited its pipes.
+    // Never let those handles wedge result delivery indefinitely.
+    match tokio::time::timeout(Duration::from_secs(2), async {
+        let stdout = (&mut stdout_task).await??;
+        let stderr = (&mut stderr_task).await??;
+        Ok::<_, anyhow::Error>((stdout.0, stdout.1, stderr.0, stderr.1))
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            guard.terminate_forcefully();
+            stdout_task.abort();
+            stderr_task.abort();
+            // The output was intentionally abandoned, which is accurately
+            // represented as truncation rather than delaying the scheduler.
+            Ok((String::new(), true, String::new(), true))
+        }
+    }
+}
+
 async fn terminate(child: &mut Child, guard: &ProcessTree) {
     guard.terminate_gracefully();
     if tokio::time::timeout(Duration::from_secs(5), child.wait())
@@ -573,7 +604,6 @@ fn configure_process_group(command: &mut Command) -> Result<()> {
 
 #[cfg(windows)]
 fn configure_process_group(command: &mut Command) -> Result<()> {
-    use std::os::windows::process::CommandExt;
     command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
     Ok(())
 }
@@ -590,7 +620,7 @@ struct ProcessTree {
 
 #[cfg(unix)]
 impl ProcessTree {
-    fn attach(pid: u32) -> Result<Self> {
+    fn attach(pid: u32, _job_name: Option<&str>) -> Result<Self> {
         Ok(Self {
             process_group: pid as i32,
         })
@@ -610,21 +640,30 @@ impl ProcessTree {
 #[cfg(windows)]
 struct ProcessTree {
     job: windows_sys::Win32::Foundation::HANDLE,
+    process_group: u32,
 }
 
 #[cfg(windows)]
 impl ProcessTree {
-    fn attach(pid: u32) -> Result<Self> {
+    fn attach(pid: u32, job_name: Option<&str>) -> Result<Self> {
         use std::{
             mem::{size_of, zeroed},
-            ptr::{null, null_mut},
+            ptr::null,
         };
         use windows_sys::Win32::{
             Foundation::CloseHandle,
             System::{JobObjects::*, Threading::*},
         };
         unsafe {
-            let job = CreateJobObjectW(null(), null());
+            let wide_name = job_name.map(|name| {
+                name.encode_utf16()
+                    .chain(std::iter::once(0))
+                    .collect::<Vec<_>>()
+            });
+            let job = CreateJobObjectW(
+                null(),
+                wide_name.as_ref().map_or(null(), |name| name.as_ptr()),
+            );
             if job.is_null() {
                 bail!(
                     "CreateJobObjectW failed: {}",
@@ -660,15 +699,26 @@ impl ProcessTree {
                     std::io::Error::last_os_error()
                 );
             }
-            Ok(Self { job })
+            Ok(Self {
+                job,
+                process_group: pid,
+            })
         }
-        fn terminate_gracefully(&self) {
-            unsafe {
-                windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
-            }
+    }
+    fn terminate_gracefully(&self) {
+        unsafe {
+            // Processes are created with CREATE_NEW_PROCESS_GROUP. CTRL_BREAK
+            // gives cooperative tasks a real graceful phase before the Job
+            // Object is terminated by the watchdog.
+            let _ = windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                self.process_group,
+            );
         }
-        fn terminate_forcefully(&self) {
-            self.terminate_gracefully();
+    }
+    fn terminate_forcefully(&self) {
+        unsafe {
+            windows_sys::Win32::System::JobObjects::TerminateJobObject(self.job, 1);
         }
     }
 }
@@ -687,7 +737,7 @@ struct ProcessTree;
 
 #[cfg(not(any(unix, windows)))]
 impl ProcessTree {
-    fn attach(_pid: u32) -> Result<Self> {
+    fn attach(_pid: u32, _job_name: Option<&str>) -> Result<Self> {
         Ok(Self)
     }
     fn terminate_gracefully(&self) {}
@@ -717,6 +767,18 @@ fn encode_powershell(script: &str) -> String {
 #[cfg(windows)]
 const EXCEL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class SchedulerNative {
+  [DllImport("user32.dll", SetLastError=true)] public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+  [DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)] public static extern IntPtr OpenJobObject(uint access, bool inherit, string name);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr OpenProcess(uint access, bool inherit, uint processId);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool IsProcessInJob(IntPtr process, IntPtr job, out bool result);
+  [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
+}
+'@
 $payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:SCHEDULER_EXCEL_PAYLOAD_B64))
 $payload = $payloadJson | ConvertFrom-Json
 $excel = $null
@@ -725,8 +787,42 @@ $stage = 'excel_startup'
 $exitCode = 2
 $diagnostic = $null
 $exceptionDetail = $null
+$jobHandle = [IntPtr]::Zero
+$excelProcessHandle = [IntPtr]::Zero
+$mayQuitExcel = $false
+$preexistingExcelPids = @(Get-Process -Name EXCEL -ErrorAction SilentlyContinue | ForEach-Object { [uint32]$_.Id })
+$excelStartBoundary = [DateTime]::UtcNow.AddSeconds(-2)
 try {
   $excel = New-Object -ComObject Excel.Application
+  $stage = 'isolation'
+  $excelPid = [uint32]0
+  $hwnd = [IntPtr][int64]$excel.Hwnd
+  if ($hwnd -eq [IntPtr]::Zero -or [SchedulerNative]::GetWindowThreadProcessId($hwnd, [ref]$excelPid) -eq 0 -or $excelPid -eq 0) {
+    throw 'Cannot resolve the private Excel process from Application.Hwnd'
+  }
+  if ($preexistingExcelPids -contains $excelPid) {
+    throw 'Excel COM activation resolved to a preexisting user Excel process'
+  }
+  $excelProcess = Get-Process -Id $excelPid -ErrorAction Stop
+  if ($excelProcess.ProcessName -ne 'EXCEL' -or $excelProcess.StartTime.ToUniversalTime() -lt $excelStartBoundary) {
+    throw 'Excel process identity or creation time could not be proven private'
+  }
+  $mayQuitExcel = $true
+  $jobHandle = [SchedulerNative]::OpenJobObject(5, $false, $env:SCHEDULER_EXCEL_JOB_NAME)
+  if ($jobHandle -eq [IntPtr]::Zero) { throw 'Cannot open the executor Job Object' }
+  $excelProcessHandle = [SchedulerNative]::OpenProcess(0x1101, $false, $excelPid)
+  if ($excelProcessHandle -eq [IntPtr]::Zero) { throw 'Cannot open the private Excel process for isolation' }
+  if (-not [SchedulerNative]::AssignProcessToJobObject($jobHandle, $excelProcessHandle)) {
+    throw 'Cannot attach the private Excel process to the executor Job Object'
+  }
+  $isMember = $false
+  if (-not [SchedulerNative]::IsProcessInJob($excelProcessHandle, $jobHandle, [ref]$isMember) -or -not $isMember) {
+    throw 'Cannot verify private Excel process Job Object membership'
+  }
+  # Keep the Rust executor as the sole Job Object owner so KILL_ON_JOB_CLOSE
+  # still terminates PowerShell and Excel if the executor process itself crashes.
+  [void][SchedulerNative]::CloseHandle($jobHandle)
+  $jobHandle = [IntPtr]::Zero
   $excel.Visible = [bool]$payload.visible
   $excel.DisplayAlerts = $false
   $excel.UserControl = $false
@@ -752,6 +848,7 @@ try {
   $hresultHex = ('0x{0:X8}' -f ($hresult -band 0xffffffffL))
   $failureCode = switch ($stage) {
     'excel_startup' { 'excel_startup_failed' }
+    'isolation' { 'excel_startup_failed' }
     'workbook_open' { 'excel_workbook_open_failed' }
     'macro_invoke' { 'excel_macro_failed' }
     'macro_result' { 'excel_invalid_return' }
@@ -759,6 +856,7 @@ try {
   }
   $summary = switch ($stage) {
     'excel_startup' { 'private Excel application could not be started' }
+    'isolation' { 'private Excel process identity or isolation could not be established' }
     'workbook_open' { 'Excel could not open the configured workbook' }
     'macro_invoke' { 'Excel or VBA failed while invoking the macro' }
     'macro_result' { 'Excel macro returned an unsupported value' }
@@ -771,6 +869,7 @@ try {
   } else {
     $exitCode = switch ($stage) {
       'excel_startup' { 10 }
+      'isolation' { 10 }
       'workbook_open' { 11 }
       'macro_invoke' { 12 }
       'macro_result' { 13 }
@@ -781,9 +880,11 @@ try {
 } finally {
   $cleanupFailed = $false
   if ($null -ne $workbook) { try { $workbook.Close([bool]$payload.save_changes) } catch { $cleanupFailed = $true } }
-  if ($null -ne $excel) { try { $excel.Quit() } catch { $cleanupFailed = $true } }
+  if ($null -ne $excel -and $mayQuitExcel) { try { $excel.Quit() } catch { $cleanupFailed = $true } }
   if ($null -ne $workbook) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($workbook) } catch { $cleanupFailed = $true } }
   if ($null -ne $excel) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($excel) } catch { $cleanupFailed = $true } }
+  if ($excelProcessHandle -ne [IntPtr]::Zero) { [void][SchedulerNative]::CloseHandle($excelProcessHandle) }
+  if ($jobHandle -ne [IntPtr]::Zero) { [void][SchedulerNative]::CloseHandle($jobHandle) }
   [GC]::Collect(); [GC]::WaitForPendingFinalizers()
   if ($cleanupFailed -and $null -eq $diagnostic) {
     $exitCode = 15
@@ -836,5 +937,22 @@ mod tests {
         assert_eq!(diagnostic.code, FailureCode::ExcelProcessCrashed);
         assert_eq!(diagnostic.origin, FailureOrigin::ExcelHostProcess);
         assert_eq!(diagnostic.stage, FailureStage::MacroInvoke);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn excel_script_proves_identity_and_job_membership_before_opening_workbook() {
+        for required in [
+            "GetWindowThreadProcessId",
+            "$preexistingExcelPids -contains $excelPid",
+            "AssignProcessToJobObject",
+            "IsProcessInJob",
+            "SCHEDULER_EXCEL_JOB_NAME",
+        ] {
+            assert!(EXCEL_SCRIPT.contains(required), "missing {required}");
+        }
+        let isolation = EXCEL_SCRIPT.find("IsProcessInJob").expect("membership");
+        let workbook = EXCEL_SCRIPT.find("Workbooks.Open").expect("open");
+        assert!(isolation < workbook);
     }
 }

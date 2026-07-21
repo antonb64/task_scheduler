@@ -98,6 +98,25 @@ async fn completed_command_exits_while_agent_control_pipe_remains_open() {
     assert_eq!(result.outcome, ExecutionOutcome::Succeeded);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn descendant_inheriting_output_pipes_cannot_wedge_result_collection() {
+    let started = std::time::Instant::now();
+    let result = execute(assignment(
+        "/bin/sh",
+        vec!["-c".into(), "sleep 30 & exit 0".into()],
+        10,
+    ))
+    .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(6),
+        "output collection remained blocked by a descendant"
+    );
+    assert_eq!(result.outcome, ExecutionOutcome::Succeeded);
+    assert!(result.output.stdout_truncated);
+    assert!(result.output.stderr_truncated);
+}
+
 #[tokio::test]
 async fn missing_keepalive_expires_the_process_tree() {
     let result = execute(assignment("/bin/sleep", vec!["5".into()], 1)).await;
