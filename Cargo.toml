@@ -34,13 +34,14 @@ cron = "0.15"
 futures = "0.3"
 hex = "0.4"
 html-escape = "0.2"
+hmac = "0.12"
 http = "1.2"
 fs2 = "0.4"
 jsonschema = "0.33"
 libc = "0.2"
 opentelemetry = "0.32"
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "logs", "metrics", "trace", "tls-ring"] }
+opentelemetry-otlp = { version = "0.32", features = ["grpc-tonic", "http-proto", "reqwest-client", "reqwest-rustls", "logs", "metrics", "trace", "tls-ring"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio"] }
 prost = "0.14"
 rand = "0.8"

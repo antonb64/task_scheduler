@@ -2,8 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/antonb64/task_scheduler/main/schemas/blueprint-v1.schema.json",
   "title": "Task Scheduler Blueprint v1",
-  "description": "A reusable scheduler/v1 execution blueprint. YAML blueprints are converted to the equivalent JSON value before validation. Unknown properties are intentionally permitted because the Rust v1 model ignores them.",
+  "description": "A reusable scheduler/v1 execution blueprint. YAML blueprints are converted to the equivalent JSON value before validation. Unknown top-level properties are rejected to catch configuration typos.",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "api_version",
     "executor"
@@ -29,6 +30,17 @@
       },
       "description": "A valid JSON Schema 2020-12 schema used to validate the resolved parameter object."
     },
+    "parameter_bindings": {
+      "type": "object",
+      "propertyNames": {
+        "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9_-]{0,126}[A-Za-z0-9])?$"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/parameter_binding"
+      },
+      "default": {},
+      "description": "Agent-local environment or secret-file values resolved immediately before execution. Resolved values are never stored in execution snapshots."
+    },
     "required_labels": {
       "$ref": "#/$defs/labels",
       "default": {}
@@ -45,8 +57,72 @@
         "type": "string"
       }
     },
+    "parameter_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "name"
+      ],
+      "properties": {
+        "source": {
+          "enum": [
+            "environment",
+            "secret_file"
+          ]
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "value_type": {
+          "enum": [
+            "string",
+            "integer",
+            "number",
+            "boolean",
+            "json"
+          ],
+          "default": "string"
+        },
+        "sensitive": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "source": {
+                "const": "environment"
+              }
+            },
+            "required": [
+              "source"
+            ]
+          },
+          "then": {
+            "properties": {
+              "name": {
+                "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "name": {
+                "pattern": "^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,126}[A-Za-z0-9])?$"
+              }
+            }
+          }
+        }
+      ]
+    },
     "command_executor": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "kind",
         "program"
@@ -84,6 +160,7 @@
     },
     "excel_macro_executor": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "kind",
         "workbook_path",
@@ -183,6 +260,7 @@
     },
     "execution_policy": {
       "type": "object",
+      "additionalProperties": false,
       "properties": {
         "max_attempts": {
           "type": "integer",

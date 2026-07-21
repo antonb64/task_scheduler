@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use scheduler_core::{
     ArtifactFetchError, ArtifactKind, GlobalSettings, NodeSettings, ResolvedScheduleSnapshot,
@@ -14,7 +15,10 @@ use scheduler_core::{
     resolve_snapshot,
 };
 use scheduler_protocol::control::{CoordinatorMessage, coordinator_message};
-use scheduler_store::{CronOccurrenceResult, NewRun, NewSchedule, ScheduleRecord};
+use scheduler_store::{
+    CronBatchOccurrenceResult, CronOccurrenceResult, NewBlueprintRevision, NewRun, NewSchedule,
+    ScheduleRecord,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -54,7 +58,47 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/runs/{id}/events", get(run_events))
         .route("/api/v1/runs/{id}/cancel", post(cancel_run))
         .route("/api/v1/runs/{id}/retry", post(retry_run))
+        .route(
+            "/api/v1/batches",
+            get(crate::collection_runtime::list_batches),
+        )
+        .route(
+            "/api/v1/batches/{id}",
+            get(crate::collection_runtime::get_batch),
+        )
+        .route(
+            "/api/v1/batches/{id}/items",
+            get(crate::collection_runtime::list_batch_items),
+        )
+        .route(
+            "/api/v1/batches/{id}/cancel",
+            post(crate::collection_runtime::cancel_batch),
+        )
+        .route(
+            "/api/v1/batches/{id}/retrigger",
+            post(crate::collection_runtime::retrigger_batch),
+        )
         .route("/api/v1/agents", get(list_agents))
+        .route("/api/v1/blueprints", get(list_blueprints))
+        .route("/api/v1/telemetry/status", get(telemetry_status))
+        .route(
+            "/api/v1/dashboard",
+            get(get_dashboard).put(update_dashboard),
+        )
+        .route("/api/v1/agents/{id}/health", get(get_agent_health))
+        .route(
+            "/api/v1/agents/{id}/health/evidence",
+            get(get_agent_health_evidence),
+        )
+        .route(
+            "/api/v1/agents/{id}/health/quarantine",
+            post(quarantine_agent),
+        )
+        .route("/api/v1/agents/{id}/health/reset", post(reset_agent_health))
+        .route(
+            "/api/v1/input-health/{blueprint_digest}/{input_fingerprint}/probe",
+            post(grant_input_probe),
+        )
         .route(
             "/api/v1/settings/global",
             get(get_global_settings).put(update_global_settings),
@@ -80,14 +124,155 @@ async fn ready(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn list_schedules(
+async fn telemetry_status(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
+    Ok(Json(serde_json::to_value(scheduler_telemetry::status())?))
+}
+
+async fn get_agent_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    scheduler_core::validate_agent_id(&id)?;
+    let view = state
+        .store
+        .node_health(&id)
+        .await?
+        .ok_or_else(ApiError::not_found)?;
+    Ok(Json(serde_json::to_value(view)?))
+}
+
+async fn get_agent_health_evidence(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    scheduler_core::validate_agent_id(&id)?;
+    let limit = page_limit(query.limit);
+    let cursor =
+        decode_time_uuid_cursor(query.cursor.as_deref(), ApiCursorKind::AgentHealthEvidence)?;
+    let mut items = state
+        .store
+        .list_health_evidence_page(
+            Some(&id),
+            cursor.as_ref().map(|cursor| cursor.timestamp.as_str()),
+            cursor.as_ref().map(|cursor| cursor.id.as_str()),
+            limit + 1,
+        )
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::AgentHealthEvidence,
+                    &TimeCursor {
+                        timestamp: item
+                            .occurred_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        id: item.id.to_string(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
+}
+
+async fn quarantine_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    scheduler_core::validate_agent_id(&id)?;
+    let view = state.store.set_node_manual_quarantine(&id, true).await?;
+    state.apply_agent_health_view(&view).await;
+    Ok(Json(serde_json::to_value(view)?))
+}
+
+async fn reset_agent_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    scheduler_core::validate_agent_id(&id)?;
+    let view = state.store.set_node_manual_quarantine(&id, false).await?;
+    state.apply_agent_health_view(&view).await;
+    Ok(Json(serde_json::to_value(view)?))
+}
+
+async fn grant_input_probe(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path((blueprint_digest, input_fingerprint)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    if !is_hex_digest(&blueprint_digest) || !is_hex_digest(&input_fingerprint) {
+        return Err(ApiError {
+            status: StatusCode::BAD_REQUEST,
+            code: "invalid_health_fingerprint",
+            message: "health digests must contain exactly 64 hexadecimal characters".into(),
+            request_id: None,
+        });
+    }
     Ok(Json(serde_json::to_value(
-        state.store.list_schedules().await?,
+        state
+            .store
+            .grant_input_probe(&blueprint_digest, &input_fingerprint)
+            .await?,
     )?))
+}
+
+fn is_hex_digest(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let limit = page_limit(query.limit);
+    let cursor = decode_time_uuid_cursor(query.cursor.as_deref(), ApiCursorKind::Schedules)?;
+    let mut items = state
+        .store
+        .list_schedules_page(
+            cursor.as_ref().map(|cursor| cursor.timestamp.as_str()),
+            cursor.as_ref().map(|cursor| cursor.id.as_str()),
+            limit + 1,
+        )
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::Schedules,
+                    &TimeCursor {
+                        timestamp: item
+                            .created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        id: item.id.to_string(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
 }
 
 async fn get_schedule(
@@ -221,6 +406,14 @@ async fn trigger_run(
         if let Some(run) = state.store.get_run_by_idempotency(id, key).await? {
             return Ok((StatusCode::OK, Json(serde_json::to_value(run)?)));
         }
+        if let Some(batch) =
+            crate::collection_runtime::batch_by_idempotency(&state, id, key).await?
+        {
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"kind": "batch", "batch": batch})),
+            ));
+        }
     }
     let schedule = state
         .store
@@ -228,6 +421,21 @@ async fn trigger_run(
         .await?
         .ok_or_else(ApiError::not_found)?;
     let overrides = normalize_overrides(request.parameters)?;
+    if schedule.view.spec.parameter_collection.is_some() {
+        let batch = crate::collection_runtime::create_batch_from_schedule(
+            &state,
+            &schedule,
+            &overrides,
+            "manual",
+            request.run_at.unwrap_or_else(Utc::now),
+            idempotency,
+        )
+        .await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"kind": "batch", "batch": batch})),
+        ));
+    }
     let run = create_run_from_schedule(
         &state,
         &schedule,
@@ -268,11 +476,35 @@ async fn webhook(
         {
             return Ok((StatusCode::OK, Json(serde_json::to_value(run)?)));
         }
+        if let Some(batch) =
+            crate::collection_runtime::batch_by_idempotency(&state, schedule.view.id, key).await?
+        {
+            return Ok((
+                StatusCode::OK,
+                Json(serde_json::json!({"kind": "batch", "batch": batch})),
+            ));
+        }
+    }
+    let overrides = normalize_overrides(parameters)?;
+    if schedule.view.spec.parameter_collection.is_some() {
+        let batch = crate::collection_runtime::create_batch_from_schedule(
+            &state,
+            &schedule,
+            &overrides,
+            "webhook",
+            Utc::now(),
+            idempotency,
+        )
+        .await?;
+        return Ok((
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"kind": "batch", "batch": batch})),
+        ));
     }
     let run = create_run_from_schedule(
         &state,
         &schedule,
-        &normalize_overrides(parameters)?,
+        &overrides,
         "webhook",
         Utc::now(),
         idempotency,
@@ -321,6 +553,184 @@ async fn rotate_webhook(
 #[derive(Debug, Deserialize)]
 struct ListQuery {
     limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CursorPage<T> {
+    items: Vec<T>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+const API_CURSOR_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ApiCursorKind {
+    AgentHealthEvidence,
+    Schedules,
+    Runs,
+    RunEvents,
+    RunAttempts,
+    Agents,
+    Blueprints,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ApiCursorEnvelope<T> {
+    version: u8,
+    kind: ApiCursorKind,
+    position: T,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct TimeCursor {
+    timestamp: String,
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct IdCursor {
+    id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct AttemptCursor {
+    attempt_number: u32,
+    id: String,
+}
+
+fn page_limit(limit: Option<u32>) -> u32 {
+    limit.unwrap_or(50).clamp(1, 200)
+}
+
+fn encode_api_cursor(kind: ApiCursorKind, position: &impl Serialize) -> Result<String> {
+    Ok(
+        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&ApiCursorEnvelope {
+            version: API_CURSOR_VERSION,
+            kind,
+            position,
+        })?),
+    )
+}
+
+fn decode_api_cursor<T: for<'de> Deserialize<'de>>(
+    cursor: Option<&str>,
+    expected_kind: ApiCursorKind,
+) -> Result<Option<T>> {
+    cursor
+        .map(|cursor| {
+            let bytes = URL_SAFE_NO_PAD
+                .decode(cursor)
+                .context("invalid pagination cursor")?;
+            let envelope: ApiCursorEnvelope<T> =
+                serde_json::from_slice(&bytes).context("invalid pagination cursor")?;
+            if envelope.version != API_CURSOR_VERSION || envelope.kind != expected_kind {
+                bail!("invalid pagination cursor");
+            }
+            Ok(envelope.position)
+        })
+        .transpose()
+}
+
+fn decode_time_uuid_cursor(
+    cursor: Option<&str>,
+    kind: ApiCursorKind,
+) -> Result<Option<TimeCursor>> {
+    let cursor: Option<TimeCursor> = decode_api_cursor(cursor, kind)?;
+    if let Some(cursor) = cursor.as_ref() {
+        validate_cursor_timestamp(&cursor.timestamp)?;
+        validate_cursor_uuid(&cursor.id)?;
+    }
+    Ok(cursor)
+}
+
+fn decode_blueprint_cursor(cursor: Option<&str>) -> Result<Option<TimeCursor>> {
+    let cursor: Option<TimeCursor> = decode_api_cursor(cursor, ApiCursorKind::Blueprints)?;
+    if let Some(cursor) = cursor.as_ref() {
+        validate_cursor_timestamp(&cursor.timestamp)?;
+        if !is_canonical_digest(&cursor.id) {
+            bail!("invalid pagination cursor");
+        }
+    }
+    Ok(cursor)
+}
+
+fn decode_agent_cursor(cursor: Option<&str>) -> Result<Option<IdCursor>> {
+    let cursor: Option<IdCursor> = decode_api_cursor(cursor, ApiCursorKind::Agents)?;
+    if let Some(cursor) = cursor.as_ref()
+        && scheduler_core::validate_agent_id(&cursor.id).is_err()
+    {
+        bail!("invalid pagination cursor");
+    }
+    Ok(cursor)
+}
+
+fn decode_event_cursor(cursor: Option<&str>) -> Result<Option<i64>> {
+    decode_api_cursor::<IdCursor>(cursor, ApiCursorKind::RunEvents)?
+        .map(|cursor| {
+            let id = cursor
+                .id
+                .parse::<i64>()
+                .context("invalid pagination cursor")?;
+            if id <= 0 || id.to_string() != cursor.id {
+                bail!("invalid pagination cursor");
+            }
+            Ok(id)
+        })
+        .transpose()
+}
+
+fn decode_attempt_cursor(cursor: Option<&str>) -> Result<Option<AttemptCursor>> {
+    let cursor: Option<AttemptCursor> = decode_api_cursor(cursor, ApiCursorKind::RunAttempts)?;
+    if let Some(cursor) = cursor.as_ref() {
+        if cursor.attempt_number == 0 {
+            bail!("invalid pagination cursor");
+        }
+        validate_cursor_uuid(&cursor.id)?;
+    }
+    Ok(cursor)
+}
+
+fn validate_cursor_timestamp(timestamp: &str) -> Result<()> {
+    let parsed = DateTime::parse_from_rfc3339(timestamp).context("invalid pagination cursor")?;
+    let canonical = parsed
+        .with_timezone(&Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    if canonical != timestamp {
+        bail!("invalid pagination cursor");
+    }
+    Ok(())
+}
+
+fn validate_cursor_uuid(id: &str) -> Result<()> {
+    let parsed = Uuid::parse_str(id).context("invalid pagination cursor")?;
+    if parsed.to_string() != id {
+        bail!("invalid pagination cursor");
+    }
+    Ok(())
+}
+
+fn is_canonical_digest(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn cursor_page<T: Serialize>(
+    items: Vec<T>,
+    next_cursor: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(serde_json::to_value(CursorPage {
+        items,
+        next_cursor,
+    })?))
 }
 
 async fn list_runs(
@@ -329,9 +739,35 @@ async fn list_runs(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::to_value(
-        state.store.list_runs(query.limit.unwrap_or(100)).await?,
-    )?))
+    let limit = page_limit(query.limit);
+    let cursor = decode_time_uuid_cursor(query.cursor.as_deref(), ApiCursorKind::Runs)?;
+    let mut items = state
+        .store
+        .list_runs_page(
+            cursor.as_ref().map(|cursor| cursor.timestamp.as_str()),
+            cursor.as_ref().map(|cursor| cursor.id.as_str()),
+            limit + 1,
+        )
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::Runs,
+                    &TimeCursor {
+                        timestamp: item
+                            .created_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        id: item.id.to_string(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
 }
 
 async fn get_run(
@@ -353,28 +789,70 @@ async fn run_events(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::to_value(
-        state
-            .store
-            .audit_events("run", &id.to_string(), 500)
-            .await?,
-    )?))
+    if state.store.get_run(id).await?.is_none() {
+        return Err(ApiError::not_found());
+    }
+    let limit = page_limit(query.limit);
+    let cursor_id = decode_event_cursor(query.cursor.as_deref())?;
+    let mut items = state
+        .store
+        .audit_events_page("run", &id.to_string(), cursor_id, limit + 1)
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                let id = item["id"].as_i64().context("audit event ID is malformed")?;
+                encode_api_cursor(ApiCursorKind::RunEvents, &IdCursor { id: id.to_string() })
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
 }
 
 async fn run_attempts(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
     if state.store.get_run(id).await?.is_none() {
         return Err(ApiError::not_found());
     }
-    Ok(Json(serde_json::to_value(
-        state.store.run_attempts(id).await?,
-    )?))
+    let limit = page_limit(query.limit);
+    let cursor = decode_attempt_cursor(query.cursor.as_deref())?;
+    let mut items = state
+        .store
+        .run_attempts_page(
+            id,
+            cursor.as_ref().map(|cursor| cursor.attempt_number),
+            cursor.as_ref().map(|cursor| cursor.id.as_str()),
+            limit + 1,
+        )
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::RunAttempts,
+                    &AttemptCursor {
+                        attempt_number: item.attempt_number,
+                        id: item.id.to_string(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
 }
 
 async fn cancel_run(
@@ -414,11 +892,96 @@ async fn retry_run(
 async fn list_agents(
     State(state): State<AppState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::to_value(
-        state.store.list_agents().await?,
-    )?))
+    let limit = page_limit(query.limit);
+    let cursor = decode_agent_cursor(query.cursor.as_deref())?;
+    let mut items = state
+        .store
+        .list_agents_page(cursor.as_ref().map(|cursor| cursor.id.as_str()), limit + 1)
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::Agents,
+                    &IdCursor {
+                        id: item.id.clone(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
+}
+
+async fn list_blueprints(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListQuery>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &headers)?;
+    let limit = page_limit(query.limit);
+    let cursor = decode_blueprint_cursor(query.cursor.as_deref())?;
+    let mut items = state
+        .store
+        .list_blueprint_revisions_page(
+            cursor.as_ref().map(|cursor| cursor.timestamp.as_str()),
+            cursor.as_ref().map(|cursor| cursor.id.as_str()),
+            limit + 1,
+        )
+        .await?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_cursor = has_more
+        .then(|| {
+            items.last().map(|item| {
+                encode_api_cursor(
+                    ApiCursorKind::Blueprints,
+                    &TimeCursor {
+                        timestamp: item
+                            .loaded_at
+                            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+                        id: item.digest.clone(),
+                    },
+                )
+            })
+        })
+        .flatten()
+        .transpose()?;
+    cursor_page(items, next_cursor)
+}
+
+async fn get_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<(HeaderMap, Json<Value>), ApiError> {
+    authorize(&state, &headers)?;
+    let dashboard = state.store.get_dashboard().await?;
+    let mut response_headers = HeaderMap::new();
+    response_headers.insert(header::ETAG, format!("\"{}\"", dashboard.revision).parse()?);
+    Ok((response_headers, Json(serde_json::to_value(dashboard)?)))
+}
+
+async fn update_dashboard(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<UpdateSettingsRequest>,
+) -> Result<(HeaderMap, Json<Value>), ApiError> {
+    authorize(&state, &headers)?;
+    require_if_match(&headers, request.expected_revision)?;
+    let config: scheduler_core::DashboardConfig =
+        serde_json::from_value(request.document).context("invalid dashboard configuration")?;
+    config.validate()?;
+    let revision = state
+        .store
+        .update_dashboard(&config, request.expected_revision, &request.lock_token)
+        .await?;
+    settings_update_response(revision)
 }
 
 async fn get_global_settings(
@@ -583,7 +1146,12 @@ pub async fn resolve_and_encrypt(
     )?;
     let parameters: Value =
         serde_json::from_slice(&parameters_artifact.bytes).context("invalid parameters JSON")?;
-    scheduler_core::validate_parameters(&blueprint.parameters_schema, &parameters)?;
+    if !parameters.is_object() {
+        bail!("parameters must be a JSON object");
+    }
+    if spec.parameter_collection.is_none() && blueprint.parameter_bindings.is_empty() {
+        scheduler_core::validate_parameters(&blueprint.parameters_schema, &parameters)?;
+    }
     let resolved = ResolvedScheduleSnapshot {
         blueprint,
         base_parameters: parameters,
@@ -592,7 +1160,60 @@ pub async fn resolve_and_encrypt(
     };
     let plaintext = serde_json::to_vec(&resolved)?;
     let digest = hex::encode(Sha256::digest(&plaintext));
+    let blueprint_digest = hex::encode(Sha256::digest(serde_json::to_vec(&resolved.blueprint)?));
+    let source_ref = reqwest::Url::parse(&spec.blueprint_ref.uri).map_or_else(
+        |_| spec.blueprint_ref.uri.clone(),
+        |mut uri| {
+            uri.set_query(None);
+            uri.set_fragment(None);
+            uri.to_string()
+        },
+    );
+    state
+        .store
+        .register_blueprint_revision(&NewBlueprintRevision {
+            digest: blueprint_digest,
+            resolved_snapshot_digest: digest.clone(),
+            source_ref,
+            source_version: resolved.blueprint_source_version.clone(),
+            executor_kind: match resolved.blueprint.executor {
+                scheduler_core::ExecutorSpec::Command(_) => "command".into(),
+                scheduler_core::ExecutorSpec::ExcelMacro(_) => "excel_macro".into(),
+            },
+            required_labels: serde_json::to_value(&resolved.blueprint.required_labels)?,
+            execution_policy: serde_json::to_value(&resolved.blueprint.policy)?,
+            parameter_schema: blueprint_schema_metadata(&resolved.blueprint.parameters_schema),
+            binding_declarations: serde_json::to_value(&resolved.blueprint.parameter_bindings)?,
+        })
+        .await?;
     Ok((state.cipher.encrypt(&plaintext)?, digest))
+}
+
+fn blueprint_schema_metadata(schema: &Value) -> Value {
+    let properties = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|properties| {
+            properties
+                .iter()
+                .map(|(name, value)| {
+                    let mut metadata = serde_json::Map::new();
+                    if let Some(value_type) = value.get("type") {
+                        metadata.insert("type".into(), value_type.clone());
+                    }
+                    if let Some(format) = value.get("format") {
+                        metadata.insert("format".into(), format.clone());
+                    }
+                    (name.clone(), Value::Object(metadata))
+                })
+                .collect::<serde_json::Map<_, _>>()
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "type": schema.get("type").cloned().unwrap_or(Value::String("object".into())),
+        "required": schema.get("required").cloned().unwrap_or_else(|| serde_json::json!([])),
+        "properties": properties,
+    })
 }
 
 pub async fn create_run_from_schedule(
@@ -648,6 +1269,9 @@ async fn build_run_from_schedule(
 fn validate_schedule_spec(spec: &ScheduleSpec) -> Result<()> {
     if spec.name.trim().is_empty() {
         bail!("schedule name is required");
+    }
+    if let Some(collection) = &spec.parameter_collection {
+        collection.validate()?;
     }
     if let Some(cron) = &spec.cron {
         scheduler_core::schedule::parse_cron(cron)?;
@@ -721,22 +1345,25 @@ pub struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    request_id: Option<String>,
 }
 
 impl ApiError {
-    fn unauthorized() -> Self {
+    pub(crate) fn unauthorized() -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             code: "authentication_required",
             message: "authentication required".into(),
+            request_id: None,
         }
     }
 
-    fn not_found() -> Self {
+    pub(crate) fn not_found() -> Self {
         Self {
             status: StatusCode::NOT_FOUND,
             code: "resource_not_found",
             message: "resource not found".into(),
+            request_id: None,
         }
     }
 
@@ -745,6 +1372,7 @@ impl ApiError {
             status: StatusCode::PRECONDITION_REQUIRED,
             code: "precondition_required",
             message: message.into(),
+            request_id: None,
         }
     }
 
@@ -753,6 +1381,7 @@ impl ApiError {
             status: StatusCode::PRECONDITION_FAILED,
             code: "precondition_failed",
             message: message.into(),
+            request_id: None,
         }
     }
 }
@@ -764,9 +1393,31 @@ where
     fn from(error: E) -> Self {
         let error = error.into();
         let artifact_error = error.downcast_ref::<ArtifactFetchError>();
-        let message = format!("{error:#}");
-        let (status, code) = if let Some(error) = artifact_error {
-            match error {
+        let collection_error =
+            error.downcast_ref::<crate::collection_runtime::CollectionRuntimeError>();
+        let public_message = error.to_string();
+        let (status, code, message, request_id) = if let Some(error) = collection_error {
+            let status = match error.code() {
+                "collection_source_too_large" | "collection_item_limit_exceeded" => {
+                    StatusCode::PAYLOAD_TOO_LARGE
+                }
+                "collection_source_timeout" | "collection_connector_timeout" => {
+                    StatusCode::GATEWAY_TIMEOUT
+                }
+                "collection_source_transport"
+                | "collection_source_http_status"
+                | "collection_connector_transport"
+                | "collection_connector_http_status" => StatusCode::BAD_GATEWAY,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            (
+                status,
+                error.code(),
+                format!("collection operation failed ({})", error.code()),
+                None,
+            )
+        } else if let Some(error) = artifact_error {
+            let (status, code) = match error {
                 ArtifactFetchError::Timeout { .. } => {
                     (StatusCode::GATEWAY_TIMEOUT, "connector_timeout")
                 }
@@ -791,40 +1442,107 @@ where
                 ArtifactFetchError::UnsupportedKind { .. } => {
                     (StatusCode::BAD_REQUEST, "connector_kind_not_allowed")
                 }
-            }
-        } else if message.contains("conflict") || message.contains("currently being edited") {
-            (StatusCode::CONFLICT, "conflict")
-        } else if message.contains("not found") {
-            (StatusCode::NOT_FOUND, "resource_not_found")
-        } else if message.contains("parameters failed validation") {
+            };
+            (status, code, "artifact resolution failed".into(), None)
+        } else if public_message.contains("conflict")
+            || public_message.contains("currently being edited")
+            || public_message.contains("edit lock is invalid or expired")
+        {
+            (
+                StatusCode::CONFLICT,
+                "conflict",
+                "the resource changed or is locked by another editor".into(),
+                None,
+            )
+        } else if public_message.contains("not found") {
+            (
+                StatusCode::NOT_FOUND,
+                "resource_not_found",
+                "resource not found".into(),
+                None,
+            )
+        } else if public_message.contains("parameters failed validation") {
             (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "parameter_validation_failed",
+                "parameters failed blueprint validation".into(),
+                None,
             )
-        } else if message.contains("artifact") || message.contains("blueprint") {
-            (StatusCode::BAD_REQUEST, "artifact_resolution_failed")
+        } else if public_message.contains("artifact") || public_message.contains("blueprint") {
+            (
+                StatusCode::BAD_REQUEST,
+                "artifact_resolution_failed",
+                "artifact or blueprint validation failed".into(),
+                None,
+            )
+        } else if is_safe_client_error(&public_message) {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                public_message,
+                None,
+            )
         } else {
-            (StatusCode::BAD_REQUEST, "invalid_request")
+            let request_id = crate::management::current_request_id();
+            tracing::error!(
+                %request_id,
+                error = %format!("{error:#}"),
+                "management API request failed internally"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                "internal server error; use request_id to locate the diagnostic log".into(),
+                Some(request_id),
+            )
         };
         Self {
             status,
             code,
             message,
+            request_id,
         }
     }
 }
 
+fn is_safe_client_error(message: &str) -> bool {
+    [
+        "invalid pagination cursor",
+        "invalid dashboard configuration",
+        "invalid global settings",
+        "invalid node settings",
+        "invalid parameters JSON",
+        "lock_token required",
+        "schedule has no cron trigger",
+        "schedule is paused",
+        "schedule name is required",
+        "parameter overrides must be a JSON object",
+        "must be",
+        "must contain",
+        "must use",
+        "must match",
+        "must not",
+        "at least",
+        "between",
+        "only a",
+        "already terminal",
+        "does not exist",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(serde_json::json!({
-                "error": self.message,
-                "code": self.code,
-                "status": self.status.as_u16(),
-            })),
-        )
-            .into_response()
+        let mut body = serde_json::json!({
+            "error": self.message,
+            "code": self.code,
+            "status": self.status.as_u16(),
+        });
+        if let Some(request_id) = self.request_id {
+            body["request_id"] = Value::String(request_id);
+        }
+        (self.status, Json(body)).into_response()
     }
 }
 
@@ -836,6 +1554,26 @@ pub async fn materialize_cron(state: &AppState) -> Result<()> {
         };
         let cursor = schedule.last_cron_at.unwrap_or(schedule.view.created_at);
         for next in due_cron_batch(cron, cursor, now)? {
+            opentelemetry::global::meter("scheduler-coordinator")
+                .u64_histogram("scheduler.cron.lag_ms")
+                .build()
+                .record(
+                    u64::try_from((now - next).num_milliseconds().max(0)).unwrap_or(u64::MAX),
+                    &[],
+                );
+            if schedule.view.spec.parameter_collection.is_some() {
+                let new =
+                    crate::collection_runtime::build_cron_batch(state, &schedule, next).await?;
+                match state
+                    .store
+                    .create_cron_batch(new, schedule.view.revision, cron)
+                    .await?
+                {
+                    CronBatchOccurrenceResult::Applied(_) => {}
+                    CronBatchOccurrenceResult::StaleSchedule => break,
+                }
+                continue;
+            }
             let new = build_run_from_schedule(
                 state,
                 &schedule,
@@ -928,6 +1666,144 @@ mod tests {
         }
     }
 
+    fn raw_api_cursor(version: u8, kind: &str, position: Value) -> String {
+        URL_SAFE_NO_PAD.encode(
+            serde_json::to_vec(&serde_json::json!({
+                "version": version,
+                "kind": kind,
+                "position": position,
+            }))
+            .expect("cursor fixture"),
+        )
+    }
+
+    fn assert_invalid_cursor<T: std::fmt::Debug>(result: Result<T>) {
+        let error = result.expect_err("cursor must be rejected");
+        assert!(
+            format!("{error:#}").contains("invalid pagination cursor"),
+            "unexpected cursor error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn api_cursors_are_versioned_and_bound_to_their_endpoint_kind() {
+        let position = TimeCursor {
+            timestamp: "2026-07-21T12:34:56.789Z".into(),
+            id: Uuid::new_v4().to_string(),
+        };
+        let encoded =
+            encode_api_cursor(ApiCursorKind::Schedules, &position).expect("encode cursor");
+        let decoded = decode_time_uuid_cursor(Some(&encoded), ApiCursorKind::Schedules)
+            .expect("decode matching cursor");
+        assert_eq!(decoded, Some(position));
+
+        let bytes = URL_SAFE_NO_PAD.decode(&encoded).expect("cursor base64");
+        let envelope: Value = serde_json::from_slice(&bytes).expect("cursor JSON");
+        assert_eq!(envelope["version"], API_CURSOR_VERSION);
+        assert_eq!(envelope["kind"], "schedules");
+
+        let cross_endpoint =
+            decode_time_uuid_cursor(Some(&encoded), ApiCursorKind::Runs).expect_err("kind fence");
+        let api_error = ApiError::from(cross_endpoint);
+        assert_eq!(api_error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(api_error.code, "invalid_request");
+
+        assert_invalid_cursor(decode_time_uuid_cursor(
+            Some(&raw_api_cursor(
+                API_CURSOR_VERSION + 1,
+                "schedules",
+                serde_json::json!({
+                    "timestamp": "2026-07-21T12:34:56.789Z",
+                    "id": Uuid::new_v4().to_string(),
+                }),
+            )),
+            ApiCursorKind::Schedules,
+        ));
+        assert_invalid_cursor(decode_time_uuid_cursor(
+            Some(&raw_api_cursor(
+                API_CURSOR_VERSION,
+                "unknown_list",
+                serde_json::json!({
+                    "timestamp": "2026-07-21T12:34:56.789Z",
+                    "id": Uuid::new_v4().to_string(),
+                }),
+            )),
+            ApiCursorKind::Schedules,
+        ));
+        assert_invalid_cursor(decode_time_uuid_cursor(
+            Some(
+                &URL_SAFE_NO_PAD.encode(
+                    serde_json::to_vec(&serde_json::json!({
+                        "timestamp": "2026-07-21T12:34:56.789Z",
+                        "id": Uuid::new_v4().to_string(),
+                    }))
+                    .expect("legacy cursor fixture"),
+                ),
+            ),
+            ApiCursorKind::Schedules,
+        ));
+    }
+
+    #[test]
+    fn api_cursors_reject_malformed_sort_fields_and_entity_ids() {
+        for position in [
+            serde_json::json!({
+                "timestamp": "not-a-timestamp",
+                "id": Uuid::new_v4().to_string(),
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-21T12:34:56Z",
+                "id": Uuid::new_v4().to_string(),
+            }),
+            serde_json::json!({
+                "timestamp": "2026-07-21T12:34:56.789Z",
+                "id": "not-a-uuid",
+            }),
+        ] {
+            let encoded = raw_api_cursor(API_CURSOR_VERSION, "schedules", position);
+            assert_invalid_cursor(decode_time_uuid_cursor(
+                Some(&encoded),
+                ApiCursorKind::Schedules,
+            ));
+        }
+
+        for digest in ["a".repeat(63), "A".repeat(64), "g".repeat(64)] {
+            let encoded = raw_api_cursor(
+                API_CURSOR_VERSION,
+                "blueprints",
+                serde_json::json!({
+                    "timestamp": "2026-07-21T12:34:56.789Z",
+                    "id": digest,
+                }),
+            );
+            assert_invalid_cursor(decode_blueprint_cursor(Some(&encoded)));
+        }
+
+        let invalid_agent = raw_api_cursor(
+            API_CURSOR_VERSION,
+            "agents",
+            serde_json::json!({"id": "../not-an-agent"}),
+        );
+        assert_invalid_cursor(decode_agent_cursor(Some(&invalid_agent)));
+
+        for id in ["0", "01", "-1", "not-an-event"] {
+            let encoded = raw_api_cursor(
+                API_CURSOR_VERSION,
+                "run_events",
+                serde_json::json!({"id": id}),
+            );
+            assert_invalid_cursor(decode_event_cursor(Some(&encoded)));
+        }
+
+        for position in [
+            serde_json::json!({"attempt_number": 0, "id": Uuid::new_v4().to_string()}),
+            serde_json::json!({"attempt_number": 1, "id": "not-a-uuid"}),
+        ] {
+            let encoded = raw_api_cursor(API_CURSOR_VERSION, "run_attempts", position);
+            assert_invalid_cursor(decode_attempt_cursor(Some(&encoded)));
+        }
+    }
+
     #[test]
     fn settings_updates_require_a_matching_if_match_revision() {
         let mut headers = HeaderMap::new();
@@ -1009,7 +1885,20 @@ mod tests {
         });
         assert_eq!(upstream.status, StatusCode::BAD_GATEWAY);
         assert_eq!(upstream.code, "connector_upstream_failed");
-        assert!(upstream.message.contains("503"));
+        assert_eq!(upstream.message, "artifact resolution failed");
+        assert!(!upstream.message.contains("503"));
+    }
+
+    #[test]
+    fn unexpected_api_failures_are_safe_correlated_500_errors() {
+        let error = ApiError::from(anyhow::anyhow!(
+            "database failure at /private/secret/scheduler.db: malformed row"
+        ));
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(error.code, "internal_error");
+        assert!(error.request_id.is_some());
+        assert!(!error.message.contains("scheduler.db"));
+        assert!(!error.message.contains("malformed row"));
     }
 
     #[test]
@@ -1131,6 +2020,12 @@ parameters_schema:
             sessions: Arc::new(RwLock::new(HashMap::new())),
             internal_rest_url: "http://127.0.0.1:1".into(),
             internal_admin_token: "test-admin-token".into(),
+            collection_sources: crate::collection_runtime::CollectionSourceRegistry::new(
+                vec![directory.path().to_path_buf()],
+                None,
+            )
+            .expect("collection sources"),
+            collection_worker_id: "test-coordinator".into(),
         };
         let spec = ScheduleSpec {
             name: "connector snapshot".into(),
@@ -1142,6 +2037,7 @@ parameters_schema:
             parameters_ref: ArtifactRef {
                 uri: "connector://records/accounts/current?revision=17".into(),
             },
+            parameter_collection: None,
             required_labels: Default::default(),
             cron: None,
             webhook_enabled: false,
@@ -1217,5 +2113,26 @@ parameters_schema:
         .await
         .expect("run from persisted snapshot");
         assert_eq!(run.state, scheduler_core::RunState::Queued);
+    }
+
+    #[test]
+    fn blueprint_catalog_schema_metadata_never_retains_defaults_or_examples() {
+        let metadata = blueprint_schema_metadata(&serde_json::json!({
+            "type": "object",
+            "required": ["password"],
+            "properties": {
+                "password": {
+                    "type": "string",
+                    "format": "password",
+                    "default": "must-never-appear",
+                    "examples": ["also-secret"]
+                }
+            }
+        }));
+        let encoded = serde_json::to_string(&metadata).expect("metadata");
+        assert!(encoded.contains("password"));
+        assert!(encoded.contains("format"));
+        assert!(!encoded.contains("must-never-appear"));
+        assert!(!encoded.contains("also-secret"));
     }
 }

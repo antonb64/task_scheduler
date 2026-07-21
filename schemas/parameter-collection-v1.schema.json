@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/antonb64/task_scheduler/main/schemas/parameter-collection-v1.schema.json",
+  "title": "Task Scheduler Parameter Collection v1",
+  "description": "The bounded JSON forms accepted from file and direct HTTP collection sources. NDJSON sources contain one item object per nonblank line using $defs/item. Static-source snapshot identity is derived from the exact response/file bytes; api_version and snapshot_id are optional metadata and do not override that identity.",
+  "oneOf": [
+    {
+      "type": "array",
+      "maxItems": 10000,
+      "items": {
+        "$ref": "#/$defs/item"
+      }
+    },
+    {
+      "type": "object",
+      "required": [
+        "items"
+      ],
+      "properties": {
+        "api_version": {
+          "const": "scheduler/parameter-collection/v1"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "items": {
+          "type": "array",
+          "maxItems": 10000,
+          "items": {
+            "$ref": "#/$defs/item"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "item": {
+      "type": "object",
+      "required": [
+        "key",
+        "parameters"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "parameters": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

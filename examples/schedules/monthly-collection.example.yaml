@@ -1,0 +1,20 @@
+name: monthly workbook collection
+blueprint_ref:
+  uri: file:///absolute/path/to/task_scheduler/examples/blueprints/excel-macro.yaml
+parameters_ref:
+  uri: file:///absolute/path/to/task_scheduler/examples/parameters/excel-macro.json
+parameter_collection:
+  source_ref:
+    uri: file:///absolute/path/to/task_scheduler/examples/parameter-collections/monthly-reports.example.json
+  page_size: 500
+  max_items: 10000
+  max_active_runs: 32
+  poison_distinct_nodes: 2
+required_labels:
+  os: windows
+  capability: excel
+cron:
+  expression: "0 0 6 1 * * *"
+  timezone: Europe/Vienna
+webhook_enabled: false
+enabled: true

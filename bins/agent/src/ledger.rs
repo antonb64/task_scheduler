@@ -344,7 +344,9 @@ mod tests {
                     backoff_cap_seconds: 1,
                 },
                 required_labels: BTreeMap::new(),
+                blueprint_digest: "test-blueprint".into(),
                 parameters_digest: "test-parameters".into(),
+                late_bindings: None,
             },
         }
     }

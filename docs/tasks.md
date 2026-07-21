@@ -2,7 +2,7 @@
 
 A blueprint describes how to execute work and validates its parameters. A parameter document supplies reusable base values. A schedule binds references to both artifacts, placement labels, and optional cron/webhook triggers.
 
-When a schedule is created or updated, the coordinator fetches both artifacts, parses and validates them, and encrypts a resolved snapshot. It does not fetch artifacts again for every run. Each trigger then deep-merges its overrides, validates the result, renders an immutable execution snapshot, and queues a run.
+When a schedule is created or updated, the coordinator fetches the blueprint and base parameters, parses them, and encrypts a resolved snapshot. It does not refetch those artifacts for every trigger. An ordinary trigger deep-merges overrides, validates/renders, and queues one run. A collection trigger fetches its configured collection at trigger time and creates a batch of child runs. Agent-local bindings are resolved only on the selected node.
 
 ## Artifact locations
 
@@ -40,23 +40,25 @@ enabled: true
 | `name` | Required, nonempty | Operator-visible schedule name. |
 | `blueprint_ref.uri` | Required | Blueprint artifact URI. |
 | `parameters_ref.uri` | Required | Base parameter artifact URI. |
+| `parameter_collection` | `null` | Optional per-trigger collection source and ingestion/concurrency limits. When present, a trigger creates a batch rather than one run. |
 | `required_labels` | `{}` | Additional exact-match placement labels merged over the blueprint labels. Schedule values win on duplicate keys. |
 | `cron` | `null` | `{expression, timezone}` repeated trigger. |
 | `webhook_enabled` | `false` | Whether the schedule has an authenticated public webhook. |
 | `enabled` | `true` | Paused schedules do not create or accept new runs. |
 
-Creating or updating a schedule fails if either artifact cannot be fetched, the blueprint is invalid, the base parameters fail its schema, or the cron/timezone is invalid. Updates increment the schedule revision. Already queued/running runs retain their old execution snapshots.
+Creating or updating a schedule fails if either schedule-time artifact cannot be fetched, the blueprint is invalid, or the cron/timezone is invalid. Base parameters are validated immediately for ordinary schedules. Collection schedules and blueprints with late agent bindings defer final validation until collection-item merge or agent binding resolution respectively. Updates increment the schedule revision. Already queued/running runs and batches retain their old execution snapshots.
 
 Copyable examples:
 
 - [`examples/schedules/echo.example.yaml`](../examples/schedules/echo.example.yaml)
 - [`examples/schedules/echo.example.json`](../examples/schedules/echo.example.json)
+- [`examples/schedules/monthly-collection.example.yaml`](../examples/schedules/monthly-collection.example.yaml)
 
 ## Blueprint document
 
 The formal schema is [`schemas/blueprint-v1.schema.json`](../schemas/blueprint-v1.schema.json).
 
-Version 1 ignores unknown blueprint/schedule object fields for forward compatibility. Validate documents against the published schemas and review spelling carefully; an unknown typo is not guaranteed to fail at deserialization. Connector bootstrap documents are stricter and reject unknown fields.
+Version 1 rejects unknown properties in schedule and blueprint documents, including their typed nested objects: artifact references, collection and cron specifications, executor variants, execution policy, and parameter-binding declarations. This catches misspelled configuration keys at deserialization as well as schema validation. Deliberately open maps such as labels, command environment entries, and the blueprint's JSON Schema remain maps whose member names are user-defined. Connector bootstrap documents are strict as well.
 
 ```yaml
 api_version: scheduler/v1
@@ -108,6 +110,7 @@ Top-level fields:
 | `api_version` | Required | Must be exactly `scheduler/v1`. |
 | `executor` | Required | A `command` or `excel_macro` executor. |
 | `parameters_schema` | `{"type":"object"}` | JSON Schema used for base values and every trigger-specific merged document. |
+| `parameter_bindings` | `{}` | Agent-local environment or logical secret-file values resolved just before execution. |
 | `required_labels` | `{}` | Exact-match placement labels. |
 | `policy` | Defaults below | Attempt, timeout, and retry policy. |
 
@@ -153,6 +156,132 @@ The parameter artifact is JSON:
 Manual and webhook overrides must also be JSON objects. Merge behavior is recursive for objects; arrays, scalars, and null replace the saved value at that key. The final merged document is validated before a run is committed.
 
 Validation errors returned to operators deliberately identify schema keywords and schema paths without including runtime parameter values or their object keys.
+
+## Parameter collections and batches
+
+Adding `parameter_collection` keeps the one-blueprint/one-schedule model but expands every cron, manual, future, or webhook trigger into one durable batch and one run per valid provider key:
+
+```yaml
+parameter_collection:
+  source_ref:
+    uri: connector://reporting/daily-workbooks
+  page_size: 500
+  max_items: 10000
+  max_active_runs: 32
+  poison_distinct_nodes: 2
+```
+
+Defaults and limits are:
+
+| Field | Default | Valid range | Effect |
+| --- | ---: | ---: | --- |
+| `page_size` | 500 | 1–1,000 | Maximum items requested/accepted per connector page; static sources are sliced into pages of this size. |
+| `max_items` | 10,000 | 1–10,000 | Per-batch hard limit. A non-final page that reaches the limit fails closed. |
+| `max_active_runs` | 32 | 1–1,000 | Maximum concurrently active child runs for this batch. |
+| `poison_distinct_nodes` | 2 | 2–32 | Healthy nodes which must reproduce the same ambiguous failure family before the input is confirmed poisoned. |
+
+Each collection item is an object with a stable, nonempty provider key of at most 256 bytes and a parameter object:
+
+```json
+{
+  "key": "customer-42-monthly",
+  "parameters": {
+    "workbook_path": "C:\\Reports\\Customer42.xlsm",
+    "month": "2026-07"
+  }
+}
+```
+
+Final precedence is `base parameters < collection item parameters < manual/webhook overrides`. Objects deep-merge; arrays, scalars, and null replace. One override therefore applies to every item in that trigger. The final nonsecret parameter document is schema-validated and rendered independently for each item.
+
+`file://` and unauthenticated `http(s)://` collection sources accept any of:
+
+```json
+[
+  {"key":"customer-42","parameters":{"customer_id":42}},
+  {"key":"customer-84","parameters":{"customer_id":84}}
+]
+```
+
+```json
+{
+  "api_version":"scheduler/parameter-collection/v1",
+  "snapshot_id":"operator-metadata-only",
+  "items":[{"key":"customer-42","parameters":{"customer_id":42}}]
+}
+```
+
+```text
+{"key":"customer-42","parameters":{"customer_id":42}}
+{"key":"customer-84","parameters":{"customer_id":84}}
+```
+
+For static sources, the coordinator hashes the exact file/response bytes for immutable snapshot identity; an envelope `snapshot_id` does not replace that hash. Bodies are capped at 16 MiB. File sources must resolve beneath a coordinator artifact root. Direct HTTP uses GET, no authentication or redirects, a five-second connect timeout, and a 20-second total timeout. Use an authenticated `connector://` collection for production APIs; its paginated protocol is documented in [Custom connectors](connectors.md#parameter-collection-page-protocol).
+
+The coordinator first persists a `scheduled` batch, then claims a 60-second ingestion lease, fetches and transactionally commits pages, and finalizes only after the entire source passes snapshot/cursor/limit consistency checks. Coordinator restart safely replays committed page/cursor state. No child item is dispatchable before finalization. Batch states are `scheduled`, `collecting`, `running`, `succeeded`, `completed_with_errors`, `failed`, and `cancelled`; item states are `ready`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `invalid`, `suspected_poison`, `poisoned`, and `held`.
+
+Malformed item shapes, missing/invalid keys, invalid parameters, merge/schema/render failure, and known poisoned fingerprints receive safe item failure codes while valid siblings continue. Missing keys cannot be correlated across retries, and conflicting duplicate provider keys fail the batch source consistency check. Provider keys are encrypted at rest and available only in an authenticated batch view; they are excluded from logs, telemetry, audit metadata, and fingerprints.
+
+Trigger and inspect a collection schedule:
+
+```sh
+taskctl schedules run <schedule-id> --parameters overrides.json
+taskctl batches list --limit 50
+taskctl batches show <batch-id>
+taskctl batches items <batch-id> --limit 50
+taskctl batches cancel <batch-id>
+taskctl batches retrigger <batch-id>
+```
+
+Retrigger preserves the original immutable schedule/blueprint revision, collection reference, limits, and trigger overrides, but fetches a new collection snapshot. Cancellation durably stops ingestion/finalization and cancels already queued or running child runs. There is no per-item retry command; use ordinary run retry for a terminal child run or retrigger the batch.
+
+## Agent-local environment and secret-file bindings
+
+Bindings let a blueprint declare parameter names whose values exist only on the selected node:
+
+```yaml
+parameter_bindings:
+  bwp_user:
+    source: environment
+    name: BWP_USER
+    value_type: string
+    sensitive: true
+
+  bwp_password:
+    source: secret_file
+    name: bwp-password
+    value_type: string
+    sensitive: true
+```
+
+`source` is `environment` or `secret_file`; `value_type` is `string` (default), `integer`, `number`, `boolean`, or `json`; `sensitive` defaults to `true`. Binding keys become fields in the final parameter object and must be declared by `parameters_schema` when `additionalProperties: false` is used. Agent-advertised binding availability participates in placement, but only the source/name pair is advertised—never a value.
+
+The agent must explicitly allow an environment name through `SCHEDULER_AGENT_ALLOWED_ENV_BINDINGS`. A secret-file `name` is a logical basename, never a path, and is searched beneath the configured absolute `SCHEDULER_AGENT_SECRET_ROOTS`. Traversal, absolute names, symlink escape, non-regular files, missing/unreadable values, invalid decoding, and values above `SCHEDULER_AGENT_BINDING_MAX_BYTES` are rejected before task acceptance/start with `parameter_binding_failed`. Available files are discovered by logical filename; do not use the same logical name in multiple roots.
+
+Preflight rejection is a structured control-plane response, not an agent-stream failure. `parameter_binding_failed` means binding resolution/decoding/schema rendering failed; `assignment_policy_rejected` means the now-resolved assignment violates the node's current execution policy. In either case the coordinator finishes the offered attempt with an operator-safe diagnostic and `attempt.rejected_before_acceptance` audit event, releases the node slot, and returns the run to the queue. That rejecting node remains excluded for this run; the run waits when no different eligible node exists instead of entering an unbounded offer/rejection loop. The agent remains connected, no task process starts, and the run's accepted-attempt count and retry budget are unchanged. The rejected offered-attempt record remains visible in attempt history so operators can determine which node and preflight stage failed.
+
+Resolution is performed in memory before durable acceptance and checked again immediately before launch. The resolved assignment is sent to `task-executor` over stdin, not command-line arguments. The coordinator snapshot and agent ledger retain the declaration, not resolved values. The final bound document is schema-validated and rendered on the agent.
+
+Sensitive command bindings may be referenced only from `executor.env` values. Referencing one from a program, argument, working directory, or another command field is rejected; there is no unsafe-argument override in version 1. Excel macro argument expressions may receive sensitive bindings in memory, and the COM host suppresses its payload. Non-sensitive bindings can be used anywhere normal parameter templates are accepted.
+
+Example command use:
+
+```yaml
+executor:
+  kind: command
+  program: /opt/company-tasks/export
+  args: ["--customer", "{{params.customer_id}}"]
+  env:
+    BWP_USER: "{{params.bwp_user}}"
+    BWP_PASSWORD: "{{params.bwp_password}}"
+```
+
+When any binding is sensitive, the agent clears stdout, stderr, and free-form error/diagnostic text before task-output logging, local SQLite outbox persistence, or coordinator transmission. It preserves only byte counts, truncation flags, exit/signal/status fields, and stable diagnostic classifications. Treat `sensitive: false` as an explicit disclosure decision: the scheduler still avoids parameter-value logging, but the target program and chosen output mode can expose what it receives. Binding names and secret roots are bootstrap security policy and cannot be changed through synchronized node settings.
+
+Complete secure Excel examples, with all 17 `processID` arguments but without credentials in the parameter JSON:
+
+- [`examples/blueprints/process-id-secure.yaml`](../examples/blueprints/process-id-secure.yaml)
+- [`examples/parameters/process-id-secure.json`](../examples/parameters/process-id-secure.json)
 
 ## Parameter templates
 
@@ -311,7 +440,7 @@ taskctl schedules run <schedule-id> \
   --idempotency-key customer-import-2026-08-01
 ```
 
-The initial response is `202 Accepted`. Repeating the same idempotency key for that schedule returns the existing run with `200 OK`.
+The initial response is `202 Accepted`. Repeating the same idempotency key for that schedule returns the existing run or batch with `200 OK`. A collection schedule returns `{ "kind":"batch", "batch": ... }`; inspect it with `taskctl batches show`.
 
 ## Cron triggers
 
@@ -353,7 +482,7 @@ curl -i \
   "https://scheduler.example.com:8443/hooks/v1/$PUBLIC_ID"
 ```
 
-The body is the parameter override object. It is deep-merged and validated before the run is created. Initial creation returns `202`; repeating the key returns the existing run. A missing/incorrect secret returns `401`; a disabled schedule or old/rotated public ID is not found.
+The body is the parameter override object. It is deep-merged and validated before an ordinary run or collection batch is created. Initial creation returns `202`; repeating the key returns the existing run or batch. A missing/incorrect secret returns `401`; a disabled schedule or old/rotated public ID is not found.
 
 Rotate both the public ID and secret with:
 

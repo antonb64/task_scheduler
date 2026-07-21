@@ -14,6 +14,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
 hex.workspace = true
+hmac.workspace = true
 jsonschema.workspace = true
 reqwest.workspace = true
 serde.workspace = true

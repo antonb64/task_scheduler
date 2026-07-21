@@ -2,8 +2,9 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://raw.githubusercontent.com/antonb64/task_scheduler/main/schemas/schedule-v1.schema.json",
   "title": "Task Scheduler Schedule v1",
-  "description": "The ScheduleSpec accepted by the v1 management API. Unknown properties are intentionally permitted because the Rust v1 model ignores them.",
+  "description": "The ScheduleSpec accepted by the v1 management API. Unknown top-level properties are rejected to catch configuration typos.",
   "type": "object",
+  "additionalProperties": false,
   "required": [
     "name",
     "blueprint_ref",
@@ -19,6 +20,18 @@
     },
     "parameters_ref": {
       "$ref": "#/$defs/artifact_ref"
+    },
+    "parameter_collection": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/parameter_collection"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "description": "Optional per-trigger collection expansion. When absent, the trigger creates one ordinary run."
     },
     "required_labels": {
       "$ref": "#/$defs/labels",
@@ -47,6 +60,7 @@
   "$defs": {
     "artifact_ref": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "uri"
       ],
@@ -64,8 +78,45 @@
         "type": "string"
       }
     },
+    "parameter_collection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_ref"
+      ],
+      "properties": {
+        "source_ref": {
+          "$ref": "#/$defs/artifact_ref"
+        },
+        "page_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 500
+        },
+        "max_items": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 10000
+        },
+        "max_active_runs": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000,
+          "default": 32
+        },
+        "poison_distinct_nodes": {
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 32,
+          "default": 2
+        }
+      }
+    },
     "cron": {
       "type": "object",
+      "additionalProperties": false,
       "required": [
         "expression",
         "timezone"

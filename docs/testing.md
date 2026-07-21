@@ -26,6 +26,15 @@ where at-least-once delivery commonly fails.
   schedules/runs/attempts, replaying idempotency keys, expiring leases, completing
   work, and repeatedly closing and reopening the database. It checks SQLite
   integrity, foreign keys, uniqueness, and run/attempt state invariants.
+- The store model also replays parameter-collection page commits across crash/reopen
+  boundaries and checks cursor generation, page/provider-key uniqueness, batch
+  finalization, child-run uniqueness, cancellation rollups, and per-batch
+  concurrency/fair interleaving.
+- A dedicated health model generates diverse functional, ambiguous, strong-local,
+  and cluster-sensitive evidence. It proves that one input and ordinary business
+  failures cannot quarantine a node, poison needs distinct healthy nodes in one
+  failure family, cluster/retracted evidence is excluded, and threshold decisions
+  remain deterministic.
 - Focused store regressions verify cron cursor reset/preservation and prove that
   stale revisions or changed cron identities cannot insert or advance an occurrence.
   A dense every-second fallback test guards the coordinator's single batch scan.
@@ -41,6 +50,24 @@ live ledger owners, cancellation before spawn, corrupt-row quarantine,
 persisted disabled settings, stale/expired/cancelled/finished resume rejection,
 capacity-one recovery queuing, inherited output pipes, and the Windows Excel
 identity/Job Object contract.
+
+Focused collection tests cover JSON/NDJSON parsing, bounded paging, snapshot drift,
+bad/cyclic cursors, connector request/response shape, valid-item continuation,
+invalid item quarantine, duplicate rollback, restart replay, idempotent cron batch
+creation, and batch cancellation. Binding tests cover environment allowlists,
+logical secret names, traversal and symlink escape, regular-file/size/type parsing,
+schema validation, placement capability matching, redacted failures, sensitive
+command-field restrictions, and pre-accept rejection without retry-budget or stream
+loss. Management tests cover stable cursor bounds, wildcard-safe ID search,
+dashboard lock/revision fencing, request-ID panic containment, proxy panic
+containment, and bounded proxy bodies. Published-schema tests also enforce strict
+unknown-property rejection throughout typed schedule and blueprint objects.
+
+Security/management regressions also bind the peer leaf-certificate SHA-256 to the
+claimed agent ID, reject unregistered/mismatched/missing certificates and duplicate
+configuration entries, verify contended settings/dashboard pages are read-only and
+do not expose lock tokens, and prove force-releasing an existing lock appends the
+safe audit event. Queue-depth store tests separately prove exact ready/delayed counts.
 
 ## Running the suites
 
@@ -78,6 +105,7 @@ for custom soaks and exact replay.
 | Cron | `SCHEDULER_CRON_SIM_SEED_START` | `SCHEDULER_CRON_SIM_SEEDS` |
 | SQLite store | `SCHEDULER_STORE_SIM_SEED_START` | `SCHEDULER_STORE_SIM_SEEDS`, `SCHEDULER_STORE_SIM_STEPS` |
 | Coordinator protocol | `SCHEDULER_SIM_SEED` | `SCHEDULER_SIM_CASES` |
+| Health correlation | `SCHEDULER_HEALTH_SIM_SEED_START` | `SCHEDULER_HEALTH_SIM_SEEDS`, `SCHEDULER_HEALTH_SIM_STEPS` |
 
 The simulators enforce upper bounds on configurable volume so an accidental
 environment value cannot create an unbounded CI run.
@@ -114,8 +142,26 @@ cargo test -p coordinator --test protocol_simulation -- \
   --nocapture --test-threads=1
 ```
 
+For a health-correlation failure, replay exactly one seed and enough steps to
+include the reported position:
+
+```sh
+SCHEDULER_HEALTH_SIM_SEED_START=1000123 \
+SCHEDULER_HEALTH_SIM_SEEDS=1 \
+SCHEDULER_HEALTH_SIM_STEPS=241 \
+cargo test -p scheduler-core --test health_simulation -- --nocapture
+```
+
+The health defaults are 512 seeds × 240 steps in `fast` and 4,096 × 2,000 in
+`soak`; the test caps them at 16,384 seeds and 10,000 steps.
+
 Keep the recent trace from a failure in the bug report. It is part of the replay
 contract and shows the last operations that led to the invariant violation.
+
+There is not yet a standalone 10,000-item wall-clock load-test binary or a real
+OTLP HTTP/protobuf/mTLS integration suite. Collection limits and crash/replay
+invariants are tested in the current unit/store simulations; licensed Excel remains
+the only test of real Office COM behavior.
 
 ## Continuous integration
 

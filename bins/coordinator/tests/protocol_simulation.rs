@@ -480,6 +480,7 @@ async fn create_schedule(store: &Store, seed: u64) -> Uuid {
                 parameters_ref: ArtifactRef {
                     uri: "file:///simulation-parameters".into(),
                 },
+                parameter_collection: None,
                 required_labels: BTreeMap::new(),
                 cron: None,
                 webhook_enabled: false,
@@ -522,6 +523,7 @@ fn execution_snapshot() -> ExecutionSnapshot {
             working_directory: None,
         }),
         parameters_schema: serde_json::json!({"type": "object"}),
+        parameter_bindings: BTreeMap::new(),
         required_labels: BTreeMap::new(),
         policy: ExecutionPolicy {
             max_attempts: 1,
@@ -534,7 +536,9 @@ fn execution_snapshot() -> ExecutionSnapshot {
         executor: blueprint.executor,
         policy: blueprint.policy,
         required_labels: blueprint.required_labels,
+        blueprint_digest: "simulation-blueprint".into(),
         parameters_digest: "simulation-parameters".into(),
+        late_bindings: None,
     }
 }
 

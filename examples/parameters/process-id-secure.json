@@ -1,0 +1,17 @@
+{
+  "id": 2147483647,
+  "workbook_name": "Monthly Processing.xlsm",
+  "recipients": "operations@example.com;finance@example.com",
+  "selection_variant": "CURRENT_AND_ARCHIVED",
+  "responsible": "Ada Lovelace",
+  "subject": "Processing result – July",
+  "body": "Line 1\nLine 2",
+  "pdf": true,
+  "mailfilter": false,
+  "query1": "SELECT * FROM CurrentData WHERE Status = 'Ready'",
+  "query2": "",
+  "query3": "",
+  "query4": "",
+  "query5": "",
+  "info": false
+}

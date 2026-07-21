@@ -45,6 +45,12 @@ pub struct Config {
     pub grpc_tls_key: Option<PathBuf>,
     #[arg(long, env = "SCHEDULER_GRPC_CLIENT_CA")]
     pub grpc_client_ca: Option<PathBuf>,
+    #[arg(
+        long = "agent-certificate-fingerprint",
+        env = "SCHEDULER_AGENT_CERTIFICATE_FINGERPRINTS",
+        value_delimiter = ','
+    )]
+    pub agent_certificate_fingerprints: Vec<String>,
     #[arg(long, env = "SCHEDULER_HTTP_TLS_CERT")]
     pub http_tls_cert: Option<PathBuf>,
     #[arg(long, env = "SCHEDULER_HTTP_TLS_KEY")]

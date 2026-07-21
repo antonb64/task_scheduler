@@ -46,7 +46,9 @@ async fn run_macro(
                 ..ExecutionPolicy::default()
             },
             required_labels: BTreeMap::new(),
+            blueprint_digest: "test-blueprint".into(),
             parameters_digest: "test".into(),
+            late_bindings: None,
         },
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_task-executor"))

@@ -1,4 +1,5 @@
 {
+  "workbook_path": "C:\\TaskWorkbooks\\Validation.xlsm",
   "input_file": "C:\\TaskInput\\input.csv",
   "batch_number": 42,
   "strict": true

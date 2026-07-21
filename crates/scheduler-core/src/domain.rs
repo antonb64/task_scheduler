@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactRef {
     pub uri: String,
 }
@@ -28,10 +29,13 @@ pub fn validate_agent_id(id: &str) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ScheduleSpec {
     pub name: String,
     pub blueprint_ref: ArtifactRef,
     pub parameters_ref: ArtifactRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameter_collection: Option<crate::ParameterCollectionSpec>,
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -47,17 +51,21 @@ fn default_true() -> bool {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CronSpec {
     pub expression: String,
     pub timezone: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Blueprint {
     pub api_version: String,
     pub executor: ExecutorSpec,
     #[serde(default = "empty_schema")]
     pub parameters_schema: Value,
+    #[serde(default)]
+    pub parameter_bindings: BTreeMap<String, crate::ParameterBinding>,
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -76,6 +84,7 @@ pub enum ExecutorSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommandSpec {
     pub program: String,
     #[serde(default)]
@@ -87,6 +96,7 @@ pub struct CommandSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExcelMacroSpec {
     pub workbook_path: String,
     #[serde(default)]
@@ -103,6 +113,7 @@ pub struct ExcelMacroSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionPolicy {
     #[serde(default = "default_max_attempts")]
     pub max_attempts: u32,
@@ -154,7 +165,11 @@ pub struct ExecutionSnapshot {
     pub executor: ExecutorSpec,
     pub policy: ExecutionPolicy,
     pub required_labels: BTreeMap<String, String>,
+    #[serde(default)]
+    pub blueprint_digest: String,
     pub parameters_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub late_bindings: Option<crate::LateBindingSnapshot>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,6 +282,7 @@ pub struct FailureStatus {
 #[serde(rename_all = "snake_case")]
 pub enum FailureCode {
     AssignmentRejected,
+    ParameterBindingFailed,
     ExecutorStartFailed,
     ExecutorProcessCrashed,
     ExecutorProtocolError,
@@ -306,6 +322,7 @@ pub enum FailureOrigin {
 pub enum FailureStage {
     Placement,
     Validation,
+    ParameterBinding,
     ExecutorStart,
     ProcessStart,
     Isolation,
@@ -346,6 +363,7 @@ impl ExecutionOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GlobalSettings {
     pub revision: i64,
     pub default_timezone: String,
@@ -404,6 +422,7 @@ impl GlobalSettings {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NodeSettings {
     pub revision: i64,
     pub enabled: bool,

@@ -21,6 +21,7 @@ export SCHEDULER_ADMIN_TOKEN='<admin-token>'
 taskctl nodes
 taskctl schedules list
 taskctl runs list --limit 100
+taskctl batches list --limit 50
 ```
 
 The Nodes page/API reports hostname, connected state, advertised capacity/running count, bootstrap labels, last seen time, desired/applied settings revisions, and the current settings rejection error when present. A disconnected node cannot receive new assignments. A desired revision higher than the applied revision means synchronization is pending or rejected; inspect `settings_error` to distinguish them. Rejections and stale acknowledgements do not advance the applied revision or hot-apply unacknowledged placement settings. After a reconnect, a node with no provable prior applied document is placement-ineligible until it acknowledges the current desired revision. The same state can be inspected in the coordinator database read-only:
@@ -40,7 +41,7 @@ queued -> running -> succeeded
                   -> cancelled
 ```
 
-The coordinator persists an attempt and lease before offering it. The agent persists acceptance before acknowledging it. Offers that never become accepted do not consume an attempt. A failed accepted attempt returns the run to `queued` with exponential backoff until the snapshot's maximum is reached.
+The coordinator persists an attempt and lease before offering it. The agent persists acceptance before acknowledging it. Offers that never become accepted do not consume an attempt. A structured binding/policy rejection is retained as a finished diagnostic attempt but leaves the run's accepted-attempt counter unchanged. A failed accepted attempt returns the run to `queued` with exponential backoff until the snapshot's maximum is reached.
 
 The agent retains a finished result in its local outbox until the coordinator acknowledges it. Duplicate offers and results are idempotent at protocol boundaries, but duplicate task execution remains possible around lease expiry. Use `TASK_RUN_ID` inside application logic to make side effects idempotent.
 
@@ -53,34 +54,96 @@ RUST_LOG=info
 RUST_LOG=info,scheduler_store=debug
 ```
 
-Useful correlation fields include `run_id`, `attempt_id`, `agent_id`, failure code/origin/stage, and settings revision. Do not configure debug output into an untrusted sink.
+Useful correlation fields include request, schedule, schedule revision, blueprint digest, batch, run, attempt, agent/node, settings revision, trigger, connector, HTTP/gRPC status, process status, and failure code/origin/stage. Not every event has every field. Start with one durable ID from the UI/API, then filter on its linked run/attempt/batch/node IDs. Do not configure debug output into an untrusted sink.
 
-Task stdout and stderr are captured in bounded buffers and also logged line by line with target `scheduler.task_output`, `stream`, `sequence`, run ID, and attempt ID. A single exported line is capped at 65,536 bytes; the captured stdout and stderr buffers are capped at 1 MiB each. Tasks must never print passwords, tokens, full parameter documents, or other secrets.
+`SCHEDULER_TASK_OUTPUT_LOGGING` controls the agent's `scheduler.task_output` events. Attempts with at least one sensitive binding always suppress stdout, stderr, and free-form result text before any logging, local ledger write, or transmission:
+
+| Mode | Behavior |
+| --- | --- |
+| `off` | Emits no task-output event. |
+| `metadata` | Default. Emits only stdout/stderr byte counts and truncation flags with run/attempt IDs. |
+| `content` | Emits captured stdout/stderr line content with stream and sequence. Each exported line is capped at 65,536 UTF-8 bytes. |
+
+The execution capture remains bounded to 1 MiB per stream in every mode and its metadata remains available in attempt diagnostics. `content` is an explicit data-disclosure setting: scheduler redaction cannot reliably remove secrets printed by arbitrary tasks. Keep production at `metadata` or `off`; never print passwords, tokens, provider keys, parameter documents, collection cursors, or secret values.
+
+Useful filters include:
+
+```sh
+RUST_LOG=info,scheduler_store=debug
+RUST_LOG=info,scheduler.task_output=off
+RUST_LOG=info,coordinator.dispatch=debug
+```
+
+The last target-specific syntax depends on the log collector's handling of Rust tracing targets. Keep full safe diagnostics in a protected sink; UI `500` pages deliberately show only a request ID.
 
 ## OpenTelemetry
 
-Set the bootstrap endpoint on each process:
+Set bootstrap telemetry on each process. gRPC remains the default:
 
 ```sh
 OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.internal:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 ```
 
-The implementation uses OTLP over gRPC and exports tracing spans, metrics, and bridged structured logs in batches. Export calls have five-second timeouts. Collector unavailability does not stop scheduling, and providers attempt to flush during a normal process drop.
+For OTLP HTTP/protobuf:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.internal:4318
+OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+```
+
+The exporter supports global and per-signal standard endpoint, protocol, and header variables: `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_{ENDPOINT,PROTOCOL,HEADERS}`. A global HTTP endpoint gets `/v1/traces`, `/v1/metrics`, or `/v1/logs` appended; an explicit per-signal endpoint is used as provided. Headers use the standard comma-separated `key=value` form with percent decoding.
+
+Prefer local secret files over putting credentials in an environment or synchronized settings:
+
+```sh
+SCHEDULER_OTLP_CREDENTIAL_FILE=/run/secrets/otel-bearer-token
+SCHEDULER_OTLP_HEADERS_FILE=/run/secrets/otel-headers
+SCHEDULER_OTLP_TLS_CA_FILE=/etc/task-scheduler/otel-ca.pem
+SCHEDULER_OTLP_TLS_CLIENT_CERT_FILE=/etc/task-scheduler/otel-client.pem
+SCHEDULER_OTLP_TLS_CLIENT_KEY_FILE=/etc/task-scheduler/otel-client.key
+```
+
+The credential file contains the bare bearer token and produces an `Authorization: Bearer ...` header. `SCHEDULER_OTLP_BEARER_TOKEN_FILE` is an alias. The headers file uses the same `key=value,key2=value2` format as `OTEL_EXPORTER_OTLP_HEADERS`; environment headers override duplicate file keys. Standard TLS aliases `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, and `OTEL_EXPORTER_OTLP_CLIENT_KEY` are also accepted. Client certificate/key must be configured together. Each secret file is capped at 64 KiB; endpoints may not contain credentials or query strings. Values and file paths are redacted from telemetry configuration debug output.
+
+The implementation exports traces, metrics, and bridged structured logs in bounded batches. Span/log queues hold 2,048 items and export at most 512 per batch; metrics export every 30 seconds; calls have five-second timeouts. Collector unavailability does not stop scheduling. Authenticated `GET /api/v1/telemetry/status` reports safe coordinator exporter state: configured flag, protocol (`grpc`, `http/protobuf`, `mixed`, or `disabled`), last-success Unix milliseconds, safe last-error class, failed-export item count, batches in flight, and queue capacities. The dashboard renders this as local/configured/degraded with dropped and in-flight counts. It never exposes endpoints, headers, credentials, certificate material, or file paths. Providers attempt to flush during normal shutdown.
 
 The currently emitted metrics are:
 
 | Metric | Source | Attributes |
 | --- | --- | --- |
 | `scheduler.dispatch.offers` | coordinator | none |
+| `scheduler.dispatch.passes` / `scheduler.dispatch.candidates` | coordinator | none |
+| `scheduler.queue.depth` | coordinator | `readiness=ready|delayed` |
+| `scheduler.dispatch.decisions` | coordinator | `decision` |
+| `scheduler.dispatch.latency_ms` | coordinator | none |
 | `scheduler.lease.expirations` | coordinator | none |
+| `scheduler.agent.acceptances` | coordinator | `result` |
 | `scheduler.attempt.results` | coordinator | `outcome` |
+| `scheduler.settings.sync` | coordinator/agent | `result` |
+| `scheduler.agent.assignment_offers` | agent | `result`, `executor` |
+| `scheduler.agent.results` | agent | `result` |
+| `scheduler.agent.result_persist_retries` | agent | none |
 | `scheduler.task.completions` | agent | `outcome`, `executor` |
 | `scheduler.task.failures` | agent | `code`, `origin`, `stage` |
 | `scheduler.task.duration_ms` | agent | none |
+| `scheduler.executor.lifetime_ms` | agent | executor lifecycle attributes |
+| `scheduler.management.proxy.requests` / `scheduler.management.proxy.duration_ms` | agent | bounded `result`, `status_class` |
+| `scheduler.collection.source.fetches` / `scheduler.collection.source.fetch.duration_ms` | coordinator | `source=file|http|connector`, `outcome=success|error` |
+| `scheduler.collection.errors` | coordinator | bounded safe `stage`, `code` |
+| `scheduler.collection.worker.claimed_batches` | coordinator | none |
+| `scheduler.collection.batches` | coordinator | `state` |
+| `scheduler.collection.state_transitions` | coordinator | `to` |
+| `scheduler.collection.items` | coordinator | `state=ready|invalid|poisoned|held` |
+| `scheduler.collection.page.commits` / `scheduler.collection.page.items` / `scheduler.collection.page.duration_ms` | coordinator | `source`, `outcome=applied|replayed|stale|error` |
+| `scheduler.collection.finalizations` / `scheduler.collection.finalization.duration_ms` | coordinator | `outcome=finalized|already_finalized|error` |
+| `scheduler.node_health.transitions` | coordinator | `state` |
 
-The synchronized global/node `otlp_endpoint` fields are currently reserved and do not hot-reconfigure the provider. Restart the relevant process after changing `OTEL_EXPORTER_OTLP_ENDPOINT`.
+The synchronized global/node `otlp_endpoint` fields are currently reserved and do not hot-reconfigure the provider. All endpoint/protocol/credential/TLS changes require a process restart. Atomic runtime exporter reconfiguration is not implemented; a bad startup configuration fails startup rather than replacing a live exporter.
 
-Useful alerts include sustained lease expirations, repeated infrastructure failure codes, no results following dispatch offers, desired/applied settings divergence, and missing agent-connected logs. Queue depth and connector health are not currently exported as dedicated metrics; query the management API and logs instead.
+Collection traces are `coordinator.collection.worker_pass`, `coordinator.collection.batch`, `coordinator.collection.source.fetch`, `coordinator.collection.page.commit`, and `coordinator.collection.batch.finalize`. They correlate batch/schedule/trigger, safe source kind/page size, page generation/count/finality/outcome, and finalization outcome without provider keys, cursors, resource queries, or parameters. `coordinator.health.classify_attempt` correlates run, attempt, and node in a trace; node IDs intentionally remain out of metric labels. Queue depth is observed inside `coordinator.dispatch.pass`, with each candidate in `coordinator.dispatch.candidate`.
+
+Useful alerts include sustained nonzero ready queue depth, delayed-queue growth, cron lag, collection source errors/latency, failed finalizations, invalid/poisoned/held item rates, automatic node-health transitions, lease expirations, repeated infrastructure failure codes, exhausted active/Excel slots, no results following dispatch offers, management 5xx latency, desired/applied settings divergence, and missing agent-connected logs. Exporter failures/dropped counts, in-flight batches, and configured queue capacities are available through telemetry status; the upstream SDK does not expose exact instantaneous queue occupancy.
 
 ## Failure diagnostics
 
@@ -111,10 +174,13 @@ Stable codes include:
 | Area | Codes |
 | --- | --- |
 | Assignment/agent | `assignment_rejected`, `executor_start_failed`, `executor_process_crashed`, `executor_protocol_error`, `agent_lease_expired`, `infrastructure_error` |
+| Binding | `parameter_binding_failed` |
 | Command | `process_spawn_failed`, `process_isolation_failed`, `process_exited_non_zero`, `process_crashed`, `process_timed_out`, `cancelled` |
 | Excel | `excel_unsupported`, `excel_startup_failed`, `excel_workbook_open_failed`, `excel_correlation_setup_failed`, `excel_macro_failed`, `excel_macro_returned_failure`, `excel_invalid_return`, `excel_process_crashed`, `excel_cleanup_failed` |
 
 Origins identify the component: `coordinator`, `agent`, `task_executor`, `command_process`, `excel_host_process`, `excel_automation`, or `excel_macro`. Stages distinguish placement, validation, executor/process startup, isolation, execution, Excel startup/workbook/correlation/invocation/result/cleanup, result decoding, lease, and cancellation.
+
+At the control-protocol boundary, the two structured pre-accept rejection codes are `parameter_binding_failed` and `assignment_policy_rejected`. The coordinator persists the latter as diagnostic code `assignment_rejected` with origin `agent` and stage `validation`.
 
 Interpret common cases:
 
@@ -123,6 +189,8 @@ Interpret common cases:
 - `executor_process_crashed`: `task-executor` itself exited without a valid result. Check agent/executor versions and OS logs.
 - `process_timed_out`: the blueprint timeout elapsed and the process tree was terminated.
 - `agent_lease_expired`: coordinator heartbeats stopped renewing this exact attempt. A duplicate attempt may follow.
+- `parameter_binding_failed`: the selected node could not safely advertise, read, decode, validate, or render a declared environment/secret-file binding. Confirm the source/name allowlist, service environment or secret root/file ACL, type, size, and schema. The diagnostic intentionally omits the name/path/value.
+- `assignment_rejected` at the validation stage: after resolving late bindings, the node found that the assignment violates its current command/workbook allowlist or another execution-policy check. Compare the node's desired/applied settings and the executor path. The wire rejection code is `assignment_policy_rejected`; the persisted diagnostic code is `assignment_rejected`.
 - `excel_macro_returned_failure`: the macro returned integer `1`; this is an application failure.
 - `excel_invalid_return`: the macro returned neither integer `0` nor integer `1`.
 - `excel_process_crashed`: the private Excel process died or COM/RPC disconnected.
@@ -130,7 +198,47 @@ Interpret common cases:
 - `excel_correlation_setup_failed`: reserved workbook names conflict or could not be installed.
 - `excel_cleanup_failed`: close, quit, or COM release failed after execution.
 
-The diagnostic `retryable` value is advisory metadata. Current run-state logic retries every non-successful accepted result while attempts remain.
+The diagnostic `retryable` value is advisory metadata. Current run-state logic retries every non-successful accepted result while attempts remain. A `parameter_binding_failed` or validation-stage `assignment_rejected` received before acceptance is different: it is recorded for diagnosis, returns the run to the queue, does not increment the accepted-attempt count, and does not tear down the agent stream or start `task-executor`. The rejecting node stays excluded for that run; if no other eligible node exists, the run waits rather than hot-looping.
+
+## Input poison and node health
+
+Health scoring is separate from `NodeSettings.enabled`. Inspect it from `/nodes/{agent-id}`, the health API, or:
+
+```sh
+taskctl nodes health <agent-id>
+taskctl nodes evidence <agent-id>
+```
+
+`process_exited_non_zero` and `excel_macro_returned_failure` (macro return `1`) are functional/business observations. They prove that the node executed the workload contract and never poison an input or penalize a node. Cancellation is ignored. Crash, timeout, Excel invocation/contract/cleanup, and other ambiguous failures first make an input suspected. The same failure family on the schedule's `poison_distinct_nodes` healthy nodes, at least two, confirms poison unless a later functional success intervenes. Retries prefer a different healthy node; without one the input remains suspected rather than being falsely confirmed.
+
+Confirmed fingerprints are based on blueprint digest plus canonical nonsecret parameters. Sensitive bound values and provider keys are excluded. Future matching collection items become `held`. Release one audited probe from the input-health action in the UI or:
+
+```sh
+taskctl input-health probe <64-hex-blueprint-digest> <64-hex-input-fingerprint>
+```
+
+Node scoring considers the latest observation per input, at most ten, inside 15 minutes. It becomes `suspect` after at least three failures across three fingerprints and a 50% failure rate. Normal auto-quarantine requires at least five failures, a 60% rate, and four fingerprints across at least two schedules; one-schedule evidence requires six fingerprints. Strong local failures—executor start/protocol, binding availability, process isolation, Excel unsupported/startup—use a five-minute fast path of three fingerprints across two schedules. Lease incidents can be cluster-suppressed, and evidence later confirmed as input poison is retracted from node scoring. One repeated input alone cannot quarantine a node.
+
+Quarantine blocks new placement but does not stop active work:
+
+```sh
+taskctl nodes quarantine <agent-id>
+taskctl nodes reset <agent-id>
+```
+
+Reset is allowed only from manual/automatic quarantine and enters `probation` at capacity one. Five functional observations across three inputs restore `healthy`; an ambiguous/strong infrastructure observation re-quarantines the node. Every transition, retraction, manual action, and probe is audited. Do not reset repeatedly to hide a hardware/Excel installation fault; fix it, then use probation as the controlled verification path.
+
+## Management UI and diagnostics
+
+Every connected node proxies the coordinator-authoritative control panel. Schedule, run, attempt, run-event, batch/item, node, node-health-evidence, and blueprint-revision REST lists use cursor-page objects. They default to 50 entries and clamp requests to 1–200; stable entity-specific timestamps/numbers plus IDs define traversal order. Preserve the opaque cursor unchanged for the same endpoint and filters. `taskctl` prints the page envelope, including any `next_cursor`, rather than silently unwrapping or fetching every page.
+
+Global ID search accepts a canonical ID or unique/ambiguous prefix of at least eight safe characters and searches schedule, run, attempt, node, and loaded blueprint digest records. It shows all matches rather than selecting an ambiguous prefix. Batch/provider-key search is deliberately local to an authenticated batch detail page and exact-match only.
+
+The cluster dashboard is revision-fenced and protected by the same two-minute edit lease as settings. Up to 100 schedule cards can be ordered. Cards show a 24-hour view of queued/running, success/business/infrastructure counts, invalid and poisoned/held items, retries, node diversity, p50/p95 duration (bounded to 10,000 sampled attempt durations), and last execution/success/failure. Daily schedule rollups are persisted transactionally for terminal outcomes, while the current dashboard combines live queries. The UI does not currently offer selectable 7-day/30-day windows.
+
+Loaded-blueprint pages show metadata only: digest, redacted source, source version/load time, executor kind, labels, policy/schema/binding declarations, and current/retained usage. Collection/base parameter values and secret values are never shown.
+
+Management requests carry `X-Request-ID`, route spans, and panic-catching middleware. A panic or operator-safe database/proxy failure returns a stable error page containing only that request ID; it must not terminate the coordinator/agent. Agent proxy bodies and timeouts are bounded. Search the structured logs for the ID to locate the full safe diagnostic.
 
 ## SQLite backup and restore
 
@@ -207,6 +315,23 @@ taskctl runs show <run-id>
 - `running` must be below the node's applied `max_parallel`.
 - Excel requires a Windows node with `excel_max_parallel: 1`.
 - A future run remains queued until `scheduled_at`/`not_before`.
+- The node must be healthy/suspect/probation (quarantined nodes reject placement), and probation has capacity one.
+- Every declared binding source/name must be advertised by the node.
+
+### A collection batch fails or stops progressing
+
+```sh
+taskctl batches show <batch-id>
+taskctl batches items <batch-id> --limit 200
+```
+
+- `collection_connector_*`: verify connector config, bearer environment, TLS/route, content type, protocol version, and upstream status. The scheduler never falls back.
+- `collection_snapshot_drift`/`collection_snapshot_expired`: the provider changed or expired the immutable view during paging. Extend snapshot lifetime and replay from a stable transaction/version.
+- `collection_cursor_cycle`/`collection_cursor_invalid`: the provider repeated, emptied, oversized, or malformed a non-final cursor/page.
+- `collection_conflicting_duplicate_key`/`collection_duplicate_key`: stable provider keys were repeated inconsistently. Make keys unique and deterministic within a snapshot.
+- `collection_item_limit_exceeded`/`collection_page_too_large`/`collection_source_too_large`: reduce the source/page or increase the schedule limit within the hard cap.
+- Item codes `collection_item_invalid_*`, `collection_item_schema_invalid`, `collection_item_merge_failed`, or `collection_item_render_failed` quarantine only bad items; inspect counts and provider keys in the authenticated batch page while valid siblings continue.
+- `collection_input_poisoned`/`held`: inspect the linked input-health evidence and release a single probe only after diagnosing the workload.
 
 ### The node is online but rejects an assignment
 
@@ -219,6 +344,8 @@ taskctl runs show <run-id>
 
 - Verify the gRPC URL and network route, not the REST port.
 - Supply CA, certificate, and key together.
+- Confirm the coordinator has exactly one `SCHEDULER_AGENT_CERTIFICATE_FINGERPRINTS` entry for the configured `SCHEDULER_AGENT_ID` and that it is the SHA-256 of the presented leaf certificate's DER bytes—not of its PEM file text.
+- After client-certificate renewal, update the fingerprint map and restart the coordinator before switching the agent certificate.
 - Verify the server certificate SAN or set `SCHEDULER_AGENT_TLS_DOMAIN` deliberately.
 - Check certificate validity, key ACLs, and client-CA chain.
 - Ensure no second process owns the same local ledger lock.
@@ -227,7 +354,15 @@ taskctl runs show <run-id>
 
 - `503 Coordinator is unavailable`: the agent has no active gRPC client.
 - `502`: the gRPC management call or coordinator's internal REST request failed.
+- For native HTTPS, configure both `SCHEDULER_AGENT_UI_TLS_CERT` and `SCHEDULER_AGENT_UI_TLS_KEY` and verify their PEM/hostname. A partial pair, certificate/key load error, UI bind failure, or later listener/server failure terminates the agent; inspect the startup log and service restart status.
+- For proxy TLS, keep the agent listener on loopback HTTP and verify the proxy forwards the complete request/response without exposing port 8081.
 - Verify `SCHEDULER_INTERNAL_REST_URL`, including HTTP versus HTTPS and certificate trust.
+
+### A settings or dashboard editor is read-only
+
+- Another tab/session owns the two-minute lock. The page shows owner category and expiry but never its token.
+- Use **Retry lock** after the other page navigates away or the lease expires.
+- Use **Force unlock** only after confirming the other editor is abandoned. The action is CSRF-protected and audited as `settings.lock_force_released`; it invalidates the other page's token but does not bypass revision checks.
 
 ### Schedule creation cannot read an artifact
 
@@ -270,16 +405,17 @@ taskctl runs show <run-id>
 - Delivery is at least once, not exactly once. A lease race can execute duplicate attempts.
 - Process groups/Job Objects isolate crashes and cleanup; they are not a privilege or filesystem/network sandbox.
 - One administrator token grants full management access. Scoped API tokens, accounts, roles, and multi-user audit identity are not implemented.
-- mTLS verifies the client CA but does not bind certificate subject/SAN to `agent_id`.
-- The agent UI listener is plaintext HTTP. Keep it loopback-only and put a TLS reverse proxy in front for production; direct HTTP is incompatible with the coordinator's recommended Secure session cookie.
+- Production gRPC mTLS binds the exact leaf-certificate SHA-256 fingerprint to `agent_id`; subject/SAN text is not the identity mapping. Renewals require a configured fingerprint cutover and coordinator restart.
+- The agent UI can terminate HTTPS with `SCHEDULER_AGENT_UI_TLS_CERT`/`KEY`. Without them, keep its HTTP listener loopback-only and use a trusted TLS reverse proxy; direct HTTP is incompatible with the coordinator's recommended Secure session cookie.
 - Coordinator snapshots/results are encrypted, but the agent ledger stores rendered assignments, environment/argument values, and results in plaintext for durable delivery. Protect the ledger directory with strict OS ACLs. Acknowledged rows are not automatically pruned.
-- Raw task output can contain secrets and is exported to logs/OTLP. Avoid printing secrets.
+- Raw task output can contain secrets. The default exports metadata only. `SCHEDULER_TASK_OUTPUT_LOGGING=content` deliberately exports content only for attempts without sensitive bindings; sensitive-binding attempts suppress task text in every mode. Applications should still avoid printing secrets.
 - Online master-key rotation and multi-key decryption are not implemented.
 - `audit_retention_days` does not currently prune audit events.
 - Synchronized OTLP endpoint fields do not currently hot-apply.
 - Node settings rejection errors are exposed in the API/UI. Rejected, stale, future, and late acknowledgements do not advance the applied revision or alter effective placement settings.
 - Built-in backup/checkpoint automation is not implemented.
-- Dedicated queue-depth, cron-lag, adapter-health, settings-sync, active-slot, and dropped-telemetry metrics are not yet emitted.
+- Queue depth, cron lag, collection ingestion/state/items/errors/latency, node-health transitions, settings sync, management request latency/status class, and active total/Excel slot capacity have dedicated metrics. Exporter failure/drop state is exposed through telemetry status rather than a self-referential OTLP metric.
+- OTLP HTTP/protobuf, header/credential files, custom TLS files, per-signal endpoints, and safe coordinator exporter status are startup-supported. The status endpoint/dashboard cover the coordinator process, not each remote agent exporter; atomic runtime telemetry reconfiguration is not implemented.
 - Readiness covers SQLite only.
 - Built-in direct HTTP artifact fetching has no production header configuration. Use a named connector when authentication is required.
 - Connector health/discovery and automatic connector-to-file fallback are not implemented.

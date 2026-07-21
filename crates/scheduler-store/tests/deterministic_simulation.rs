@@ -3,9 +3,13 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Duration, TimeZone, Utc};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use scheduler_core::{
-    ArtifactRef, ExecutionOutcome, ExecutionResult, OutputMetadata, RunState, ScheduleSpec,
+    ArtifactRef, BatchItemState, ExecutionOutcome, ExecutionResult, OutputMetadata, RunState,
+    ScheduleSpec,
 };
-use scheduler_store::{AttemptRecord, NewRun, NewSchedule, Store};
+use scheduler_store::{
+    AttemptRecord, CommitCollectionPage, CommitPageOutcome, FinalizeBatchOutcome, NewBatch,
+    NewBatchItem, NewRun, NewSchedule, Store,
+};
 use tempfile::TempDir;
 use tokio::task::JoinSet;
 use uuid::Uuid;
@@ -93,6 +97,7 @@ fn schedule_spec(name: impl Into<String>) -> ScheduleSpec {
         parameters_ref: ArtifactRef {
             uri: "file:///simulation/parameters.json".into(),
         },
+        parameter_collection: None,
         required_labels: BTreeMap::new(),
         cron: None,
         webhook_enabled: true,
@@ -168,6 +173,148 @@ fn sim_unwrap<T, E: std::fmt::Display>(
             trace.join("\n")
         )
     })
+}
+
+#[tokio::test]
+async fn paged_collection_replay_is_deterministic_across_crash_boundaries() {
+    for seed in simulation_seeds() {
+        let mut database = Database::new(seed + 50_000).await;
+        let schedule_id = deterministic_uuid(seed + 50_000, 1);
+        create_schedule(&database.store, schedule_id, "collection-simulation").await;
+        let batch_id = deterministic_uuid(seed + 50_000, 2);
+        database
+            .store
+            .create_batch(NewBatch {
+                id: batch_id,
+                schedule_id,
+                schedule_revision: 1,
+                trigger_kind: "manual".into(),
+                scheduled_at: fixed_time(seed as i64),
+                idempotency_key: Some(format!("collection-{seed}")),
+                encrypted_snapshot: vec![1],
+                encrypted_trigger_overrides: None,
+                snapshot_digest: format!("snapshot-{seed}"),
+                key_id: "simulation-key".into(),
+                page_size: 7,
+                max_items: 10_000,
+                max_active_runs: 32,
+                poison_distinct_nodes: 2,
+            })
+            .await
+            .expect("create collection batch");
+        let claimed = database
+            .store
+            .claim_collection_batches("simulation-collector", 300, 1)
+            .await
+            .expect("claim batch");
+        let lease_token = claimed[0]
+            .lease_token
+            .as_deref()
+            .expect("lease token")
+            .to_owned();
+        let mut rng = StdRng::seed_from_u64(seed ^ 0xa11c_e5ed);
+        let mut cursor = "start".to_owned();
+        let mut item_index = 0_u32;
+        for generation in 0..4_u64 {
+            let is_final = generation == 3;
+            let page_len = if is_final { 4 } else { 7 };
+            let next_cursor = if is_final {
+                "end".to_owned()
+            } else {
+                format!("cursor-{}", generation + 1)
+            };
+            let items = (0..page_len)
+                .map(|_| {
+                    let index = item_index;
+                    item_index += 1;
+                    NewBatchItem {
+                        id: deterministic_uuid(seed + 50_000, 100 + u64::from(index)),
+                        item_index: index,
+                        provider_key_encrypted: vec![index as u8],
+                        provider_key_hmac: format!("key-{seed}-{index}"),
+                        encrypted_parameters: vec![index as u8, 1],
+                        encrypted_snapshot: Some(vec![index as u8, 2]),
+                        key_id: "simulation-key".into(),
+                        parameters_digest: format!("parameters-{seed}-{index}"),
+                        state: BatchItemState::Ready,
+                        failure_code: None,
+                        max_attempts: Some(3),
+                        initial_backoff_seconds: Some(1),
+                        backoff_cap_seconds: Some(3),
+                    }
+                })
+                .collect();
+            let page = CommitCollectionPage {
+                batch_id,
+                lease_token: lease_token.clone(),
+                expected_generation: generation,
+                request_cursor_digest: cursor.clone(),
+                page_digest: format!("page-{seed}-{generation}"),
+                collection_snapshot_encrypted: vec![3],
+                collection_snapshot_digest: format!("provider-snapshot-{seed}"),
+                next_cursor_encrypted: (!is_final).then(|| vec![generation as u8]),
+                next_cursor_digest: next_cursor.clone(),
+                is_final,
+                items,
+            };
+            assert_eq!(
+                database
+                    .store
+                    .commit_collection_page(page.clone())
+                    .await
+                    .expect("commit page"),
+                CommitPageOutcome::Applied
+            );
+            if rng.gen_bool(0.75) {
+                database.reopen().await;
+            }
+            assert_eq!(
+                database
+                    .store
+                    .commit_collection_page(page)
+                    .await
+                    .expect("replay committed page"),
+                CommitPageOutcome::Replayed
+            );
+            cursor = next_cursor;
+        }
+        database.reopen().await;
+        assert_eq!(
+            database
+                .store
+                .finalize_batch(batch_id, &lease_token)
+                .await
+                .expect("finalize batch"),
+            FinalizeBatchOutcome::Finalized
+        );
+        database.reopen().await;
+        assert_eq!(
+            database
+                .store
+                .finalize_batch(batch_id, &lease_token)
+                .await
+                .expect("replay finalization"),
+            FinalizeBatchOutcome::AlreadyFinalized
+        );
+        assert_eq!(
+            database
+                .store
+                .list_batch_items(batch_id, 100)
+                .await
+                .expect("items")
+                .len(),
+            25
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM runs WHERE batch_id=?")
+                .bind(batch_id.to_string())
+                .fetch_one(database.store.pool())
+                .await
+                .expect("run count"),
+            25,
+            "seed {seed} produced duplicate or missing child runs"
+        );
+    }
 }
 
 async fn assert_database_invariants(store: &Store, seed: u64, step: usize, trace: &[String]) {

@@ -29,7 +29,9 @@ fn assignment(program: &str, args: Vec<String>, lease_seconds: u64) -> Execution
                 ..ExecutionPolicy::default()
             },
             required_labels: BTreeMap::new(),
+            blueprint_digest: "test-blueprint".into(),
             parameters_digest: "test".into(),
+            late_bindings: None,
         },
     }
 }

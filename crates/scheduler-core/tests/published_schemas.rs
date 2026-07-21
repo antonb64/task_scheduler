@@ -73,9 +73,24 @@ fn every_published_schema_is_valid_draft_2020_12() {
     for schema in [
         "blueprint-v1.schema.json",
         "schedule-v1.schema.json",
+        "parameter-collection-v1.schema.json",
         "connectors-v1.schema.json",
     ] {
         let _ = validator(schema);
+    }
+}
+
+#[test]
+fn parameter_collection_examples_match_the_published_schema() {
+    let validator = validator("parameter-collection-v1.schema.json");
+    let examples = example_documents("parameter-collections");
+    assert!(
+        !examples.is_empty(),
+        "expected parameter collection examples"
+    );
+    for path in examples {
+        let instance = read_yaml_or_json(&path);
+        assert_valid(&validator, &instance, &path.display().to_string());
     }
 }
 
@@ -238,16 +253,62 @@ fn published_blueprint_schema_enforces_excel_scalar_and_argument_limits() {
 }
 
 #[test]
-fn schemas_match_runtime_unknown_property_behavior() {
+fn published_blueprint_schema_matches_parameter_binding_model() {
+    let validator = validator("blueprint-v1.schema.json");
+    let valid = serde_json::json!({
+        "api_version": "scheduler/v1",
+        "executor": {
+            "kind": "command",
+            "program": "runner",
+            "env": {"PASSWORD": "{{params.password}}"}
+        },
+        "parameter_bindings": {
+            "password": {
+                "source": "secret_file",
+                "name": "reporting-password",
+                "value_type": "string"
+            },
+            "enabled": {
+                "source": "environment",
+                "name": "REPORTING_ENABLED",
+                "value_type": "boolean",
+                "sensitive": false
+            }
+        }
+    });
+    assert_valid(&validator, &valid, "parameter binding blueprint");
+    scheduler_core::blueprint::parse_blueprint(
+        &serde_json::to_vec(&valid).unwrap(),
+        Some("application/json"),
+    )
+    .expect("runtime model");
+
+    let mut invalid = valid.clone();
+    invalid["parameter_bindings"]["password"]["name"] = serde_json::json!("../password");
+    assert!(!validator.is_valid(&invalid));
+    assert!(
+        scheduler_core::blueprint::parse_blueprint(
+            &serde_json::to_vec(&invalid).unwrap(),
+            Some("application/json")
+        )
+        .is_err()
+    );
+
+    let mut invalid = valid;
+    invalid["parameter_bindings"]["enabled"]["name"] = serde_json::json!("INVALID-NAME");
+    assert!(!validator.is_valid(&invalid));
+}
+
+#[test]
+fn schemas_and_runtime_reject_unknown_top_level_properties() {
     let blueprint_validator = validator("blueprint-v1.schema.json");
     let blueprint = serde_json::json!({
         "api_version": "scheduler/v1",
         "executor": {"kind": "command", "program": "runner", "future_field": true},
         "future_field": {"accepted": true}
     });
-    assert_valid(&blueprint_validator, &blueprint, "extended blueprint");
-    serde_json::from_value::<scheduler_core::Blueprint>(blueprint)
-        .expect("Rust blueprint model ignores unknown fields");
+    assert!(!blueprint_validator.is_valid(&blueprint));
+    assert!(serde_json::from_value::<scheduler_core::Blueprint>(blueprint).is_err());
 
     let schedule_validator = validator("schedule-v1.schema.json");
     let schedule = serde_json::json!({
@@ -256,9 +317,8 @@ fn schemas_match_runtime_unknown_property_behavior() {
         "parameters_ref": {"uri": "file:///tasks/parameters.json"},
         "future_field": true
     });
-    assert_valid(&schedule_validator, &schedule, "extended schedule");
-    serde_json::from_value::<ScheduleSpec>(schedule)
-        .expect("Rust schedule model ignores unknown fields");
+    assert!(!schedule_validator.is_valid(&schedule));
+    assert!(serde_json::from_value::<ScheduleSpec>(schedule).is_err());
 
     let connector_validator = validator("connectors-v1.schema.json");
     let connector = serde_json::json!({
@@ -267,4 +327,58 @@ fn schemas_match_runtime_unknown_property_behavior() {
     });
     assert!(!connector_validator.is_valid(&connector));
     assert!(serde_json::from_value::<ConnectorConfig>(connector).is_err());
+}
+
+#[test]
+fn schemas_and_runtime_reject_unknown_nested_properties() {
+    let blueprint_validator = validator("blueprint-v1.schema.json");
+    let valid_blueprint = serde_json::json!({
+        "api_version": "scheduler/v1",
+        "executor": {"kind": "command", "program": "runner"},
+        "parameter_bindings": {
+            "credential": {"source": "environment", "name": "TASK_CREDENTIAL"}
+        },
+        "policy": {}
+    });
+    for pointer in ["/executor", "/parameter_bindings/credential", "/policy"] {
+        let mut document = valid_blueprint.clone();
+        document
+            .pointer_mut(pointer)
+            .expect("nested blueprint object")["misspelled_field"] = Value::Bool(true);
+        assert!(
+            !blueprint_validator.is_valid(&document),
+            "pointer {pointer}"
+        );
+        assert!(
+            serde_json::from_value::<scheduler_core::Blueprint>(document).is_err(),
+            "runtime accepted unknown field at {pointer}"
+        );
+    }
+
+    let schedule_validator = validator("schedule-v1.schema.json");
+    let valid_schedule = serde_json::json!({
+        "name": "strict nested schedule",
+        "blueprint_ref": {"uri": "file:///tasks/blueprint.yaml"},
+        "parameters_ref": {"uri": "file:///tasks/parameters.json"},
+        "parameter_collection": {
+            "source_ref": {"uri": "file:///tasks/items.ndjson"}
+        },
+        "cron": {"expression": "0 0 * * * *", "timezone": "UTC"}
+    });
+    for pointer in [
+        "/blueprint_ref",
+        "/parameter_collection",
+        "/parameter_collection/source_ref",
+        "/cron",
+    ] {
+        let mut document = valid_schedule.clone();
+        document
+            .pointer_mut(pointer)
+            .expect("nested schedule object")["misspelled_field"] = Value::Bool(true);
+        assert!(!schedule_validator.is_valid(&document), "pointer {pointer}");
+        assert!(
+            serde_json::from_value::<ScheduleSpec>(document).is_err(),
+            "runtime accepted unknown field at {pointer}"
+        );
+    }
 }

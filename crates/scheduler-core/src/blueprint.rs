@@ -4,7 +4,10 @@ use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{Blueprint, ExecutionSnapshot, ExecutorSpec, ResolvedScheduleSnapshot};
+use crate::{
+    Blueprint, ExecutionSnapshot, ExecutorSpec, LateBindingSnapshot, ResolvedScheduleSnapshot,
+    validate_parameter_bindings,
+};
 
 pub fn parse_blueprint(bytes: &[u8], media_type: Option<&str>) -> Result<Blueprint> {
     let defaults = crate::ExecutionPolicy::default();
@@ -62,6 +65,7 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<()> {
         }
         _ => {}
     }
+    validate_parameter_bindings(&blueprint.parameter_bindings, &blueprint.executor)?;
     jsonschema::validator_for(&blueprint.parameters_schema).context("invalid parameters_schema")?;
     Ok(())
 }
@@ -155,20 +159,49 @@ pub fn resolve_snapshot(
     parameters: &Value,
     schedule_labels: &BTreeMap<String, String>,
 ) -> Result<ExecutionSnapshot> {
-    validate_parameters(&resolved.blueprint.parameters_schema, parameters)?;
-    let executor = render_executor(&resolved.blueprint.executor, parameters)?;
+    if !parameters.is_object() {
+        bail!("parameters must be a JSON object");
+    }
+    let late_bindings = if resolved.blueprint.parameter_bindings.is_empty() {
+        validate_parameters(&resolved.blueprint.parameters_schema, parameters)?;
+        None
+    } else {
+        let object = parameters.as_object().expect("checked above");
+        if resolved
+            .blueprint
+            .parameter_bindings
+            .keys()
+            .any(|name| object.contains_key(name))
+        {
+            bail!("saved parameters must not contain values for bound parameters");
+        }
+        Some(LateBindingSnapshot {
+            executor_template: resolved.blueprint.executor.clone(),
+            parameters_schema: resolved.blueprint.parameters_schema.clone(),
+            parameters: parameters.clone(),
+            bindings: resolved.blueprint.parameter_bindings.clone(),
+        })
+    };
+    let executor = if late_bindings.is_some() {
+        resolved.blueprint.executor.clone()
+    } else {
+        render_executor(&resolved.blueprint.executor, parameters)?
+    };
     let mut required_labels = resolved.blueprint.required_labels.clone();
     required_labels.extend(schedule_labels.clone());
     let parameters_digest = hex::encode(Sha256::digest(serde_json::to_vec(parameters)?));
+    let blueprint_digest = hex::encode(Sha256::digest(serde_json::to_vec(&resolved.blueprint)?));
     Ok(ExecutionSnapshot {
         executor,
         policy: resolved.blueprint.policy.clone(),
         required_labels,
+        blueprint_digest,
         parameters_digest,
+        late_bindings,
     })
 }
 
-fn render_executor(executor: &ExecutorSpec, parameters: &Value) -> Result<ExecutorSpec> {
+pub(crate) fn render_executor(executor: &ExecutorSpec, parameters: &Value) -> Result<ExecutorSpec> {
     match executor {
         ExecutorSpec::Command(command) => Ok(ExecutorSpec::Command(crate::CommandSpec {
             program: command.program.clone(),
@@ -319,6 +352,7 @@ policy:
                     working_directory: None,
                 }),
                 parameters_schema: serde_json::json!({"type": "object"}),
+                parameter_bindings: BTreeMap::new(),
                 required_labels: BTreeMap::new(),
                 policy: ExecutionPolicy::default(),
             },
@@ -353,6 +387,7 @@ policy:
                     visible: false,
                 }),
                 parameters_schema: serde_json::json!({"type": "object"}),
+                parameter_bindings: BTreeMap::new(),
                 required_labels: BTreeMap::new(),
                 policy: ExecutionPolicy::default(),
             },
@@ -454,6 +489,7 @@ policy:
                 visible: false,
             }),
             parameters_schema: serde_json::json!({"type": "object"}),
+            parameter_bindings: BTreeMap::new(),
             required_labels: BTreeMap::new(),
             policy: ExecutionPolicy::default(),
         };
@@ -578,6 +614,7 @@ parameters_schema:
                     working_directory: None,
                 }),
                 parameters_schema: schema,
+                parameter_bindings: BTreeMap::new(),
                 required_labels: BTreeMap::new(),
                 policy: ExecutionPolicy::default(),
             },
@@ -593,5 +630,100 @@ parameters_schema:
         assert!(resolution_error.contains("schema path /properties/credential/maxLength"));
         assert!(resolution_error.contains("`additionalProperties`"));
         assert!(resolution_error.contains("schema path /additionalProperties"));
+    }
+
+    #[test]
+    fn bound_parameters_are_deferred_until_agent_resolution() {
+        let blueprint = parse_blueprint(
+            br#"
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: runner
+  env:
+    TASK_PASSWORD: '{{params.password}}'
+parameter_bindings:
+  password:
+    source: secret_file
+    name: task-password
+parameters_schema:
+  type: object
+  required: [customer, password]
+  properties:
+    customer: {type: string}
+    password: {type: string, minLength: 8}
+"#,
+            Some("application/yaml"),
+        )
+        .expect("bound blueprint");
+        let parameters = serde_json::json!({"customer": "account-42"});
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint,
+            base_parameters: parameters.clone(),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+        let snapshot =
+            resolve_snapshot(&resolved, &parameters, &BTreeMap::new()).expect("deferred snapshot");
+        let late = snapshot.late_bindings.as_ref().expect("late bindings");
+        assert_eq!(late.bindings["password"].name, "task-password");
+        assert_eq!(late.parameters, parameters);
+        assert!(
+            !serde_json::to_string(&snapshot)
+                .unwrap()
+                .contains("actual-secret")
+        );
+
+        let error = crate::resolve_parameter_bindings(
+            &snapshot,
+            &BTreeMap::from([("password".into(), serde_json::json!("short"))]),
+        )
+        .expect_err("schema validation happens after binding")
+        .to_string();
+        assert!(!error.contains("short"));
+        assert!(error.contains("parameters failed validation"));
+
+        let final_snapshot = crate::resolve_parameter_bindings(
+            &snapshot,
+            &BTreeMap::from([("password".into(), serde_json::json!("actual-secret"))]),
+        )
+        .expect("agent-side resolution");
+        assert!(final_snapshot.late_bindings.is_none());
+        let ExecutorSpec::Command(command) = final_snapshot.executor else {
+            panic!("command");
+        };
+        assert_eq!(command.env["TASK_PASSWORD"], "actual-secret");
+    }
+
+    #[test]
+    fn saved_parameters_cannot_override_bound_values() {
+        let blueprint = parse_blueprint(
+            br#"
+api_version: scheduler/v1
+executor:
+  kind: command
+  program: runner
+  env:
+    TOKEN: '{{params.token}}'
+parameter_bindings:
+  token:
+    source: environment
+    name: TASK_TOKEN
+"#,
+            Some("application/yaml"),
+        )
+        .expect("blueprint");
+        let parameters = serde_json::json!({"token": "must-not-be-persisted"});
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint,
+            base_parameters: parameters.clone(),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+        let error = resolve_snapshot(&resolved, &parameters, &BTreeMap::new())
+            .expect_err("bound value collision")
+            .to_string();
+        assert!(!error.contains("must-not-be-persisted"));
+        assert!(error.contains("must not contain values for bound parameters"));
     }
 }

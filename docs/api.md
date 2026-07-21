@@ -26,6 +26,29 @@ GET /health/ready
 
 Success is `204 No Content`. Readiness currently checks SQLite only.
 
+### Telemetry exporter status
+
+```text
+GET /api/v1/telemetry/status
+```
+
+This endpoint requires administrator authentication and reports the coordinator process's safe exporter status:
+
+```json
+{
+  "configured": true,
+  "protocol": "http/protobuf",
+  "last_success_unix_ms": 1784606400123,
+  "last_error_class": null,
+  "dropped_telemetry": 0,
+  "export_batches_in_flight": 0,
+  "span_queue_capacity": 2048,
+  "log_queue_capacity": 2048
+}
+```
+
+`protocol` can be `grpc`, `http/protobuf`, `mixed`, or `disabled`. The response never includes endpoints, headers, credentials, certificates, keys, or secret-file paths. It covers the coordinator exporter only; agent exporter status is logged locally at agent startup and is not aggregated here.
+
 ## Error envelope
 
 API errors are JSON:
@@ -61,6 +84,31 @@ Stable envelope codes include:
 
 Do not parse the free-form `error` text for automation; use `code` and HTTP status.
 
+## Cursor pagination
+
+The schedule, run, attempt, event, agent, health-evidence, and blueprint REST list endpoints return a page object rather than a bare array:
+
+```json
+{
+  "items": [],
+  "next_cursor": "endpoint-specific-opaque-value"
+}
+```
+
+The `limit` query parameter defaults to 50 and is clamped to 1–200. When `next_cursor` is present, pass it unchanged as the next request's `cursor`; it is omitted on the final page. Cursors are URL-safe, versioned, and bound to the originating list kind. They must not be decoded, modified, or reused with another endpoint. A legacy/unknown version, cross-endpoint cursor, malformed timestamp, or invalid entity identifier returns `400 invalid_request`. Stable order is:
+
+| List | Order |
+| --- | --- |
+| Schedules | `created_at` descending, then schedule ID descending |
+| Runs | `created_at` descending, then run ID descending |
+| Attempts for one run | attempt number ascending, then attempt ID ascending |
+| Audit events for one run | event ID descending |
+| Agents | agent ID ascending |
+| Health evidence for one agent | `occurred_at` descending, then evidence ID descending |
+| Blueprint revisions | `loaded_at` descending, then blueprint digest descending |
+
+Batch and batch-item lists use the same outer response envelope and limits but retain their own opaque cursor format; their ordering is documented below. `taskctl` prints the response page, including `items` and any `next_cursor`, instead of unwrapping it. The current CLI does not automatically fetch subsequent pages; use the REST API with the returned cursor when a full traversal is required.
+
 ## Schedules
 
 ### List schedules
@@ -71,10 +119,10 @@ curl -sS "$SCHEDULER_URL/api/v1/schedules" \
 ```
 
 ```text
-GET /api/v1/schedules
+GET /api/v1/schedules?limit=50&cursor=<opaque>
 ```
 
-Returns an array of schedule views. Views contain `id`, `spec`, `revision`, timestamps, and optional `webhook_public_id`. Secrets and resolved parameter values are never returned.
+Returns a cursor page of schedule views. Views contain `id`, `spec`, `revision`, timestamps, and optional `webhook_public_id`. Secrets and resolved parameter values are never returned.
 
 ### Create a schedule
 
@@ -193,7 +241,22 @@ curl -sS "$SCHEDULER_URL/api/v1/schedules/$SCHEDULE_ID/runs" \
   -d '{"parameters":{"name":"manual invocation"}}'
 ```
 
-Initial creation returns `202 Accepted` with the run view. A repeated idempotency key for the same schedule returns that run with `200 OK`. Idempotency keys are shared across manual and webhook triggers for a schedule; use a namespaced value.
+For an ordinary schedule, initial creation returns `202 Accepted` with the run view. For a collection schedule it returns a discriminated receipt:
+
+```json
+{
+  "kind": "batch",
+  "batch": {
+    "id": "...",
+    "schedule_id": "...",
+    "schedule_revision": 4,
+    "state": "scheduled",
+    "item_count": 0
+  }
+}
+```
+
+A repeated idempotency key for the same schedule returns the existing run or batch with `200 OK`. Idempotency keys are shared across manual and webhook triggers for a schedule; use a namespaced value. Collection overrides are merged into every item after base and item parameters.
 
 ## Public webhook
 
@@ -211,20 +274,65 @@ curl -sS "$SCHEDULER_URL/hooks/v1/$PUBLIC_ID" \
   -d '{"name":"webhook invocation"}'
 ```
 
-The body must be an override object. It is deeply merged over base parameters and validated. Initial success is `202`; an idempotent replay is `200`. Disabled/paused/rotated schedules are deliberately unavailable.
+The body must be an override object. It is deeply merged over base parameters for an ordinary schedule or over every collection item. Initial success is `202`; an idempotent replay is `200`. Collection webhooks return the same discriminated batch receipt shown above. Disabled/paused/rotated schedules are deliberately unavailable.
+
+## Parameter-collection batches
+
+### List and inspect batches
+
+```text
+GET /api/v1/batches?limit=50&cursor=<opaque>
+GET /api/v1/batches/{batch_id}
+GET /api/v1/batches/{batch_id}/items?limit=50&cursor=<opaque>
+GET /api/v1/batches/{batch_id}/items?provider_key=<exact-key>
+```
+
+Batch and item list pages default to 50 rows and clamp `limit` to 1–200. `next_cursor` is URL-safe opaque state; pass it back unchanged and do not parse or persist assumptions about its contents:
+
+```json
+{
+  "items": [
+    {
+      "id": "...",
+      "schedule_id": "...",
+      "state": "running",
+      "item_count": 600,
+      "valid_item_count": 598,
+      "invalid_item_count": 2,
+      "poisoned_item_count": 0,
+      "held_item_count": 0,
+      "failure_code": null
+    }
+  ],
+  "next_cursor": "eyJjcmVhdGVkX2F0IjoiLi4uIn0"
+}
+```
+
+Items are ordered by stable item index and ID. The authenticated item view includes decrypted `provider_key`, safe `failure_code`, state, parameter digest, and optional child `run_id`, but never parameter values. `provider_key` is an exact match only, at most 256 bytes, and intentionally scoped to one batch; there is no global provider-key search.
+
+Batch states are `scheduled`, `collecting`, `running`, `succeeded`, `completed_with_errors`, `failed`, and `cancelled`. Item states are `ready`, `queued`, `running`, `succeeded`, `failed`, `cancelled`, `invalid`, `suspected_poison`, `poisoned`, and `held`.
+
+### Cancel and retrigger
+
+```text
+POST /api/v1/batches/{batch_id}/cancel
+POST /api/v1/batches/{batch_id}/retrigger
+```
+
+Cancel returns `202 Accepted`, stops later ingestion/finalization, and cancels queued/running child runs. Retrigger returns `202` with `{ "kind":"batch", "batch": ... }`; it preserves the original immutable schedule/blueprint revision, collection reference/limits, and overrides, then fetches the collection again as a new batch.
 
 ## Runs
 
 ### List and inspect
 
 ```text
-GET /api/v1/runs?limit=100
+GET /api/v1/runs?limit=50&cursor=<opaque>
 GET /api/v1/runs/{run_id}
-GET /api/v1/runs/{run_id}/attempts
-GET /api/v1/runs/{run_id}/events
+GET /api/v1/runs/{run_id}/attempts?limit=50&cursor=<opaque>
+GET /api/v1/runs/{run_id}/events?limit=50&cursor=<opaque>
 ```
 
-`limit` defaults to 100. The store caps audit event reads at 1,000; run events request the latest 500.
+The runs, attempts, and events list calls each return the cursor-page envelope described above.
 
 `/attempts` returns:
 
@@ -235,7 +343,7 @@ GET /api/v1/runs/{run_id}/events
 - bounded output byte/truncation metadata;
 - structured failure diagnostic.
 
-Raw stdout/stderr, encrypted result payloads, parameters, and environment values are not returned. `taskctl runs show <run-id>` combines the run and attempts endpoints.
+Raw stdout/stderr, encrypted result payloads, parameters, and environment values are not returned. `taskctl runs show <run-id>` combines the run object and the first attempts page as `{ "run": ..., "attempts": { "items": [...], "next_cursor": ... } }`.
 
 `/events` returns persisted audit events with ID, event type, safe metadata, and occurrence time.
 
@@ -251,10 +359,55 @@ Both return `202 Accepted`. Cancel works only for queued/running runs and durabl
 ## Agents
 
 ```text
-GET /api/v1/agents
+GET /api/v1/agents?limit=50&cursor=<opaque>
 ```
 
-Returns node ID, hostname, labels, capacity/running count, connected state, desired/applied settings revisions, optional `settings_error`, and last-seen timestamp. `settings_error` contains the latest rejection of the current desired revision and is cleared by a new desired revision or a successful current acknowledgement. Node settings are a separate endpoint.
+Returns a cursor page containing node ID, hostname, labels, capacity/running count, connected state, desired/applied settings revisions, optional `settings_error`, and last-seen timestamp. `settings_error` contains the latest rejection of the current desired revision and is cleared by a new desired revision or a successful current acknowledgement. Node settings are a separate endpoint.
+
+### Node and input health
+
+```text
+GET  /api/v1/agents/{agent_id}/health
+GET  /api/v1/agents/{agent_id}/health/evidence?limit=50&cursor=<opaque>
+POST /api/v1/agents/{agent_id}/health/quarantine
+POST /api/v1/agents/{agent_id}/health/reset
+POST /api/v1/input-health/{blueprint_digest}/{input_fingerprint}/probe
+```
+
+The health view includes `state`, `reason_code`, scoring counts/rate, revision, and transition/update timestamps. States are `healthy`, `suspect`, `auto_quarantined`, `manual_quarantined`, and `probation`. Evidence is cursor-paginated and contains safe classification/failure metadata plus flags indicating cluster suppression or poison retraction; it excludes parameters, provider keys, secret values, and task output.
+
+Manual quarantine blocks new placement without terminating active work and returns the new health view. Reset is valid only for a quarantined node and enters capacity-one probation; it does not erase the audit trail. A probe path requires two exact 64-character hexadecimal digests and releases one audited attempt for a confirmed poisoned input. Repeated probe grants do not create an unbounded bypass.
+
+CLI equivalents are `taskctl nodes health|evidence|quarantine|reset <agent-id>` and `taskctl input-health probe <blueprint-digest> <input-fingerprint>`.
+
+## Blueprint catalog and dashboard
+
+```text
+GET /api/v1/blueprints?limit=50&cursor=<opaque>
+GET /api/v1/dashboard
+PUT /api/v1/dashboard
+```
+
+The blueprint catalog returns a cursor page of loaded revisions ordered newest first by load time and digest. Each item contains digest, query/fragment-redacted source reference, optional source version, load time, executor kind, required labels, execution policy, parameter schema, binding declarations, and current/retained schedule counts. It never contains resolved base/collection/environment/secret values. A catalog row is metadata about a loaded immutable revision, not a live refetch.
+
+Dashboard reads include an `ETag` and a versioned `{revision, config}` document. Config fields are:
+
+```json
+{
+  "schedule_ids": ["018f6f8c-6302-7fc5-a0cb-b4e421fd61af"],
+  "widgets": [
+    "cluster_capacity",
+    "active_batches",
+    "recent_failures",
+    "quarantined_nodes",
+    "connector_health",
+    "telemetry_health",
+    "selected_schedules"
+  ]
+}
+```
+
+At most 100 unique schedule IDs are allowed; order is display order and widgets must be unique. Update the dashboard through the same lock/revision protocol as settings, using document key `dashboard`, `If-Match`, `expected_revision`, and `lock_token`. The telemetry widget uses the safe live coordinator exporter status and shows local/configured/degraded, protocol, dropped count, and export batches in flight. The connector widget reports configuration/observed batch posture. Neither is an active readiness probe.
 
 ## Settings
 
@@ -323,6 +476,8 @@ Administrative force release omits/ignores the token:
 ```json
 {"owner_session":"administrator","force":true}
 ```
+
+An existing force-released lock writes the safe audit event `settings.lock_force_released` for entity type `settings` and the document key. In the browser, lock contention renders the current global/node/dashboard document read-only with owner category and expiry, plus Retry and confirmed Force unlock actions; no competing lock token is exposed. Force release does not bypass the subsequent `If-Match`/revision check.
 
 ### Update a document
 

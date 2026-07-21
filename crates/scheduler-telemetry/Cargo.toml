@@ -7,9 +7,18 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+http.workspace = true
 opentelemetry.workspace = true
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
+reqwest.workspace = true
+reqwest-otel = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls", "http2"] }
+serde.workspace = true
+tonic.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+tokio.workspace = true

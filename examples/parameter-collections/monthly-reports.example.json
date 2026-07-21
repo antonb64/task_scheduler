@@ -1,0 +1,20 @@
+{
+  "api_version": "scheduler/parameter-collection/v1",
+  "snapshot_id": "monthly-reports-2026-07",
+  "items": [
+    {
+      "key": "customer-42-monthly",
+      "parameters": {
+        "workbook_path": "C:\\TaskWorkbooks\\Reports\\Customer42.xlsm",
+        "input_file": "C:\\TaskInput\\Customer42-2026-07.csv"
+      }
+    },
+    {
+      "key": "customer-84-monthly",
+      "parameters": {
+        "workbook_path": "C:\\TaskWorkbooks\\Reports\\Customer84.xlsm",
+        "input_file": "C:\\TaskInput\\Customer84-2026-07.csv"
+      }
+    }
+  ]
+}

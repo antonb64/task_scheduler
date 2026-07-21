@@ -24,13 +24,24 @@ Command-line flags have the same names as the environment variables below in keb
 | `SCHEDULER_GRPC_TLS_CERT` | Unset | PEM gRPC server certificate. Must be set together with key and client CA. |
 | `SCHEDULER_GRPC_TLS_KEY` | Unset | PEM gRPC server private key. |
 | `SCHEDULER_GRPC_CLIENT_CA` | Unset | PEM CA used to verify agent client certificates. |
+| `SCHEDULER_AGENT_CERTIFICATE_FINGERPRINTS` | Required with gRPC mTLS, comma-separated | Exact `agent-id=sha256-hex` bindings for allowed agent leaf certificates. SHA-256 may be plain 64-character hex or colon-separated. CLI form is repeatable `--agent-certificate-fingerprint`. |
 | `SCHEDULER_HTTP_TLS_CERT` | Unset | PEM management HTTPS certificate. Must be set together with its key. |
 | `SCHEDULER_HTTP_TLS_KEY` | Unset | PEM management HTTPS private key. |
 | `SCHEDULER_SECURE_COOKIES` | `false` | Adds the `Secure` attribute to UI session cookies. Set true whenever management uses HTTPS. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Unset | OTLP/gRPC endpoint used by telemetry initialized at process start. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Unset | Global OTLP endpoint used at process start. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | Global exporter protocol: `grpc` or `http/protobuf`. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_ENDPOINT` | Global endpoint | Optional per-signal endpoint. |
+| `OTEL_EXPORTER_OTLP_{TRACES,METRICS,LOGS}_PROTOCOL` | Global protocol | Optional per-signal protocol. |
+| `OTEL_EXPORTER_OTLP_HEADERS` / per-signal `..._HEADERS` | Empty | Comma-separated, percent-decoded OTLP `key=value` headers. Values are secrets. |
+| `SCHEDULER_OTLP_HEADERS_FILE` | Unset | Local file containing the same header list, merged before environment headers. |
+| `SCHEDULER_OTLP_CREDENTIAL_FILE` | Unset | Local file containing one bearer token; `SCHEDULER_OTLP_BEARER_TOKEN_FILE` is an alias. |
+| `SCHEDULER_OTLP_TLS_CA_FILE` | Unset | PEM CA file; standard alias `OTEL_EXPORTER_OTLP_CERTIFICATE`. |
+| `SCHEDULER_OTLP_TLS_CLIENT_CERT_FILE` / `SCHEDULER_OTLP_TLS_CLIENT_KEY_FILE` | Unset | PEM mTLS identity pair; standard aliases `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE` and `OTEL_EXPORTER_OTLP_CLIENT_KEY`. |
 | `RUST_LOG` | `info` | Standard `tracing_subscriber` filter, for example `info,scheduler_store=debug`. |
 
-TLS tuples are all-or-nothing. Supplying only part of either tuple stops the coordinator with a configuration error. Leaving gRPC TLS unset is intended only for loopback development.
+TLS tuples are all-or-nothing. Supplying only part of either tuple stops the coordinator with a configuration error. Enabling gRPC mTLS also requires at least one unique agent/fingerprint binding; bindings without mTLS are rejected. Leaving gRPC TLS and fingerprint bindings unset is intended only for loopback development.
+
+The client CA proves that a certificate is trusted; the fingerprint map additionally binds the exact first/leaf client certificate to the `agent_id` claimed in its hello. Unregistered IDs, missing certificates, and mismatched hashes are rejected. Certificate subject/SAN text is not used for this identity decision. A renewed certificate has a different fingerprint even when it reuses the same subject or key, so update the binding and restart the coordinator as part of certificate rotation.
 
 The coordinator opens SQLite with foreign keys, WAL journaling, normal synchronous mode, a five-second busy timeout, up to eight connections, and migrations. The lock file prevents a second coordinator using the same configured lock. Use the same stable database and lock paths after restart.
 
@@ -53,7 +64,9 @@ The agent management UI is not a second copy of cluster state. The browser reque
 | `SCHEDULER_AGENT_ID` | Required | Stable cluster-unique node ID: 1–64 ASCII letters, digits, `.`, `_`, or `-`, starting and ending with a letter or digit. Reusing an ID causes the new authenticated stream to replace the previous connection for that ID. |
 | `SCHEDULER_COORDINATOR_URL` | `http://127.0.0.1:50051` | Coordinator gRPC URL. Use `https://` with mTLS. |
 | `SCHEDULER_AGENT_DATABASE_URL` | `sqlite://agent.db` | File-backed local delivery ledger. In-memory SQLite is rejected. |
-| `SCHEDULER_AGENT_UI_ADDR` | `127.0.0.1:8081` | Plain-HTTP management proxy listener. Keep it on loopback and use a TLS reverse proxy for production browser access. Secure cookies do not work over a direct HTTP URL. |
+| `SCHEDULER_AGENT_UI_ADDR` | `127.0.0.1:8081` | Management proxy listener. It is HTTP unless the UI TLS certificate/key below are both configured. |
+| `SCHEDULER_AGENT_UI_TLS_CERT` | Unset | PEM certificate chain for native HTTPS on the agent management listener. Must be paired with its key. |
+| `SCHEDULER_AGENT_UI_TLS_KEY` | Unset | PEM private key for native agent management HTTPS. |
 | `SCHEDULER_EXECUTOR_PATH` | `task-executor` | Exact path or `PATH` name of the matching executor binary. |
 | `SCHEDULER_AGENT_CAPACITY` | `2` | Capacity advertised in the first hello and used to seed a new node's `max_parallel`. Later synchronized settings are authoritative. |
 | `SCHEDULER_AGENT_LABELS` | Empty | Comma-separated `key=value` bootstrap labels, such as `pool=excel,site=vienna`. |
@@ -61,12 +74,20 @@ The agent management UI is not a second copy of cluster state. The browser reque
 | `SCHEDULER_AGENT_TLS_CERT` | Unset | PEM agent client certificate. |
 | `SCHEDULER_AGENT_TLS_KEY` | Unset | PEM agent client private key. |
 | `SCHEDULER_AGENT_TLS_DOMAIN` | URL hostname | Optional TLS server-name override for cases where the URL host differs from the certificate SAN. |
-| `OTEL_EXPORTER_OTLP_ENDPOINT` | Unset | OTLP/gRPC endpoint used at agent startup. |
+| `SCHEDULER_AGENT_ALLOWED_ENV_BINDINGS` | Empty, comma-separated | Exact environment-variable names a blueprint may resolve on this node. Names only are advertised; values never leave the node. CLI form may be repeated as `--allow-environment-binding`. |
+| `SCHEDULER_AGENT_SECRET_ROOTS` | Empty, comma-separated | Absolute directories containing logical secret files. CLI form may be repeated as `--secret-root`. Roots are local bootstrap policy and are not synchronized. |
+| `SCHEDULER_AGENT_BINDING_MAX_BYTES` | `65536` | Per-binding read/decoded-input limit, 1–1,048,576 bytes. |
+| `SCHEDULER_TASK_OUTPUT_LOGGING` | `metadata` | `off`, `metadata`, or `content`; controls `scheduler.task_output` events. Attempts with any sensitive binding suppress captured text before logging, local persistence, or transmission in every mode. |
+| `OTEL_EXPORTER_OTLP_*`, `SCHEDULER_OTLP_*` | Unset | Same startup-only OTLP endpoint/protocol/header/credential/TLS variables as the coordinator. |
 | `RUST_LOG` | `info` | Logging filter. |
 
 The agent adds `os=<Rust target OS>` and `arch=<Rust target architecture>` unless supplied. Windows builds also add `capability=excel` unless supplied. This is a placement label only; it does not verify that Excel is installed or usable.
 
 The local ledger obtains an OS-exclusive companion lock. A second live agent process cannot use the same ledger. It stores assignments and pending results so a process crash or network outage does not lose accepted work.
+
+For native agent HTTPS, configure both UI TLS files and use a certificate valid for the browser-facing node hostname. With neither set, keep the HTTP listener on loopback and terminate HTTPS at a trusted reverse proxy. The management listener is a required agent component: a partial TLS pair, an unreadable/invalid certificate or key, or a listener bind/serve failure causes the agent process to exit instead of continuing without its UI. These UI files are unrelated to `SCHEDULER_AGENT_TLS_CERT`/`KEY`, which authenticate the outbound gRPC client.
+
+Environment and secret-file bindings are local security capabilities. The agent advertises configured/discovered source-and-name pairs only. It performs a safe preflight before acknowledging an assignment and resolves again immediately before starting `task-executor`. Secret-file names cannot be paths and must resolve to regular files under one configured root after canonicalization; symlink escape is rejected. Protect secret roots and the agent environment with the task account's OS ACLs. See [Agent-local environment and secret-file bindings](tasks.md#agent-local-environment-and-secret-file-bindings).
 
 ## Taskctl bootstrap settings
 
@@ -103,7 +124,7 @@ The coordinator creates this document at revision 1:
 | `lease_seconds` | At least three times `heartbeat_seconds`. Used for new/renewed attempt leases. |
 | `heartbeat_seconds` | At least 5. Pushed to connected agents and hot-applied to their heartbeat interval. |
 | `audit_retention_days` | At least 1. Reserved configuration field; automatic audit pruning is not currently implemented. |
-| `otlp_endpoint` | Null or absolute HTTP(S) URL. Reserved synchronized field; telemetry is currently configured only from bootstrap `OTEL_EXPORTER_OTLP_ENDPOINT`. |
+| `otlp_endpoint` | Null or absolute HTTP(S) URL. Reserved synchronized field; telemetry is configured only from the bootstrap OTLP environment variables above. |
 
 Changing a policy default does not rewrite existing encrypted schedules. Edit and save a schedule to resolve it again under the new defaults.
 
@@ -150,14 +171,16 @@ Node settings are persisted on the agent before it acknowledges a valid revision
 
 ## Editing settings safely
 
-Opening a settings edit page acquires a two-minute document lock for the current UI session. The page renews it every 30 seconds and releases it during normal navigation. Saving also compares the revision so an expired lock cannot overwrite a newer document.
+Opening a global settings, node settings, or dashboard edit page acquires a two-minute document lock for the current UI session. The page renews it every 30 seconds and releases it during normal navigation. Saving also compares the revision so an expired lock cannot overwrite a newer document.
+
+If another page/session owns the lock, the UI shows the current document in a read-only textarea, identifies whether this or another administrator session owns it, shows the expiry, and does not expose the lock token. **Retry lock** reloads after normal release/expiry. **Force unlock** requires the authenticated session and CSRF confirmation, deletes the competing lock, writes `settings.lock_force_released` to the settings audit stream, and returns to the edit page. The former editor's token is then invalid; revision fencing still prevents a stale save after another edit.
 
 REST clients use the same protocol:
 
 1. `GET /api/v1/settings/global` and retain its `ETag`, such as `"3"`.
 2. `POST /api/v1/settings/locks/global` with `{"owner_session":"maintenance-script"}`.
 3. `PUT /api/v1/settings/global` with `If-Match: "3"` and a body containing `expected_revision`, `lock_token`, and `document`.
-4. `DELETE /api/v1/settings/locks/global` with the token, or `force: true` for administrative recovery.
+4. `DELETE /api/v1/settings/locks/global` with the token, or `force: true` for administrative recovery. A force release of an existing lock is audited.
 
 Node document keys use `node:<agent-id>` for lock operations.
 
@@ -165,6 +188,7 @@ Node document keys use `node:<agent-id>` for lock operations.
 
 - [`blueprint-v1.schema.json`](../schemas/blueprint-v1.schema.json)
 - [`schedule-v1.schema.json`](../schemas/schedule-v1.schema.json)
+- [`parameter-collection-v1.schema.json`](../schemas/parameter-collection-v1.schema.json)
 - [`connectors-v1.schema.json`](../schemas/connectors-v1.schema.json)
 
 The Rust implementation remains authoritative if a development checkout temporarily contains a newer field than the checked-in schemas.

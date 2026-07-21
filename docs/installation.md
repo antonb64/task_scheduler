@@ -77,7 +77,27 @@ openssl x509 -req -sha256 -in command-01.csr -CA scheduler-ca.crt -CAkey schedul
   -CAcreateserial -days 825 -copy_extensions copy -out command-01.crt
 ```
 
-The current coordinator verifies that the client certificate chains to the configured CA. It does not bind the certificate subject to the agent's self-declared agent ID, so issue client certificates only to trusted nodes and keep the CA narrowly scoped.
+Calculate the SHA-256 fingerprint of the exact leaf certificate DER bytes presented by each agent:
+
+```sh
+openssl x509 -in command-01.crt -outform DER | openssl dgst -sha256 -hex
+# SHA2-256(stdin)= 0123456789abcdef...64-hex-characters-total
+```
+
+The equivalent colon-formatted value from `openssl x509 -in command-01.crt -noout -fingerprint -sha256` is also accepted. Record only the hex value, not the `SHA2-256(stdin)=` or `sha256 Fingerprint=` prefix. Configure one unique binding per node:
+
+```sh
+SCHEDULER_AGENT_CERTIFICATE_FINGERPRINTS=command-01=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef,excel-01=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+```
+
+On PowerShell without OpenSSL, load the certificate rather than hashing the PEM text file:
+
+```powershell
+$cert = [System.Security.Cryptography.X509Certificates.X509Certificate2]::new('C:\certs\excel-01.crt')
+$cert.GetCertHashString([System.Security.Cryptography.HashAlgorithmName]::SHA256)
+```
+
+The coordinator first verifies the certificate chain against `SCHEDULER_GRPC_CLIENT_CA`, then compares the leaf fingerprint with the entry for the hello's `agent_id`. It does not infer identity from subject/CN/SAN. Certificate renewal changes the DER fingerprint: update the binding and restart the coordinator before starting the agent with the new certificate. Duplicate bindings for one agent ID are rejected, so rotation needs a coordinated cutover rather than an overlap window.
 
 ## 4. Start the coordinator
 
@@ -98,8 +118,10 @@ SCHEDULER_HTTP_TLS_KEY=/etc/task-scheduler/management-private-key.pem
 SCHEDULER_GRPC_TLS_CERT=/etc/task-scheduler/coordinator.crt
 SCHEDULER_GRPC_TLS_KEY=/etc/task-scheduler/coordinator.key
 SCHEDULER_GRPC_CLIENT_CA=/etc/task-scheduler/scheduler-ca.crt
+SCHEDULER_AGENT_CERTIFICATE_FINGERPRINTS=command-01=replace-with-64-hex-sha256,excel-01=replace-with-64-hex-sha256
 SCHEDULER_SECURE_COOKIES=true
 OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.internal:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 RUST_LOG=info
 ```
 
@@ -163,7 +185,12 @@ SCHEDULER_AGENT_LABELS=pool=general
 SCHEDULER_AGENT_TLS_CA=/etc/task-scheduler/scheduler-ca.crt
 SCHEDULER_AGENT_TLS_CERT=/etc/task-scheduler/command-01.crt
 SCHEDULER_AGENT_TLS_KEY=/etc/task-scheduler/command-01.key
+SCHEDULER_AGENT_ALLOWED_ENV_BINDINGS=BWP_USER
+SCHEDULER_AGENT_SECRET_ROOTS=/run/secrets/task-scheduler
+SCHEDULER_AGENT_BINDING_MAX_BYTES=65536
+SCHEDULER_TASK_OUTPUT_LOGGING=metadata
 OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.internal:4317
+OTEL_EXPORTER_OTLP_PROTOCOL=grpc
 RUST_LOG=info
 ```
 
@@ -196,7 +223,33 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now task-scheduler-agent
 ```
 
-The agent connects outbound; no inbound gRPC firewall rule is needed on the node. Its UI proxy is local at `http://127.0.0.1:8081` and returns `503` while the coordinator stream is unavailable. With production `SCHEDULER_SECURE_COOKIES=true`, browsers must reach that proxy through an HTTPS reverse proxy; a Secure session cookie is not sent to a plain `http://` agent URL.
+The agent connects outbound; no inbound gRPC firewall rule is needed on the node. In this example its UI proxy is local at `http://127.0.0.1:8081` and returns `503` while the coordinator stream is unavailable. A Secure session cookie is not sent to a plain `http://` agent URL, so production browsers need either native agent HTTPS or an HTTPS reverse proxy.
+
+There are two supported browser TLS boundaries:
+
+- Native agent HTTPS: set `SCHEDULER_AGENT_UI_TLS_CERT` and `SCHEDULER_AGENT_UI_TLS_KEY` together, bind `SCHEDULER_AGENT_UI_ADDR` to the intended interface/port, and use a certificate valid for that node's browser hostname. The agent itself terminates TLS.
+- Reverse proxy: leave both agent UI TLS settings unset, retain the HTTP listener on `127.0.0.1`, and expose only a trusted HTTPS proxy. Never expose this loopback hop on an untrusted network.
+
+The agent treats this listener as required. It fails startup if only one UI TLS file is configured, either PEM file cannot be loaded, or the UI address cannot be bound; a later listener/server failure also terminates the agent process. Validate the certificate/key and port before relying on the node for task execution.
+
+For native HTTPS, the corresponding agent environment is:
+
+```sh
+SCHEDULER_AGENT_UI_ADDR=0.0.0.0:8443
+SCHEDULER_AGENT_UI_TLS_CERT=/etc/task-scheduler/node-management-fullchain.pem
+SCHEDULER_AGENT_UI_TLS_KEY=/etc/task-scheduler/node-management-private-key.pem
+```
+
+In both cases set `SCHEDULER_SECURE_COOKIES=true` on the coordinator, because the coordinator creates the shared browser session. Native agent UI TLS does not add browser client-certificate authentication; the cluster administrator login/CSRF protections still apply. The UI certificate/key are separate from the agent's outbound gRPC mTLS certificate/key.
+
+Create each configured secret root before starting the agent, make it readable only by the task account, and put each secret in a regular file named by its logical binding name:
+
+```sh
+sudo install -d -o task-agent -g task-agent -m 0700 /run/secrets/task-scheduler
+sudo install -o task-agent -g task-agent -m 0600 /secure/provisioning/bwp-password /run/secrets/task-scheduler/bwp-password
+```
+
+Do not configure path-like binding names in blueprints. Mount secrets read-only where possible. On Linux, `/run` is normally ephemeral, so provision the files before each agent start. Environment bindings such as `BWP_USER` must both exist in the agent service environment and be listed in `SCHEDULER_AGENT_ALLOWED_ENV_BINDINGS`; listing a name does not supply its value.
 
 For example, an HTTPS nginx virtual host on the node can forward all paths without exposing port 8081:
 
@@ -215,7 +268,7 @@ server {
 }
 ```
 
-The scheduler does not currently interpret forwarded headers for URL generation, but its routes and cookies are host-relative, so this simple whole-site proxy is sufficient. Apply your normal network allowlist and browser-access authentication policy in front of it.
+The reverse proxy is a security boundary: restrict the agent HTTP listener to loopback, forward the whole site without rewriting paths or response bodies, preserve bounded request/response handling, and protect the proxy certificate/key. The scheduler does not interpret forwarded headers for URL generation, but routes and cookies are host-relative, so this whole-site proxy is sufficient. Apply your normal network allowlist and optional additional browser authentication in front of it.
 
 ## 6. Start a macOS agent
 
@@ -258,6 +311,7 @@ Excel automation has stricter requirements:
 - Ensure macros never display a custom dialog, prompt for input, or wait for user interaction.
 - Place workbooks under a dedicated allowlisted directory such as `C:\TaskWorkbooks`.
 - Keep `excel_max_parallel` at 1.
+- Configure any macro credentials as allowlisted environment/secret-file bindings; never embed them in parameter artifacts or command arguments.
 
 Copy `agent.exe` and `task-executor.exe` into a stable directory, then register the current user with the helper:
 
@@ -285,6 +339,8 @@ Start-ScheduledTask -TaskName RustTaskSchedulerAgent
 ```
 
 The helper creates the data directory but does not provision directory ACLs, certificates, Excel, workbooks, or Trust Center configuration.
+
+The registration helper does not currently expose binding/secret-root or native UI-TLS switches. To use them on Windows, register an equivalent per-user Scheduled Task invocation with explicit `--allow-environment-binding`, `--secret-root`, `--binding-max-bytes`, `--task-output-logging`, and (when native HTTPS is wanted) `--ui-tls-cert`/`--ui-tls-key` arguments, or update the generated action after registration. Place logical secret files and private keys in dedicated ACL-protected directories owned by the interactive task user. Keep secret values out of the command line: only environment-variable names and secret-root/key-file paths belong in the task action.
 
 ## 8. Apply node settings
 
@@ -329,6 +385,7 @@ export SCHEDULER_URL=https://scheduler.example.com:8443
 export SCHEDULER_ADMIN_TOKEN='replace-with-admin-token'
 taskctl nodes
 taskctl schedules list
+taskctl batches list --limit 50
 ```
 
 The same control panel is available through any connected agent UI. The browser authenticates with the same administrator token; agent UI requests are carried over the existing gRPC connection. Plain loopback access is suitable when secure cookies are disabled for local development. In production, publish the loopback listener only through an HTTPS reverse proxy so the browser can use the coordinator's Secure session cookie.

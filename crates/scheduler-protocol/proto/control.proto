@@ -15,6 +15,7 @@ message AgentMessage {
     AttemptResult result = 4;
     SettingsApplied settings_applied = 5;
     ResumeAttempt resume = 6;
+    AttemptRejected rejected = 7;
   }
 }
 
@@ -25,6 +26,9 @@ message AgentHello {
   uint32 capacity = 4;
   uint32 running = 5;
   string version = 6;
+  // Bootstrap capability names only. Binding values never cross registration.
+  repeated string environment_bindings = 7;
+  repeated string secret_file_bindings = 8;
 }
 
 message Heartbeat {
@@ -44,6 +48,16 @@ message AttemptResult {
   string attempt_id = 2;
   string lease_token = 3;
   string result_json = 4;
+}
+
+// Rejection happens before durable acceptance and therefore does not consume
+// an accepted-attempt retry. Codes are a closed, operator-safe vocabulary;
+// parameter values and local paths must never be sent.
+message AttemptRejected {
+  string agent_id = 1;
+  string attempt_id = 2;
+  string lease_token = 3;
+  string code = 4;
 }
 
 message SettingsApplied {

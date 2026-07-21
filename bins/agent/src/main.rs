@@ -1,13 +1,16 @@
 mod config;
 mod ledger;
+mod parameter_bindings;
 mod proxy;
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, bail};
@@ -16,13 +19,14 @@ use clap::Parser;
 use config::Config;
 use futures::StreamExt;
 use ledger::Ledger;
+use parameter_bindings::ParameterBindingResolver;
 use scheduler_core::{
     ExecutionAssignment, ExecutionOutcome, ExecutionResult, ExecutorSpec, FailureCode,
     FailureDiagnostic, FailureOrigin, FailureStage, FailureStatus, NodeSettings, OutputMetadata,
 };
 use scheduler_protocol::control::{
-    AgentHello, AgentMessage, AttemptAccepted, AttemptResult, Heartbeat, ResumeAttempt,
-    SettingsApplied, agent_message, coordinator_message,
+    AgentHello, AgentMessage, AttemptAccepted, AttemptRejected, AttemptResult, Heartbeat,
+    ResumeAttempt, SettingsApplied, agent_message, coordinator_message,
     scheduler_control_client::SchedulerControlClient,
 };
 use tokio::{
@@ -32,7 +36,7 @@ use tokio::{
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
-use tracing::{error, info, warn};
+use tracing::{error, info, instrument, warn};
 
 #[derive(Clone)]
 struct Runtime {
@@ -44,6 +48,7 @@ struct Runtime {
     outgoing: Arc<RwLock<Option<mpsc::Sender<AgentMessage>>>>,
     connected: watch::Sender<bool>,
     heartbeat_seconds: watch::Sender<u64>,
+    parameter_bindings: Arc<ParameterBindingResolver>,
 }
 
 #[derive(Clone)]
@@ -59,7 +64,18 @@ async fn main() -> Result<()> {
     let config = Config::parse();
     scheduler_core::validate_agent_id(&config.agent_id)
         .context("invalid SCHEDULER_AGENT_ID/--agent-id")?;
-    let _telemetry = scheduler_telemetry::init("scheduler-agent", config.otlp_endpoint.as_deref())?;
+    let parameter_bindings = Arc::new(ParameterBindingResolver::new(
+        &config.allowed_environment_bindings,
+        &config.secret_roots,
+        config.binding_max_bytes,
+    )?);
+    let telemetry = scheduler_telemetry::init("scheduler-agent", config.otlp_endpoint.as_deref())?;
+    let telemetry_status = telemetry.status();
+    info!(
+        configured = telemetry_status.configured,
+        protocol = %telemetry_status.protocol,
+        "telemetry initialized"
+    );
     let ledger = Ledger::connect(&config.database_url).await?;
     let (connected, _) = watch::channel(false);
     let (heartbeat_seconds, _) = watch::channel(10);
@@ -85,6 +101,7 @@ async fn main() -> Result<()> {
         outgoing: Arc::new(RwLock::new(None)),
         connected,
         heartbeat_seconds,
+        parameter_bindings,
     };
 
     let proxy_client = Arc::new(RwLock::new(None));
@@ -92,21 +109,45 @@ async fn main() -> Result<()> {
         client: proxy_client.clone(),
     });
     let ui_addr = config.ui_addr;
-    tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(ui_addr).await {
-            Ok(listener) => {
-                info!(%ui_addr, "agent management UI proxy listening");
-                if let Err(error) = axum::serve(listener, ui).await {
-                    error!(%error, "agent UI stopped");
-                }
-            }
-            Err(error) => error!(%error, "agent UI failed to bind"),
+    let ui_server: Pin<Box<dyn Future<Output = Result<()>> + Send>> = match (
+        config.ui_tls_cert.clone(),
+        config.ui_tls_key.clone(),
+    ) {
+        (Some(cert), Some(key)) => {
+            let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key)
+                .await
+                .context("agent management UI TLS configuration is invalid")?;
+            let listener = std::net::TcpListener::bind(ui_addr)
+                .context("agent management UI failed to bind")?;
+            listener.set_nonblocking(true)?;
+            let server = axum_server::from_tcp_rustls(listener, tls)?;
+            Box::pin(async move {
+                info!(%ui_addr, "agent HTTPS management UI proxy listening");
+                server
+                    .serve(ui.into_make_service())
+                    .await
+                    .context("agent HTTPS management UI stopped")
+            })
         }
-    });
+        (None, None) => {
+            let listener = tokio::net::TcpListener::bind(ui_addr)
+                .await
+                .context("agent management UI failed to bind")?;
+            Box::pin(async move {
+                info!(%ui_addr, "agent HTTP management UI proxy listening; configure TLS for non-local deployments");
+                axum::serve(listener, ui)
+                    .await
+                    .context("agent HTTP management UI stopped")
+            })
+        }
+        _ => bail!("agent UI TLS requires both certificate and key"),
+    };
 
-    run_connections(runtime, proxy_client).await
+    tokio::try_join!(run_connections(runtime, proxy_client), ui_server)?;
+    Ok(())
 }
 
+#[instrument(name = "agent.connection.supervisor", skip_all)]
 async fn run_connections(
     runtime: Runtime,
     proxy_client: Arc<RwLock<Option<SchedulerControlClient<Channel>>>>,
@@ -133,10 +174,16 @@ async fn run_connections(
     }
 }
 
+#[instrument(
+    name = "agent.control.stream",
+    skip_all,
+    fields(agent_id = runtime.config.agent_id)
+)]
 async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channel>) -> Result<()> {
     let (outgoing_tx, outgoing_rx) = mpsc::channel(256);
     *runtime.outgoing.write().await = Some(outgoing_tx.clone());
     let labels = runtime.config.labels()?;
+    let available_bindings = runtime.parameter_bindings.available_bindings().await?;
     let recoverable = runtime.ledger.recoverable_assignments().await?;
     {
         let mut recovering = runtime.recovering.write().await;
@@ -155,6 +202,8 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
                 capacity: runtime.config.capacity,
                 running: recoverable.len() as u32,
                 version: env!("CARGO_PKG_VERSION").into(),
+                environment_bindings: available_bindings.environment,
+                secret_file_bindings: available_bindings.secret_files,
             })),
         })
         .await?;
@@ -199,8 +248,32 @@ async fn run_stream(runtime: &Runtime, mut client: SchedulerControlClient<Channe
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                let active = runtime.active.read().await.keys().cloned().collect::<Vec<_>>();
+                let active_guard = runtime.active.read().await;
+                let active = active_guard.keys().cloned().collect::<Vec<_>>();
+                let active_excel = active_guard.values().filter(|task| task.excel).count() as u64;
+                drop(active_guard);
                 let reserved = runtime.recovering.read().await.len() as u32;
+                let settings = runtime.settings.read().await;
+                let meter = opentelemetry::global::meter("scheduler-agent");
+                let slots = meter.u64_gauge("scheduler.agent.slots").build();
+                slots.record(
+                    active.len() as u64 + u64::from(reserved),
+                    &[opentelemetry::KeyValue::new("state", "active")],
+                );
+                slots.record(
+                    u64::from(settings.max_parallel),
+                    &[opentelemetry::KeyValue::new("state", "capacity")],
+                );
+                let excel_slots = meter.u64_gauge("scheduler.agent.excel_slots").build();
+                excel_slots.record(
+                    active_excel,
+                    &[opentelemetry::KeyValue::new("state", "active")],
+                );
+                excel_slots.record(
+                    u64::from(settings.excel_max_parallel),
+                    &[opentelemetry::KeyValue::new("state", "capacity")],
+                );
+                drop(settings);
                 outgoing_tx.send(AgentMessage { payload: Some(agent_message::Payload::Heartbeat(Heartbeat {
                     agent_id: runtime.config.agent_id.clone(),
                     running: active.len() as u32 + reserved,
@@ -225,13 +298,28 @@ fn publish_connection_state(sender: &watch::Sender<bool>, connected: bool) {
     sender.send_replace(connected);
 }
 
+#[instrument(
+    name = "agent.coordinator.message",
+    skip_all,
+    fields(
+        message.kind = tracing::field::Empty,
+        run_id = tracing::field::Empty,
+        attempt_id = tracing::field::Empty,
+        settings.revision = tracing::field::Empty
+    )
+)]
 async fn handle_coordinator_message(
     runtime: &Runtime,
     message: scheduler_protocol::control::CoordinatorMessage,
 ) -> Result<()> {
+    tracing::Span::current().record("message.kind", coordinator_message_kind(&message));
     match message.payload {
         Some(coordinator_message::Payload::Assignment(offer)) => {
             let assignment: ExecutionAssignment = serde_json::from_str(&offer.assignment_json)?;
+            tracing::Span::current().record("run_id", tracing::field::display(assignment.run_id));
+            tracing::Span::current()
+                .record("attempt_id", tracing::field::display(assignment.attempt_id));
+            let executor = executor_kind(&assignment);
             if runtime
                 .ledger
                 .state(&assignment.attempt_id.to_string())
@@ -239,6 +327,7 @@ async fn handle_coordinator_message(
                 .as_deref()
                 == Some("acknowledged")
             {
+                record_assignment_offer("already_acknowledged", executor);
                 return Ok(());
             }
             if let Some(pending) = runtime
@@ -247,6 +336,47 @@ async fn handle_coordinator_message(
                 .await?
             {
                 send_result(runtime, pending).await?;
+                record_assignment_offer("result_replayed", executor);
+                return Ok(());
+            }
+            // Prove local references are currently readable, decodable,
+            // schema-valid, and policy-compliant before durable acceptance.
+            // Values exist only in this temporary clone and are resolved again
+            // immediately before launch to avoid using stale secret material.
+            let preflight = if assignment.snapshot.late_bindings.is_some() {
+                match runtime
+                    .parameter_bindings
+                    .resolve_assignment(&assignment)
+                    .await
+                {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        record_assignment_offer("preflight_rejected", executor);
+                        warn!(
+                            attempt_id = %assignment.attempt_id,
+                            rejection_code = "parameter_binding_failed",
+                            error = %error,
+                            "assignment rejected before acceptance"
+                        );
+                        send_assignment_rejection(runtime, &assignment, "parameter_binding_failed")
+                            .await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                assignment.clone()
+            };
+            let settings = runtime.settings.read().await.clone();
+            if let Err(error) = validate_assignment(&settings, &preflight) {
+                record_assignment_offer("policy_rejected", executor);
+                warn!(
+                    attempt_id = %assignment.attempt_id,
+                    rejection_code = "assignment_policy_rejected",
+                    error = %error,
+                    "assignment rejected before acceptance"
+                );
+                send_assignment_rejection(runtime, &assignment, "assignment_policy_rejected")
+                    .await?;
                 return Ok(());
             }
             runtime
@@ -261,6 +391,7 @@ async fn handle_coordinator_message(
                     .as_deref(),
                 Some("cancelled" | "quarantined")
             ) {
+                record_assignment_offer("cancelled", executor);
                 return Ok(());
             }
             send(
@@ -274,6 +405,7 @@ async fn handle_coordinator_message(
                 },
             )
             .await?;
+            record_assignment_offer("accepted", executor);
             if runtime
                 .ledger
                 .claim(&assignment, &offer.assignment_json)
@@ -293,7 +425,9 @@ async fn handle_coordinator_message(
             }
         }
         Some(coordinator_message::Payload::Settings(update)) => {
+            tracing::Span::current().record("settings.revision", update.revision);
             if update.heartbeat_seconds == 0 {
+                record_settings_sync("rejected");
                 bail!("coordinator supplied an invalid zero heartbeat interval");
             }
             let mut settings: NodeSettings = serde_json::from_str(&update.settings_json)?;
@@ -308,6 +442,11 @@ async fn handle_coordinator_message(
                 *runtime.settings.write().await = settings;
                 let _ = runtime.heartbeat_seconds.send(update.heartbeat_seconds);
             }
+            record_settings_sync(if validation.is_ok() {
+                "applied"
+            } else {
+                "rejected"
+            });
             send(
                 runtime,
                 AgentMessage {
@@ -321,7 +460,12 @@ async fn handle_coordinator_message(
             .await?;
         }
         Some(coordinator_message::Payload::ResultAcknowledged(ack)) => {
+            tracing::Span::current().record("attempt_id", ack.attempt_id.as_str());
             runtime.ledger.acknowledge(&ack.attempt_id).await?;
+            opentelemetry::global::meter("scheduler-agent")
+                .u64_counter("scheduler.agent.results")
+                .build()
+                .add(1, &[opentelemetry::KeyValue::new("result", "acknowledged")]);
         }
         Some(coordinator_message::Payload::ResumeDecision(decision)) => {
             if !decision.granted {
@@ -380,6 +524,60 @@ async fn handle_coordinator_message(
     Ok(())
 }
 
+fn coordinator_message_kind(
+    message: &scheduler_protocol::control::CoordinatorMessage,
+) -> &'static str {
+    match &message.payload {
+        Some(coordinator_message::Payload::Assignment(_)) => "assignment",
+        Some(coordinator_message::Payload::Cancel(_)) => "cancel",
+        Some(coordinator_message::Payload::Settings(_)) => "settings",
+        Some(coordinator_message::Payload::ResultAcknowledged(_)) => "result_acknowledged",
+        Some(coordinator_message::Payload::ResumeDecision(_)) => "resume_decision",
+        Some(coordinator_message::Payload::HeartbeatAcknowledged(_)) => "heartbeat_acknowledged",
+        None => "empty",
+    }
+}
+
+fn record_assignment_offer(result: &'static str, executor: &'static str) {
+    use opentelemetry::KeyValue;
+
+    opentelemetry::global::meter("scheduler-agent")
+        .u64_counter("scheduler.agent.assignment_offers")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("result", result),
+                KeyValue::new("executor", executor),
+            ],
+        );
+}
+
+fn record_settings_sync(result: &'static str) {
+    opentelemetry::global::meter("scheduler-agent")
+        .u64_counter("scheduler.settings.sync")
+        .build()
+        .add(1, &[opentelemetry::KeyValue::new("result", result)]);
+}
+
+fn executor_kind(assignment: &ExecutionAssignment) -> &'static str {
+    match &assignment.snapshot.executor {
+        ExecutorSpec::Command(_) => "command",
+        ExecutorSpec::ExcelMacro(_) => "excel_macro",
+    }
+}
+
+#[instrument(
+    name = "agent.assignment.execute",
+    skip_all,
+    fields(
+        schedule_id = %assignment.schedule_id,
+        run_id = %assignment.run_id,
+        attempt_id = %assignment.attempt_id,
+        executor = executor_kind(&assignment),
+        task.outcome = tracing::field::Empty
+    )
+)]
 async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
     let attempt_id = assignment.attempt_id.to_string();
     let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -452,7 +650,34 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
                     runtime.active.write().await.remove(&attempt_id);
                     return;
                 }
-                break match run_executor(&runtime, &assignment, &cancel_rx, lease_rx).await {
+                let executable_assignment = match runtime
+                    .parameter_bindings
+                    .resolve_assignment(&assignment)
+                    .await
+                {
+                    Ok(assignment) => assignment,
+                    Err(error) => {
+                        break agent_failure_result(
+                            error,
+                            FailureCode::ParameterBindingFailed,
+                            FailureStage::ParameterBinding,
+                            "agent could not safely resolve required parameter bindings",
+                            true,
+                        );
+                    }
+                };
+                if let Err(error) = validate_assignment(&settings, &executable_assignment) {
+                    break agent_failure_result(
+                        error,
+                        FailureCode::AssignmentRejected,
+                        FailureStage::Validation,
+                        "resolved assignment was rejected by the agent's execution policy",
+                        false,
+                    );
+                }
+                break match run_executor(&runtime, &executable_assignment, &cancel_rx, lease_rx)
+                    .await
+                {
                     Ok(result) => result,
                     Err(error) => {
                         let detail = format!("{error:#}");
@@ -476,7 +701,10 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     };
-    export_task_observability(&assignment, &result);
+    let mut result = result;
+    suppress_sensitive_task_output(&assignment, &mut result);
+    tracing::Span::current().record("task.outcome", result.outcome.as_str());
+    export_task_observability(&assignment, &result, &runtime.config.task_output_logging);
     match serde_json::to_string(&result) {
         Ok(json) => {
             let mut retry = Duration::from_millis(100);
@@ -484,6 +712,10 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
                 match runtime.ledger.save_result(&attempt_id, &json).await {
                     Ok(()) => break,
                     Err(error) => {
+                        opentelemetry::global::meter("scheduler-agent")
+                            .u64_counter("scheduler.agent.result_persist_retries")
+                            .build()
+                            .add(1, &[]);
                         error!(%error, %attempt_id, "failed to persist task result; retrying before releasing capacity");
                         tokio::time::sleep(retry).await;
                         retry = (retry * 2).min(Duration::from_secs(5));
@@ -504,13 +736,56 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
             )
             .await
             {
+                opentelemetry::global::meter("scheduler-agent")
+                    .u64_counter("scheduler.agent.results")
+                    .build()
+                    .add(1, &[opentelemetry::KeyValue::new("result", "retained")]);
                 warn!(%error, %attempt_id, "result retained for reconnect");
+            } else {
+                opentelemetry::global::meter("scheduler-agent")
+                    .u64_counter("scheduler.agent.results")
+                    .build()
+                    .add(1, &[opentelemetry::KeyValue::new("result", "sent")]);
             }
         }
         Err(error) => {
+            opentelemetry::global::meter("scheduler-agent")
+                .u64_counter("scheduler.agent.results")
+                .build()
+                .add(
+                    1,
+                    &[opentelemetry::KeyValue::new(
+                        "result",
+                        "serialization_failed",
+                    )],
+                );
             error!(%error, %attempt_id, "failed to serialize task result");
             runtime.active.write().await.remove(&attempt_id);
         }
+    }
+}
+
+/// A task can deliberately or accidentally echo an environment/secret-file
+/// binding. Once a blueprint admits any sensitive late binding, task text is
+/// therefore untrusted secret-bearing data: retain only bounded byte metadata
+/// and structured status. This runs before logging, ledger persistence, and
+/// result transmission.
+fn suppress_sensitive_task_output(assignment: &ExecutionAssignment, result: &mut ExecutionResult) {
+    let has_sensitive_bindings = assignment
+        .snapshot
+        .late_bindings
+        .as_ref()
+        .is_some_and(|late| late.bindings.values().any(|binding| binding.sensitive));
+    if !has_sensitive_bindings {
+        return;
+    }
+    result.stdout.clear();
+    result.stderr.clear();
+    if result.error.is_some() {
+        result.error = Some("sensitive task output suppressed by agent policy".into());
+    }
+    if let Some(diagnostic) = &mut result.diagnostic {
+        diagnostic.summary = "sensitive task diagnostic text suppressed by agent policy".into();
     }
 }
 
@@ -527,7 +802,11 @@ fn capacity_available(
     running < settings.max_parallel && (!is_excel || excel_running < settings.excel_max_parallel)
 }
 
-fn export_task_observability(assignment: &ExecutionAssignment, result: &ExecutionResult) {
+fn export_task_observability(
+    assignment: &ExecutionAssignment,
+    result: &ExecutionResult,
+    output_logging: &str,
+) {
     use opentelemetry::KeyValue;
     let meter = opentelemetry::global::meter("scheduler-agent");
     meter.u64_counter("scheduler.task.completions").build().add(
@@ -589,33 +868,65 @@ fn export_task_observability(assignment: &ExecutionAssignment, result: &Executio
     meter
         .f64_histogram("scheduler.task.duration_ms")
         .build()
-        .record(duration, &[]);
-    for (stream, text) in [("stdout", &result.stdout), ("stderr", &result.stderr)] {
-        for (sequence, line) in text.lines().enumerate() {
-            let mut end = line.len().min(65_536);
-            while !line.is_char_boundary(end) {
-                end -= 1;
+        .record(
+            duration,
+            &[KeyValue::new("executor", executor_kind(assignment))],
+        );
+    match output_logging {
+        "off" => {}
+        "metadata" => tracing::info!(
+            target: "scheduler.task_output",
+            run_id = %assignment.run_id,
+            attempt_id = %assignment.attempt_id,
+            stdout_bytes = result.output.stdout_bytes,
+            stderr_bytes = result.output.stderr_bytes,
+            stdout_truncated = result.output.stdout_truncated,
+            stderr_truncated = result.output.stderr_truncated,
+            "task output metadata"
+        ),
+        "content" => {
+            for (stream, text) in [("stdout", &result.stdout), ("stderr", &result.stderr)] {
+                for (sequence, line) in text.lines().enumerate() {
+                    let mut end = line.len().min(65_536);
+                    while !line.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let bounded = &line[..end];
+                    tracing::info!(
+                        target: "scheduler.task_output",
+                        run_id = %assignment.run_id,
+                        attempt_id = %assignment.attempt_id,
+                        stream,
+                        sequence,
+                        message = bounded,
+                        "task output"
+                    );
+                }
             }
-            let bounded = &line[..end];
-            tracing::info!(
-                target: "scheduler.task_output",
-                run_id = %assignment.run_id,
-                attempt_id = %assignment.attempt_id,
-                stream,
-                sequence,
-                message = bounded,
-                "task output"
-            );
         }
+        _ => tracing::error!("invalid task output logging mode was accepted by configuration"),
     }
 }
 
+#[instrument(
+    name = "agent.executor.lifetime",
+    skip_all,
+    fields(
+        run_id = %assignment.run_id,
+        attempt_id = %assignment.attempt_id,
+        executor = executor_kind(assignment),
+        process.status = tracing::field::Empty
+    )
+)]
 async fn run_executor(
     runtime: &Runtime,
     assignment: &ExecutionAssignment,
     cancel: &watch::Receiver<bool>,
     mut lease_freshness: watch::Receiver<u64>,
 ) -> Result<ExecutionResult> {
+    use opentelemetry::KeyValue;
+
+    let lifetime_started = Instant::now();
     let started_at = Utc::now();
     let mut child = Command::new(&runtime.config.executor_path)
         .stdin(Stdio::piped())
@@ -660,6 +971,22 @@ async fn run_executor(
     });
     let output = child.wait_with_output().await?;
     controller.abort();
+    let process_status = if output.status.success() {
+        "success"
+    } else {
+        "failure"
+    };
+    tracing::Span::current().record("process.status", process_status);
+    opentelemetry::global::meter("scheduler-agent")
+        .f64_histogram("scheduler.executor.lifetime_ms")
+        .build()
+        .record(
+            lifetime_started.elapsed().as_secs_f64() * 1_000.0,
+            &[
+                KeyValue::new("executor", executor_kind(assignment)),
+                KeyValue::new("process_status", process_status),
+            ],
+        );
     if !output.status.success() && output.stdout.is_empty() {
         let exit_code = output.status.code();
         let signal = exit_signal(&output.status);
@@ -833,6 +1160,12 @@ fn validate_assignment(settings: &NodeSettings, assignment: &ExecutionAssignment
     {
         bail!("assignment labels no longer match applied node settings");
     }
+    // Paths and executables containing ordinary parameter templates are fully
+    // checked after local bindings have been resolved. The late envelope never
+    // contains resolved secret values and is not sent to the task executor.
+    if assignment.snapshot.late_bindings.is_some() {
+        return Ok(());
+    }
     match &assignment.snapshot.executor {
         ExecutorSpec::Command(command) => {
             let path = Path::new(&command.program);
@@ -949,6 +1282,33 @@ async fn send(runtime: &Runtime, message: AgentMessage) -> Result<()> {
     tx.send(message).await.context("coordinator stream closed")
 }
 
+async fn send_assignment_rejection(
+    runtime: &Runtime,
+    assignment: &ExecutionAssignment,
+    code: &'static str,
+) -> Result<()> {
+    send(
+        runtime,
+        assignment_rejection_message(&runtime.config.agent_id, assignment, code),
+    )
+    .await
+}
+
+fn assignment_rejection_message(
+    agent_id: &str,
+    assignment: &ExecutionAssignment,
+    code: &'static str,
+) -> AgentMessage {
+    AgentMessage {
+        payload: Some(agent_message::Payload::Rejected(AttemptRejected {
+            agent_id: agent_id.to_owned(),
+            attempt_id: assignment.attempt_id.to_string(),
+            lease_token: assignment.lease_token.clone(),
+            code: code.into(),
+        })),
+    }
+}
+
 async fn connect_channel(config: &Config) -> Result<Channel> {
     let mut endpoint = Endpoint::from_shared(config.coordinator_url.clone())?
         .connect_timeout(Duration::from_secs(10));
@@ -974,6 +1334,26 @@ async fn connect_channel(config: &Config) -> Result<Channel> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use uuid::Uuid;
+
+    fn assignment(executor: serde_json::Value) -> ExecutionAssignment {
+        serde_json::from_value(serde_json::json!({
+            "schedule_id": Uuid::new_v4(),
+            "run_id": Uuid::new_v4(),
+            "attempt_id": Uuid::new_v4(),
+            "attempt_number": 1,
+            "lease_token": "lease-token",
+            "lease_seconds": 60,
+            "snapshot": {
+                "executor": executor,
+                "policy": {},
+                "required_labels": {},
+                "blueprint_digest": "blueprint-digest",
+                "parameters_digest": "parameters-digest"
+            }
+        }))
+        .expect("assignment fixture")
+    }
 
     #[test]
     fn connection_state_is_retained_before_the_first_executor_subscribes() {
@@ -1015,5 +1395,111 @@ mod tests {
         assert!(!capacity_available(&active, &settings, false));
         active.get_mut("running").expect("running").started = false;
         assert!(capacity_available(&active, &settings, false));
+    }
+
+    #[test]
+    fn ordinary_command_and_excel_offers_are_policy_checked_before_acceptance() {
+        let command = assignment(serde_json::json!({
+            "kind": "command",
+            "program": "runner"
+        }));
+        let disabled = NodeSettings {
+            enabled: false,
+            ..NodeSettings::default()
+        };
+        assert!(validate_assignment(&disabled, &command).is_err());
+
+        let excel = assignment(serde_json::json!({
+            "kind": "excel_macro",
+            "workbook_path": "C:\\Reports\\test.xlsm",
+            "macro_name": "RunReport"
+        }));
+        let excel_disabled = NodeSettings {
+            excel_max_parallel: 0,
+            ..NodeSettings::default()
+        };
+        assert!(validate_assignment(&excel_disabled, &excel).is_err());
+    }
+
+    #[test]
+    fn assignment_rejection_message_contains_only_safe_references() {
+        let assignment = assignment(serde_json::json!({
+            "kind": "command",
+            "program": "runner"
+        }));
+        let message =
+            assignment_rejection_message("node-a", &assignment, "assignment_policy_rejected");
+        let agent_message::Payload::Rejected(rejected) = message.payload.expect("payload") else {
+            panic!("rejected payload expected");
+        };
+        assert_eq!(rejected.agent_id, "node-a");
+        assert_eq!(rejected.attempt_id, assignment.attempt_id.to_string());
+        assert_eq!(rejected.lease_token, "lease-token");
+        assert_eq!(rejected.code, "assignment_policy_rejected");
+    }
+
+    #[test]
+    fn sensitive_binding_attempts_suppress_all_persisted_task_text() {
+        let mut assignment = assignment(serde_json::json!({
+            "kind": "command",
+            "program": "runner"
+        }));
+        assignment.snapshot.late_bindings = Some(
+            serde_json::from_value(serde_json::json!({
+                "executor_template": {
+                    "kind": "command",
+                    "program": "runner",
+                    "env": {"SECRET": "{{params.secret}}"}
+                },
+                "parameters_schema": {"type": "object"},
+                "parameters": {},
+                "bindings": {
+                    "secret": {
+                        "source": "environment",
+                        "name": "TASK_TEST_SECRET",
+                        "value_type": "string",
+                        "sensitive": true
+                    }
+                }
+            }))
+            .expect("late-binding fixture"),
+        );
+        let now = Utc::now();
+        let secret = "do-not-persist-this-secret";
+        let mut result = ExecutionResult {
+            outcome: ExecutionOutcome::InfrastructureError,
+            exit_code: Some(1),
+            signal: None,
+            stdout: format!("stdout {secret}"),
+            stderr: format!("stderr {secret}"),
+            started_at: now,
+            finished_at: now,
+            error: Some(format!("error {secret}")),
+            output: OutputMetadata {
+                stdout_bytes: 99,
+                stderr_bytes: 88,
+                stdout_truncated: false,
+                stderr_truncated: true,
+            },
+            diagnostic: Some(FailureDiagnostic::new(
+                FailureCode::ProcessSpawnFailed,
+                FailureOrigin::TaskExecutor,
+                FailureStage::Execution,
+                format!("diagnostic {secret}"),
+                true,
+            )),
+        };
+
+        suppress_sensitive_task_output(&assignment, &mut result);
+        let persisted = serde_json::to_string(&result).expect("result JSON");
+        assert!(!persisted.contains(secret));
+        assert!(result.stdout.is_empty());
+        assert!(result.stderr.is_empty());
+        assert_eq!(result.output.stdout_bytes, 99);
+        assert_eq!(result.output.stderr_bytes, 88);
+        assert_eq!(
+            result.diagnostic.expect("diagnostic").code,
+            FailureCode::ProcessSpawnFailed
+        );
     }
 }
