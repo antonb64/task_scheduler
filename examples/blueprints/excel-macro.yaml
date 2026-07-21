@@ -2,7 +2,8 @@ api_version: scheduler/v1
 executor:
   kind: excel_macro
   workbook_path: "C:\\TaskWorkbooks\\Validation.xlsm"
-  macro_name: "ValidationModule.RunValidation"
+  module_name: "ValidationModule"
+  macro_name: "RunValidation"
   args:
     - "{{params.input_file}}"
     - "{{params.batch_number}}"

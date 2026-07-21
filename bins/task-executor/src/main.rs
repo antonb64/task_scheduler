@@ -186,6 +186,7 @@ fn build_excel_payload(
 ) -> Result<serde_json::Value> {
     Ok(serde_json::json!({
         "workbook_path": spec.workbook_path,
+        "module_name": spec.module_name,
         "macro_name": spec.macro_name,
         "args": marshal_excel_arguments(&spec.args)?,
         "read_only": spec.read_only,
@@ -950,7 +951,11 @@ try {
   # Excel quotes workbook names in macro references with apostrophes and
   # represents a literal apostrophe by doubling it.
   $escapedWorkbookName = ([string]$workbook.Name).Replace("'", "''")
-  $macro = "'" + $escapedWorkbookName + "'!" + [string]$payload.macro_name
+  $macroTarget = [string]$payload.macro_name
+  if ($null -ne $payload.module_name -and -not [string]::IsNullOrWhiteSpace([string]$payload.module_name)) {
+    $macroTarget = [string]$payload.module_name + '.' + $macroTarget
+  }
+  $macro = "'" + $escapedWorkbookName + "'!" + $macroTarget
   $invokeArgs = New-Object System.Collections.Generic.List[Object]
   $invokeArgs.Add($macro)
   $invariantCulture = [Globalization.CultureInfo]::InvariantCulture
@@ -1121,7 +1126,8 @@ mod tests {
         let payload = build_excel_payload(
             &ExcelMacroSpec {
                 workbook_path: "C:\\Tasks\\O'Brien.xlsm".into(),
-                macro_name: "Module.processID".into(),
+                module_name: Some("Module".into()),
+                macro_name: "processID".into(),
                 args: arguments,
                 read_only: true,
                 save_changes: false,
@@ -1134,6 +1140,25 @@ mod tests {
         assert_eq!(payload["run_id"], run_id.to_string());
         assert_eq!(payload["attempt_id"], attempt_id.to_string());
         assert_eq!(payload["args"], json);
+        assert_eq!(payload["module_name"], "Module");
+        assert_eq!(payload["macro_name"], "processID");
+
+        let legacy = build_excel_payload(
+            &ExcelMacroSpec {
+                workbook_path: "C:\\Tasks\\Legacy.xlsm".into(),
+                module_name: None,
+                macro_name: "LegacyModule.Run".into(),
+                args: Vec::new(),
+                read_only: true,
+                save_changes: false,
+                visible: false,
+            },
+            run_id,
+            attempt_id,
+        )
+        .expect("legacy Excel payload");
+        assert!(legacy["module_name"].is_null());
+        assert_eq!(legacy["macro_name"], "LegacyModule.Run");
     }
 
     #[test]
@@ -1245,6 +1270,8 @@ mod tests {
     fn excel_script_reconstructs_types_and_escapes_workbook_apostrophes() {
         for required in [
             "([string]$workbook.Name).Replace(\"'\", \"''\")",
+            "$macroTarget = [string]$payload.macro_name",
+            "$macroTarget = [string]$payload.module_name + '.' + $macroTarget",
             "[int32]::Parse",
             "[int64]::Parse",
             "[uint64]::Parse",

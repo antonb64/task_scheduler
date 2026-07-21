@@ -58,26 +58,44 @@ pub fn validate_blueprint(blueprint: &Blueprint) -> Result<()> {
             bail!("command program cannot be empty")
         }
         ExecutorSpec::ExcelMacro(excel) => {
-            if excel.workbook_path.trim().is_empty() || excel.macro_name.trim().is_empty() {
-                bail!("Excel workbook path and macro name are required");
-            }
-            if excel.args.len() > 30 {
-                bail!("Excel Application.Run supports at most 30 arguments");
-            }
-            for argument in &excel.args {
-                if !matches!(
-                    argument,
-                    Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
-                ) {
-                    bail!(
-                        "Excel arguments must be JSON strings, numbers, booleans, null, or parameter expressions"
-                    );
-                }
-            }
+            validate_excel_spec(excel, false)?;
         }
         _ => {}
     }
     jsonschema::validator_for(&blueprint.parameters_schema).context("invalid parameters_schema")?;
+    Ok(())
+}
+
+fn validate_excel_spec(excel: &crate::ExcelMacroSpec, rendered: bool) -> Result<()> {
+    if excel.workbook_path.trim().is_empty() || excel.macro_name.trim().is_empty() {
+        bail!("Excel workbook path and macro name are required");
+    }
+    if let Some(module_name) = &excel.module_name {
+        if module_name.trim().is_empty() {
+            bail!("Excel module_name cannot be blank");
+        }
+        if (rendered || !module_name.contains("{{params.")) && module_name.contains(['.', '!']) {
+            bail!("Excel module_name must be an unqualified standard module name");
+        }
+        if (rendered || !excel.macro_name.contains("{{params."))
+            && excel.macro_name.contains(['.', '!'])
+        {
+            bail!("Excel macro_name must be unqualified when module_name is set");
+        }
+    }
+    if excel.args.len() > 30 {
+        bail!("Excel Application.Run supports at most 30 arguments");
+    }
+    for argument in &excel.args {
+        if !matches!(
+            argument,
+            Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_)
+        ) {
+            bail!(
+                "Excel arguments must be JSON strings, numbers, booleans, null, or parameter expressions"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -184,14 +202,21 @@ fn render_executor(executor: &ExecutorSpec, parameters: &Value) -> Result<Execut
             }) {
                 bail!("resolved Excel arguments must be JSON scalar values");
             }
-            Ok(ExecutorSpec::ExcelMacro(crate::ExcelMacroSpec {
+            let rendered = crate::ExcelMacroSpec {
                 workbook_path: render_string(&excel.workbook_path, parameters)?,
+                module_name: excel
+                    .module_name
+                    .as_deref()
+                    .map(|value| render_string(value, parameters))
+                    .transpose()?,
                 macro_name: render_string(&excel.macro_name, parameters)?,
                 args,
                 read_only: excel.read_only,
                 save_changes: excel.save_changes,
                 visible: excel.visible,
-            }))
+            };
+            validate_excel_spec(&rendered, true)?;
+            Ok(ExecutorSpec::ExcelMacro(rendered))
         }
     }
 }
@@ -320,6 +345,7 @@ policy:
                 api_version: "scheduler/v1".into(),
                 executor: ExecutorSpec::ExcelMacro(ExcelMacroSpec {
                     workbook_path: "C:\\Tasks\\book.xlsm".into(),
+                    module_name: None,
                     macro_name: "Module.Run".into(),
                     args: vec![Value::String("{{params.payload}}".into())],
                     read_only: true,
@@ -367,7 +393,8 @@ policy:
         let ExecutorSpec::ExcelMacro(excel) = snapshot.executor else {
             panic!("wrong executor");
         };
-        assert_eq!(excel.macro_name, "ProcessModule.processID");
+        assert_eq!(excel.module_name.as_deref(), Some("ProcessModule"));
+        assert_eq!(excel.macro_name, "processID");
         assert_eq!(excel.args.len(), 17);
         assert_eq!(
             excel.args,
@@ -419,6 +446,7 @@ policy:
             api_version: "scheduler/v1".into(),
             executor: ExecutorSpec::ExcelMacro(ExcelMacroSpec {
                 workbook_path: "C:\\Tasks\\book.xlsm".into(),
+                module_name: None,
                 macro_name: "Module.Run".into(),
                 args: vec![Value::Null; 30],
                 read_only: true,
@@ -437,6 +465,78 @@ policy:
         excel.args.push(Value::Null);
         let error = validate_blueprint(&blueprint).expect_err("31 arguments must be rejected");
         assert!(error.to_string().contains("at most 30"));
+    }
+
+    #[test]
+    fn renders_separate_excel_module_and_rejects_double_qualification() {
+        let blueprint = parse_blueprint(
+            br#"api_version: scheduler/v1
+executor:
+  kind: excel_macro
+  workbook_path: 'C:\Tasks\book.xlsm'
+  module_name: '{{params.module}}'
+  macro_name: '{{params.macro}}'
+parameters_schema:
+  type: object
+"#,
+            Some("application/yaml"),
+        )
+        .expect("templated module blueprint must pass pre-render validation");
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint,
+            base_parameters: serde_json::json!({}),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+
+        let snapshot = resolve_snapshot(
+            &resolved,
+            &serde_json::json!({"module": "PublicModule", "macro": "RunTask"}),
+            &BTreeMap::new(),
+        )
+        .expect("separate module and macro render");
+        let ExecutorSpec::ExcelMacro(excel) = snapshot.executor else {
+            panic!("wrong executor");
+        };
+        assert_eq!(excel.module_name.as_deref(), Some("PublicModule"));
+        assert_eq!(excel.macro_name, "RunTask");
+
+        let error = resolve_snapshot(
+            &resolved,
+            &serde_json::json!({"module": "PublicModule", "macro": "Other.RunTask"}),
+            &BTreeMap::new(),
+        )
+        .expect_err("a separate module cannot be combined with a qualified macro");
+        assert!(error.to_string().contains("must be unqualified"));
+
+        let error = resolve_snapshot(
+            &resolved,
+            &serde_json::json!({"module": "Injected.Module", "macro": "RunTask"}),
+            &BTreeMap::new(),
+        )
+        .expect_err("a rendered module must remain unqualified");
+        assert!(error.to_string().contains("standard module name"));
+    }
+
+    #[test]
+    fn legacy_qualified_excel_macro_without_module_name_remains_valid() {
+        let blueprint = parse_blueprint(
+            br#"{
+                "api_version": "scheduler/v1",
+                "executor": {
+                    "kind": "excel_macro",
+                    "workbook_path": "C:\\\\Tasks\\\\Legacy.xlsm",
+                    "macro_name": "LegacyModule.Run"
+                }
+            }"#,
+            Some("application/json"),
+        )
+        .expect("legacy blueprint");
+        let ExecutorSpec::ExcelMacro(excel) = blueprint.executor else {
+            panic!("wrong executor");
+        };
+        assert!(excel.module_name.is_none());
+        assert_eq!(excel.macro_name, "LegacyModule.Run");
     }
 
     #[test]

@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/antonb64/task_scheduler/main/schemas/blueprint-v1.schema.json",
+  "title": "Task Scheduler Blueprint v1",
+  "description": "A reusable scheduler/v1 execution blueprint. YAML blueprints are converted to the equivalent JSON value before validation. Unknown properties are intentionally permitted because the Rust v1 model ignores them.",
+  "type": "object",
+  "required": [
+    "api_version",
+    "executor"
+  ],
+  "properties": {
+    "api_version": {
+      "const": "scheduler/v1"
+    },
+    "executor": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/command_executor"
+        },
+        {
+          "$ref": "#/$defs/excel_macro_executor"
+        }
+      ]
+    },
+    "parameters_schema": {
+      "$ref": "https://json-schema.org/draft/2020-12/schema",
+      "default": {
+        "type": "object"
+      },
+      "description": "A valid JSON Schema 2020-12 schema used to validate the resolved parameter object."
+    },
+    "required_labels": {
+      "$ref": "#/$defs/labels",
+      "default": {}
+    },
+    "policy": {
+      "$ref": "#/$defs/execution_policy",
+      "default": {}
+    }
+  },
+  "$defs": {
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "command_executor": {
+      "type": "object",
+      "required": [
+        "kind",
+        "program"
+      ],
+      "properties": {
+        "kind": {
+          "const": "command"
+        },
+        "program": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          },
+          "default": {}
+        },
+        "working_directory": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "default": null
+        }
+      }
+    },
+    "excel_macro_executor": {
+      "type": "object",
+      "required": [
+        "kind",
+        "workbook_path",
+        "macro_name"
+      ],
+      "properties": {
+        "kind": {
+          "const": "excel_macro"
+        },
+        "workbook_path": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "module_name": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "\\S",
+              "anyOf": [
+                {
+                  "pattern": "\\{\\{params\\."
+                },
+                {
+                  "not": {
+                    "pattern": "[.!]"
+                  }
+                }
+              ]
+            }
+          ],
+          "default": null,
+          "description": "Optional standard-module name. When set, macro_name is the separate unqualified public procedure name; when absent, a qualified macro_name remains supported."
+        },
+        "macro_name": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "args": {
+          "type": "array",
+          "maxItems": 30,
+          "items": {
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          },
+          "default": []
+        },
+        "read_only": {
+          "type": "boolean",
+          "default": true
+        },
+        "save_changes": {
+          "type": "boolean",
+          "default": false
+        },
+        "visible": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "module_name"
+            ],
+            "properties": {
+              "module_name": {
+                "type": "string"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "macro_name": {
+                "anyOf": [
+                  {
+                    "pattern": "\\{\\{params\\."
+                  },
+                  {
+                    "not": {
+                      "pattern": "[.!]"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      ]
+    },
+    "execution_policy": {
+      "type": "object",
+      "properties": {
+        "max_attempts": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 3
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 18446744073709551615,
+          "default": 3600
+        },
+        "initial_backoff_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 5
+        },
+        "backoff_cap_seconds": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 18446744073709551615,
+          "default": 300
+        }
+      }
+    }
+  }
+}

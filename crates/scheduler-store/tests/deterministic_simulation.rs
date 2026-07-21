@@ -983,6 +983,67 @@ async fn settings_locks_and_revisions_survive_restarts_and_stale_writers() {
 }
 
 #[tokio::test]
+async fn expected_lock_conflicts_release_sqlite_writer_before_immediate_update() {
+    // Regression for an intermittent SQLITE_BUSY observed when this test ran with
+    // the full suite: acquire_lock returned its expected business error by dropping
+    // a write transaction, but did not await that transaction's rollback.
+    for seed in simulation_seeds() {
+        let database = Database::new(seed ^ 0xb055_10cc).await;
+        for round in 0..20_u64 {
+            let settings = database
+                .store
+                .get_global_settings()
+                .await
+                .expect("read settings");
+            let winner = database
+                .store
+                .acquire_lock("global", "winner")
+                .await
+                .expect("winner lock");
+
+            let mut conflicts = JoinSet::new();
+            for contender in 0..8 {
+                let store = database.store.clone();
+                conflicts.spawn(async move {
+                    store
+                        .acquire_lock("global", &format!("contender-{contender}"))
+                        .await
+                });
+            }
+            while let Some(conflict) = conflicts.join_next().await {
+                assert!(
+                    conflict.expect("contender task").is_err(),
+                    "seed={seed} round={round}: contender unexpectedly acquired lock"
+                );
+            }
+
+            let mut document = serde_json::to_value(&settings).expect("settings JSON");
+            document["default_timeout_seconds"] = (round + 1).into();
+            let revision = database
+                .store
+                .update_settings(
+                    "global",
+                    settings.revision,
+                    &document.to_string(),
+                    &winner.lock_token,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "seed={seed} round={round}: immediate update after expected lock conflicts failed: {error}"
+                    )
+                });
+            assert_eq!(revision, settings.revision + 1);
+            database
+                .store
+                .release_lock("global", &winner.lock_token, false)
+                .await
+                .expect("release winner lock");
+        }
+    }
+}
+
+#[tokio::test]
 async fn interrupted_transaction_rolls_back_completely_before_reopen() {
     for seed in simulation_seeds() {
         let mut database = Database::new(seed ^ 0x7a11_bacc).await;

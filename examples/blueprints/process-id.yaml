@@ -2,7 +2,8 @@ api_version: scheduler/v1
 executor:
   kind: excel_macro
   workbook_path: "C:\\TaskWorkbooks\\Process.xlsm"
-  macro_name: "ProcessModule.processID"
+  module_name: "ProcessModule"
+  macro_name: "processID"
   args:
     - "{{params.id}}"
     - "{{params.workbook_name}}"

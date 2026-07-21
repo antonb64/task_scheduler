@@ -1,0 +1,18 @@
+api_version: scheduler/connectors/v1
+connectors:
+  customer-data:
+    base_url: https://customer-connector.example.com
+    bearer_token_env: CUSTOMER_CONNECTOR_TOKEN
+    allowed_kinds:
+      - parameters
+    connect_timeout_seconds: 5
+    timeout_seconds: 20
+    allow_insecure_http: false
+
+  local-development:
+    base_url: http://127.0.0.1:9010
+    allowed_kinds:
+      - blueprint
+      - parameters
+    connect_timeout_seconds: 2
+    timeout_seconds: 10

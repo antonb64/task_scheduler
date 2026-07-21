@@ -8,7 +8,9 @@ use axum::{
     response::{Html, IntoResponse, Redirect, Response},
     routing::{get, post},
 };
-use scheduler_core::{ArtifactRef, CronSpec, GlobalSettings, NodeSettings, ScheduleSpec};
+use scheduler_core::{
+    AgentView, ArtifactRef, CronSpec, GlobalSettings, NodeSettings, ScheduleSpec,
+};
 use scheduler_store::NewSchedule;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -707,7 +709,7 @@ async fn nodes(State(state): State<AppState>, headers: HeaderMap) -> Response {
         Ok(items) => {
             let mut rows = String::new();
             for item in items {
-                rows.push_str(&format!(r#"<tr><td><a href="/settings/nodes/{}">{}</a><br><span class="muted">{}</span></td><td><span class="badge {}">{}</span></td><td>{}/{}</td><td>desired r{} / applied r{}</td><td><code>{}</code></td><td>{}</td></tr>"#, esc(&item.id), esc(&item.id), esc(&item.hostname), if item.connected {"good"} else {"bad"}, if item.connected {"online"} else {"offline"}, item.running, item.capacity, item.desired_settings_revision, item.applied_settings_revision, esc(&serde_json::to_string(&item.labels).unwrap_or_default()), item.last_seen_at));
+                rows.push_str(&node_row(&item));
             }
             page(
                 "Nodes",
@@ -719,6 +721,40 @@ async fn nodes(State(state): State<AppState>, headers: HeaderMap) -> Response {
         }
         Err(error) => error_page(&session.csrf, &error),
     }
+}
+
+fn node_row(item: &AgentView) -> String {
+    let diverged = item.desired_settings_revision != item.applied_settings_revision;
+    let (settings_class, settings_label) = if item.settings_error.is_some() {
+        ("bad", "rejected")
+    } else if diverged {
+        ("bad", "pending")
+    } else {
+        ("good", "applied")
+    };
+    let rejection = item
+        .settings_error
+        .as_deref()
+        .map(|error| {
+            format!(
+                r#"<div class="bad"><strong>Rejected:</strong> {}</div>"#,
+                esc(error)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"<tr><td><a href="/settings/nodes/{id}">{id}</a><br><span class="muted">{hostname}</span></td><td><span class="badge {connection_class}">{connection}</span></td><td>{running}/{capacity}</td><td><span class="badge {settings_class}">{settings_label}</span><br>desired r{desired} / applied r{applied}{rejection}</td><td><code>{labels}</code></td><td>{last_seen}</td></tr>"#,
+        id = esc(&item.id),
+        hostname = esc(&item.hostname),
+        connection_class = if item.connected { "good" } else { "bad" },
+        connection = if item.connected { "online" } else { "offline" },
+        running = item.running,
+        capacity = item.capacity,
+        desired = item.desired_settings_revision,
+        applied = item.applied_settings_revision,
+        labels = esc(&serde_json::to_string(&item.labels).unwrap_or_default()),
+        last_seen = item.last_seen_at,
+    )
 }
 
 async fn edit_global_settings(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1072,4 +1108,51 @@ fn json_enum_name(value: impl serde::Serialize) -> String {
         .ok()
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_else(|| "unknown".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn agent_view() -> AgentView {
+        AgentView {
+            id: "node-<west>".into(),
+            hostname: "desktop & excel".into(),
+            labels: BTreeMap::from([("os".into(), "windows".into())]),
+            capacity: 2,
+            running: 1,
+            connected: true,
+            desired_settings_revision: 4,
+            applied_settings_revision: 3,
+            settings_error: None,
+            last_seen_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn node_row_marks_revision_divergence_and_escapes_rejection_errors() {
+        let mut agent = agent_view();
+        let pending = node_row(&agent);
+        assert!(pending.contains(r#"class="badge bad">pending"#));
+        assert!(pending.contains("desired r4 / applied r3"));
+
+        agent.settings_error = Some("invalid <script>alert('secret')</script> & value".into());
+        let rejected = node_row(&agent);
+        assert!(rejected.contains(r#"class="badge bad">rejected"#));
+        assert!(rejected.contains("<strong>Rejected:</strong>"));
+        assert!(rejected.contains("&lt;script&gt;"));
+        assert!(rejected.contains("&amp; value"));
+        assert!(!rejected.contains("<script>"));
+        assert!(!rejected.contains("node-<west>"));
+        assert!(rejected.contains("node-&lt;west&gt;"));
+    }
+
+    #[test]
+    fn node_row_marks_matching_revision_as_applied() {
+        let mut agent = agent_view();
+        agent.applied_settings_revision = agent.desired_settings_revision;
+        let row = node_row(&agent);
+        assert!(row.contains(r#"class="badge good">applied"#));
+        assert!(!row.contains("Rejected:"));
+    }
 }

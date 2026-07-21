@@ -22,6 +22,30 @@ pub struct Store {
 }
 
 #[derive(Debug, Clone)]
+pub struct AgentRegistration {
+    pub desired_settings: NodeSettings,
+    pub applied_settings_revision: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingsAckStatus {
+    Applied,
+    Rejected,
+    Ignored,
+}
+
+#[derive(Debug, Clone)]
+pub struct SettingsAckOutcome {
+    pub status: SettingsAckStatus,
+    pub desired_revision: i64,
+    pub applied_revision: i64,
+    /// The exact document that the coordinator durably recorded as applied.
+    /// This is present only for a successful acknowledgement of the current
+    /// desired revision.
+    pub applied_settings: Option<NodeSettings>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ScheduleRecord {
     pub view: ScheduleView,
     pub encrypted_snapshot: Vec<u8>,
@@ -440,7 +464,10 @@ impl Store {
             .bind(&occurrence)
             .fetch_one(&mut *tx)
             .await?,
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error.into());
+            }
         };
 
         let row = sqlx::query("SELECT id,schedule_id,state,trigger_kind,scheduled_at,attempt_count,created_at,updated_at FROM runs WHERE id=?")
@@ -494,7 +521,10 @@ impl Store {
                 }
                 return Err(error.into());
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                tx.rollback().await?;
+                return Err(error.into());
+            }
         }
         append_audit_tx(
             &mut tx,
@@ -590,9 +620,11 @@ impl Store {
             .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
+            tx.rollback().await?;
             return Ok(None);
         };
         if row.get::<String, _>("state") != "queued" {
+            tx.rollback().await?;
             return Ok(None);
         }
         let attempt_number = row.get::<i64, _>("max_attempt_number") as u32 + 1;
@@ -670,6 +702,7 @@ impl Store {
         let row = sqlx::query("SELECT run_id FROM attempts WHERE id=? AND lease_token=? AND state IN ('offered','accepted')")
             .bind(attempt_id.to_string()).bind(lease_token).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
+            tx.rollback().await?;
             bail!("attempt or lease token is invalid");
         };
         let run_id: String = row.get("run_id");
@@ -837,6 +870,7 @@ impl Store {
         let row = sqlx::query("SELECT a.run_id,a.state AS attempt_state,r.attempt_count,r.max_attempts,r.initial_backoff_seconds,r.backoff_cap_seconds,r.state AS run_state FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.lease_token=?")
             .bind(attempt_id.to_string()).bind(lease_token).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
+            tx.rollback().await?;
             bail!("attempt or lease token is invalid");
         };
         let run_id: String = row.get("run_id");
@@ -960,6 +994,7 @@ impl Store {
         let result = sqlx::query("UPDATE runs SET state='cancelled',updated_at=? WHERE id=? AND state IN ('queued','running')")
             .bind(now_string()).bind(run_id.to_string()).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
+            tx.rollback().await?;
             bail!("run is already terminal or does not exist");
         }
         let rows =
@@ -1004,7 +1039,7 @@ impl Store {
         labels: &std::collections::HashMap<String, String>,
         capacity: u32,
         running: u32,
-    ) -> Result<NodeSettings> {
+    ) -> Result<AgentRegistration> {
         let now = now_string();
         let labels_json = serde_json::to_string(labels)?;
         let mut settings = NodeSettings {
@@ -1034,8 +1069,16 @@ impl Store {
             serde_json::json!({"capacity": capacity}),
         )
         .await?;
+        let applied_settings_revision =
+            sqlx::query_scalar::<_, i64>("SELECT applied_settings_revision FROM agents WHERE id=?")
+                .bind(id)
+                .fetch_one(&mut *tx)
+                .await?;
         tx.commit().await?;
-        Ok(settings)
+        Ok(AgentRegistration {
+            desired_settings: settings,
+            applied_settings_revision,
+        })
     }
 
     pub async fn disconnect_agent(&self, id: &str) -> Result<()> {
@@ -1053,20 +1096,111 @@ impl Store {
         id: &str,
         revision: i64,
         error: Option<&str>,
-    ) -> Result<()> {
-        sqlx::query("UPDATE agents SET applied_settings_revision=?,settings_error=?,updated_at=? WHERE id=?")
-            .bind(revision).bind(error).bind(now_string()).bind(id).execute(&self.pool).await?;
-        self.append_audit(
-            "agent",
-            id,
-            "settings.applied",
-            serde_json::json!({"revision": revision, "error": error}),
+    ) -> Result<SettingsAckOutcome> {
+        let now = now_string();
+        let mut tx = self.pool.begin().await?;
+        let affected = if let Some(error) = error {
+            // A rejection is current only while this exact revision remains
+            // desired and no success for it has already been recorded.
+            sqlx::query("UPDATE agents SET settings_error=?,updated_at=? WHERE id=? AND desired_settings_revision=? AND applied_settings_revision<?")
+                .bind(error)
+                .bind(&now)
+                .bind(id)
+                .bind(revision)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+        } else {
+            // Only the current desired revision may advance applied state. The
+            // final predicate prevents an out-of-order ACK from regressing it.
+            sqlx::query("UPDATE agents SET applied_settings_revision=?,settings_error=NULL,updated_at=? WHERE id=? AND desired_settings_revision=? AND applied_settings_revision<=?")
+                .bind(revision)
+                .bind(&now)
+                .bind(id)
+                .bind(revision)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+        };
+        let current = sqlx::query(
+            "SELECT desired_settings_revision,applied_settings_revision,settings_error FROM agents WHERE id=?",
         )
-        .await
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .with_context(|| format!("agent {id} not found"))?;
+        let desired_revision: i64 = current.get("desired_settings_revision");
+        let applied_revision: i64 = current.get("applied_settings_revision");
+        let current_error: Option<String> = current.get("settings_error");
+
+        let (status, event_type, metadata) = if affected == 0 {
+            (
+                SettingsAckStatus::Ignored,
+                "settings.ack_ignored",
+                serde_json::json!({
+                    "revision": revision,
+                    "desired_revision": desired_revision,
+                    "applied_revision": applied_revision,
+                    "acknowledged_success": error.is_none(),
+                    "current_error": current_error.is_some(),
+                }),
+            )
+        } else if error.is_some() {
+            (
+                SettingsAckStatus::Rejected,
+                "settings.rejected",
+                serde_json::json!({"revision": revision}),
+            )
+        } else {
+            (
+                SettingsAckStatus::Applied,
+                "settings.applied",
+                serde_json::json!({"revision": revision}),
+            )
+        };
+        let applied_settings = if status == SettingsAckStatus::Applied {
+            let row = sqlx::query(
+                "SELECT document_json,revision FROM settings_documents WHERE document_key=? AND revision=?",
+            )
+            .bind(format!("node:{id}"))
+            .bind(applied_revision)
+            .fetch_optional(&mut *tx)
+            .await?
+            .with_context(|| {
+                format!(
+                    "applied settings document for agent {id} revision {applied_revision} not found"
+                )
+            })?;
+            let mut settings: NodeSettings = serde_json::from_str(row.get("document_json"))?;
+            settings.revision = row.get("revision");
+            sqlx::query(
+                "UPDATE agents SET labels_json=?,capacity=? WHERE id=? AND desired_settings_revision=? AND applied_settings_revision=?",
+            )
+            .bind(serde_json::to_string(&settings.labels)?)
+            .bind(i64::from(settings.max_parallel))
+            .bind(id)
+            .bind(settings.revision)
+            .bind(settings.revision)
+            .execute(&mut *tx)
+            .await?;
+            Some(settings)
+        } else {
+            None
+        };
+        append_audit_tx(&mut tx, "agent", id, event_type, metadata).await?;
+        tx.commit().await?;
+        Ok(SettingsAckOutcome {
+            status,
+            desired_revision,
+            applied_revision,
+            applied_settings,
+        })
     }
 
     pub async fn list_agents(&self) -> Result<Vec<AgentView>> {
-        let rows = sqlx::query("SELECT id,hostname,labels_json,capacity,running,connected,desired_settings_revision,applied_settings_revision,last_seen_at FROM agents ORDER BY id")
+        let rows = sqlx::query("SELECT id,hostname,labels_json,capacity,running,connected,desired_settings_revision,applied_settings_revision,settings_error,last_seen_at FROM agents ORDER BY id")
             .fetch_all(&self.pool).await?;
         rows.into_iter().map(agent_from_row).collect()
     }
@@ -1111,21 +1245,27 @@ impl Store {
             .fetch_optional(&mut *tx)
             .await?;
         let Some(lock) = lock else {
+            // Await the rollback before returning a normal business error. Relying on
+            // Transaction::drop schedules the rollback asynchronously; under writer
+            // contention the next pooled connection can otherwise observe SQLITE_BUSY.
+            tx.rollback().await?;
             bail!("settings edit lock is required");
         };
         if lock.get::<String, _>("lock_token") != lock_token
             || parse_time(lock.get("expires_at"))? <= now
         {
+            tx.rollback().await?;
             bail!("settings edit lock is invalid or expired");
         }
         let result = sqlx::query("UPDATE settings_documents SET document_json=?,revision=revision+1,updated_at=? WHERE document_key=? AND revision=?")
             .bind(document_json).bind(format_time(now)).bind(document_key).bind(expected_revision).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
+            tx.rollback().await?;
             bail!("settings revision conflict");
         }
         let revision = expected_revision + 1;
         if let Some(agent_id) = document_key.strip_prefix("node:") {
-            sqlx::query("UPDATE agents SET desired_settings_revision=?,updated_at=? WHERE id=?")
+            sqlx::query("UPDATE agents SET desired_settings_revision=?,settings_error=NULL,updated_at=? WHERE id=?")
                 .bind(revision)
                 .bind(format_time(now))
                 .bind(agent_id)
@@ -1161,10 +1301,11 @@ impl Store {
                 .bind(document_key)
                 .fetch_one(&mut *tx)
                 .await?;
-            bail!(
-                "settings are currently being edited by {}",
-                row.get::<String, _>("owner_session")
-            );
+            let owner: String = row.get("owner_session");
+            // This is an expected conflict, so finish the transaction before the
+            // caller immediately starts another write on a different connection.
+            tx.rollback().await?;
+            bail!("settings are currently being edited by {owner}");
         }
         tx.commit().await?;
         Ok(EditLock {
@@ -1381,6 +1522,7 @@ fn agent_from_row(row: sqlx::sqlite::SqliteRow) -> Result<AgentView> {
         connected: row.get::<bool, _>("connected"),
         desired_settings_revision: row.get("desired_settings_revision"),
         applied_settings_revision: row.get("applied_settings_revision"),
+        settings_error: row.get("settings_error"),
         last_seen_at: parse_time(row.get("last_seen_at"))?,
     })
 }
@@ -1414,7 +1556,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use chrono::TimeZone;
     use scheduler_core::{ArtifactRef, ExecutionPolicy, ScheduleSpec};
@@ -1428,6 +1570,42 @@ mod tests {
         let url = format!("sqlite://{}", database.display());
         let store = Store::connect(&url, None).await.expect("store");
         (directory, store)
+    }
+
+    async fn register_test_agent(store: &Store, id: &str) {
+        store
+            .upsert_agent(id, "test-host", &HashMap::new(), 2, 0)
+            .await
+            .expect("register test agent");
+    }
+
+    async fn advance_node_settings(store: &Store, id: &str) -> i64 {
+        let key = format!("node:{id}");
+        let settings = store
+            .get_node_settings(id)
+            .await
+            .expect("read node settings")
+            .expect("node settings");
+        let lock = store
+            .acquire_lock(&key, "settings-test")
+            .await
+            .expect("settings lock");
+        let mut document = serde_json::to_value(&settings).expect("settings JSON");
+        document["max_parallel"] = serde_json::json!(settings.max_parallel + 1);
+        let revision = store
+            .update_settings(
+                &key,
+                settings.revision,
+                &document.to_string(),
+                &lock.lock_token,
+            )
+            .await
+            .expect("advance node settings");
+        store
+            .release_lock(&key, &lock.lock_token, false)
+            .await
+            .expect("release settings lock");
+        revision
     }
 
     fn spec() -> ScheduleSpec {
@@ -1584,6 +1762,203 @@ mod tests {
                 )
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_settings_ack_preserves_applied_revision_and_exposes_safe_state() {
+        let (_directory, store) = test_store().await;
+        register_test_agent(&store, "node-rejected").await;
+
+        store
+            .settings_applied("node-rejected", 1, Some("command root is not allowed"))
+            .await
+            .expect("record rejection");
+
+        let agent = store.list_agents().await.expect("agents").remove(0);
+        assert_eq!(agent.desired_settings_revision, 1);
+        assert_eq!(agent.applied_settings_revision, 0);
+        assert_eq!(
+            agent.settings_error.as_deref(),
+            Some("command root is not allowed")
+        );
+        let events = store
+            .audit_events("agent", "node-rejected", 10)
+            .await
+            .expect("audit events");
+        let rejected = events
+            .iter()
+            .find(|event| event["event_type"] == "settings.rejected")
+            .expect("rejection audit");
+        assert_eq!(rejected["metadata"], serde_json::json!({"revision": 1}));
+        assert!(
+            !rejected.to_string().contains("command root is not allowed"),
+            "audit metadata must not copy the agent-provided error"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_settings_ack_recovers_from_rejection() {
+        let (_directory, store) = test_store().await;
+        register_test_agent(&store, "node-recovery").await;
+        let key = "node:node-recovery";
+        let settings = store
+            .get_node_settings("node-recovery")
+            .await
+            .expect("read settings")
+            .expect("node settings");
+        let lock = store
+            .acquire_lock(key, "recovery-test")
+            .await
+            .expect("settings lock");
+        let mut document = serde_json::to_value(&settings).expect("settings JSON");
+        document["max_parallel"] = serde_json::json!(7);
+        document["labels"] = serde_json::json!({"pool": "synchronized"});
+        let revision = store
+            .update_settings(
+                key,
+                settings.revision,
+                &document.to_string(),
+                &lock.lock_token,
+            )
+            .await
+            .expect("update settings");
+        store
+            .settings_applied("node-recovery", revision, Some("temporary rejection"))
+            .await
+            .expect("record rejection");
+
+        store
+            .settings_applied("node-recovery", revision, None)
+            .await
+            .expect("record success");
+
+        let agent = store.list_agents().await.expect("agents").remove(0);
+        assert_eq!(agent.applied_settings_revision, revision);
+        assert_eq!(agent.desired_settings_revision, revision);
+        assert_eq!(agent.settings_error, None);
+        assert_eq!(agent.capacity, 7);
+        assert_eq!(agent.labels["pool"], "synchronized");
+        let events = store
+            .audit_events("agent", "node-recovery", 10)
+            .await
+            .expect("audit events");
+        assert_eq!(events[0]["event_type"], "settings.applied");
+        assert_eq!(
+            events[0]["metadata"],
+            serde_json::json!({"revision": revision})
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_and_out_of_order_settings_acks_cannot_overwrite_current_state() {
+        let (_directory, store) = test_store().await;
+        register_test_agent(&store, "node-stale").await;
+        store
+            .settings_applied("node-stale", 1, None)
+            .await
+            .expect("initial success");
+        let revision = advance_node_settings(&store, "node-stale").await;
+        assert_eq!(revision, 2);
+        store
+            .settings_applied("node-stale", revision, Some("current rejection"))
+            .await
+            .expect("current rejection");
+
+        for (ack_revision, error) in [
+            (1, None),
+            (1, Some("stale rejection")),
+            (3, None),
+            (3, Some("future rejection")),
+        ] {
+            store
+                .settings_applied("node-stale", ack_revision, error)
+                .await
+                .expect("ignored acknowledgement");
+        }
+        let rejected = store.list_agents().await.expect("agents").remove(0);
+        assert_eq!(rejected.desired_settings_revision, 2);
+        assert_eq!(rejected.applied_settings_revision, 1);
+        assert_eq!(
+            rejected.settings_error.as_deref(),
+            Some("current rejection")
+        );
+
+        store
+            .settings_applied("node-stale", revision, None)
+            .await
+            .expect("current success");
+        store
+            .settings_applied("node-stale", revision, Some("late rejection"))
+            .await
+            .expect("late rejection is ignored");
+        let applied = store.list_agents().await.expect("agents").remove(0);
+        assert_eq!(applied.applied_settings_revision, 2);
+        assert_eq!(applied.settings_error, None);
+
+        let events = store
+            .audit_events("agent", "node-stale", 20)
+            .await
+            .expect("audit events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event_type"] == "settings.ack_ignored")
+                .count(),
+            5
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !event.to_string().contains("stale rejection")
+                    && !event.to_string().contains("future rejection")
+                    && !event.to_string().contains("late rejection")),
+            "ignored acknowledgements must not audit agent-provided error text"
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_success_cannot_apply_a_newer_rejected_desired_document() {
+        let (_directory, store) = test_store().await;
+        register_test_agent(&store, "node-delayed-success").await;
+        let initial = store
+            .settings_applied("node-delayed-success", 1, None)
+            .await
+            .expect("initial success");
+        assert_eq!(initial.status, SettingsAckStatus::Applied);
+
+        let revision_two = advance_node_settings(&store, "node-delayed-success").await;
+        let revision_three = advance_node_settings(&store, "node-delayed-success").await;
+        assert_eq!((revision_two, revision_three), (2, 3));
+
+        let rejected = store
+            .settings_applied(
+                "node-delayed-success",
+                revision_three,
+                Some("revision three is invalid on this node"),
+            )
+            .await
+            .expect("current rejection");
+        assert_eq!(rejected.status, SettingsAckStatus::Rejected);
+        assert_eq!(rejected.desired_revision, 3);
+        assert_eq!(rejected.applied_revision, 1);
+        assert!(rejected.applied_settings.is_none());
+
+        let delayed = store
+            .settings_applied("node-delayed-success", revision_two, None)
+            .await
+            .expect("delayed success is safely ignored");
+        assert_eq!(delayed.status, SettingsAckStatus::Ignored);
+        assert_eq!(delayed.desired_revision, 3);
+        assert_eq!(delayed.applied_revision, 1);
+        assert!(delayed.applied_settings.is_none());
+
+        let agent = store.list_agents().await.expect("agents").remove(0);
+        assert_eq!(agent.desired_settings_revision, 3);
+        assert_eq!(agent.applied_settings_revision, 1);
+        assert_eq!(
+            agent.settings_error.as_deref(),
+            Some("revision three is invalid on this node")
         );
     }
 

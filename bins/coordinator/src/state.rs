@@ -25,10 +25,12 @@ pub struct AppState {
 
 #[derive(Clone)]
 pub struct AgentSession {
+    pub connection_id: uuid::Uuid,
     pub tx: mpsc::Sender<Result<CoordinatorMessage, tonic::Status>>,
     pub enabled: bool,
     pub labels: BTreeMap<String, String>,
     pub capacity: u32,
+    pub applied_settings_revision: i64,
     pub running: u32,
     pub last_assigned: Instant,
 }

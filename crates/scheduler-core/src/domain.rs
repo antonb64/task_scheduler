@@ -11,6 +11,22 @@ pub struct ArtifactRef {
     pub uri: String,
 }
 
+pub fn validate_agent_id(id: &str) -> Result<()> {
+    let bytes = id.as_bytes();
+    let valid = (1..=64).contains(&bytes.len())
+        && bytes.first().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes.last().is_some_and(u8::is_ascii_alphanumeric)
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(*byte, b'.' | b'_' | b'-'));
+    if !valid {
+        bail!(
+            "agent_id must be 1-64 ASCII letters, digits, dots, underscores, or hyphens and must start and end with a letter or digit"
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleSpec {
     pub name: String,
@@ -73,6 +89,8 @@ pub struct CommandSpec {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExcelMacroSpec {
     pub workbook_path: String,
+    #[serde(default)]
+    pub module_name: Option<String>,
     pub macro_name: String,
     #[serde(default)]
     pub args: Vec<Value>,
@@ -444,12 +462,33 @@ pub struct AgentView {
     pub connected: bool,
     pub desired_settings_revision: i64,
     pub applied_settings_revision: i64,
+    pub settings_error: Option<String>,
     pub last_seen_at: DateTime<Utc>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_ids_are_safe_for_management_path_segments() {
+        for valid in ["node1", "excel-01", "site_a.node-42"] {
+            validate_agent_id(valid).expect("valid agent ID");
+        }
+        for invalid in [
+            "",
+            "-node",
+            "node-",
+            "node/west",
+            "node?west",
+            "node#west",
+            "node west",
+            "nöde",
+        ] {
+            validate_agent_id(invalid).expect_err("unsafe agent ID must fail");
+        }
+        validate_agent_id(&"a".repeat(65)).expect_err("agent ID length must be bounded");
+    }
 
     #[test]
     fn global_settings_reject_unsafe_lease_and_invalid_endpoints() {

@@ -11,7 +11,7 @@ use std::{collections::HashMap, sync::Arc};
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use config::Config;
-use scheduler_core::{AdapterRegistry, SnapshotCipher};
+use scheduler_core::{AdapterRegistry, ConnectorConfig, SnapshotCipher};
 use scheduler_protocol::control::scheduler_control_server::SchedulerControlServer;
 use scheduler_store::Store;
 use state::AppState;
@@ -31,7 +31,18 @@ async fn main() -> Result<()> {
     let store = Store::connect(&config.database_url, Some(&config.lock_path)).await?;
     let cipher = SnapshotCipher::from_base64(&config.master_key_id, &config.master_key)
         .context("invalid SCHEDULER_MASTER_KEY")?;
-    let adapters = AdapterRegistry::with_defaults(config.artifact_roots.clone(), HashMap::new())?;
+    let mut adapters =
+        AdapterRegistry::with_defaults(config.artifact_roots.clone(), HashMap::new())?;
+    if let Some(path) = &config.connector_config {
+        let document = tokio::fs::read(path)
+            .await
+            .with_context(|| format!("cannot read connector config {}", path.display()))?;
+        let connector_config = ConnectorConfig::from_slice(&document)
+            .with_context(|| format!("invalid connector config {}", path.display()))?;
+        let connector_count = connector_config.connectors.len();
+        adapters.register_connectors(connector_config)?;
+        info!(connector_count, "configured artifact sidecar connectors");
+    }
     let auth = auth::AuthManager::new(&config.admin_token, config.secure_cookies)?;
     let state = AppState {
         store,

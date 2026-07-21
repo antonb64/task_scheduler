@@ -8,7 +8,8 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use scheduler_core::{
-    ArtifactKind, GlobalSettings, NodeSettings, ResolvedScheduleSnapshot, ScheduleSpec,
+    ArtifactFetchError, ArtifactKind, GlobalSettings, NodeSettings, ResolvedScheduleSnapshot,
+    ScheduleSpec,
     blueprint::{merge_parameters, parse_blueprint_with_defaults},
     resolve_snapshot,
 };
@@ -762,22 +763,49 @@ where
 {
     fn from(error: E) -> Self {
         let error = error.into();
+        let artifact_error = error.downcast_ref::<ArtifactFetchError>();
         let message = format!("{error:#}");
-        let (status, code) =
-            if message.contains("conflict") || message.contains("currently being edited") {
-                (StatusCode::CONFLICT, "conflict")
-            } else if message.contains("not found") {
-                (StatusCode::NOT_FOUND, "resource_not_found")
-            } else if message.contains("parameters failed validation") {
-                (
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "parameter_validation_failed",
-                )
-            } else if message.contains("artifact") || message.contains("blueprint") {
-                (StatusCode::BAD_REQUEST, "artifact_resolution_failed")
-            } else {
-                (StatusCode::BAD_REQUEST, "invalid_request")
-            };
+        let (status, code) = if let Some(error) = artifact_error {
+            match error {
+                ArtifactFetchError::Timeout { .. } => {
+                    (StatusCode::GATEWAY_TIMEOUT, "connector_timeout")
+                }
+                ArtifactFetchError::Transport { .. } => {
+                    (StatusCode::BAD_GATEWAY, "connector_transport_failed")
+                }
+                ArtifactFetchError::UpstreamStatus { .. } => {
+                    (StatusCode::BAD_GATEWAY, "connector_upstream_failed")
+                }
+                ArtifactFetchError::InvalidResponse { .. } => {
+                    (StatusCode::BAD_GATEWAY, "connector_invalid_response")
+                }
+                ArtifactFetchError::TooLarge { .. } => {
+                    (StatusCode::PAYLOAD_TOO_LARGE, "artifact_too_large")
+                }
+                ArtifactFetchError::NotConfigured { .. } => {
+                    (StatusCode::BAD_REQUEST, "connector_not_configured")
+                }
+                ArtifactFetchError::InvalidReference { .. } => {
+                    (StatusCode::BAD_REQUEST, "invalid_artifact_reference")
+                }
+                ArtifactFetchError::UnsupportedKind { .. } => {
+                    (StatusCode::BAD_REQUEST, "connector_kind_not_allowed")
+                }
+            }
+        } else if message.contains("conflict") || message.contains("currently being edited") {
+            (StatusCode::CONFLICT, "conflict")
+        } else if message.contains("not found") {
+            (StatusCode::NOT_FOUND, "resource_not_found")
+        } else if message.contains("parameters failed validation") {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "parameter_validation_failed",
+            )
+        } else if message.contains("artifact") || message.contains("blueprint") {
+            (StatusCode::BAD_REQUEST, "artifact_resolution_failed")
+        } else {
+            (StatusCode::BAD_REQUEST, "invalid_request")
+        };
         Self {
             status,
             code,
@@ -845,9 +873,60 @@ fn due_cron_batch(
 
 #[cfg(test)]
 mod tests {
+    use std::{collections::HashMap, path::Path, sync::Arc};
+
     use chrono::TimeZone;
+    use scheduler_core::{
+        AdapterRegistry, ArtifactRef, ConnectorConfig, ConnectorEndpointConfig, ExecutorSpec,
+        SnapshotCipher,
+    };
+    use tokio::{
+        io::{AsyncReadExt as _, AsyncWriteExt as _},
+        sync::RwLock,
+    };
 
     use super::*;
+
+    async fn read_mock_request(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut request = Vec::new();
+        let header_end = loop {
+            if let Some(position) = request.windows(4).position(|value| value == b"\r\n\r\n") {
+                break position + 4;
+            }
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.expect("request headers");
+            assert_ne!(read, 0, "request ended before its headers");
+            request.extend_from_slice(&buffer[..read]);
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().expect("content length"))
+            })
+            .expect("content length header");
+        while request.len() < header_end + content_length {
+            let mut buffer = [0_u8; 1024];
+            let read = stream.read(&mut buffer).await.expect("request body");
+            assert_ne!(read, 0, "request ended before its body");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        request
+    }
+
+    fn sqlite_file_url(path: &Path) -> String {
+        let normalized = path.to_string_lossy().replace('\\', "/");
+        #[cfg(windows)]
+        {
+            format!("sqlite:///{}", normalized.trim_start_matches('/'))
+        }
+        #[cfg(not(windows))]
+        {
+            format!("sqlite://{normalized}")
+        }
+    }
 
     #[test]
     fn settings_updates_require_a_matching_if_match_revision() {
@@ -861,6 +940,76 @@ mod tests {
         let stale = require_if_match(&headers, 8).expect_err("mismatch");
         assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(stale.code, "precondition_failed");
+    }
+
+    #[test]
+    fn connector_failures_have_stable_operator_safe_http_statuses() {
+        let cases = [
+            (
+                ArtifactFetchError::NotConfigured {
+                    connector: "records".into(),
+                },
+                StatusCode::BAD_REQUEST,
+                "connector_not_configured",
+            ),
+            (
+                ArtifactFetchError::UnsupportedKind {
+                    connector: "records".into(),
+                    kind: ArtifactKind::Blueprint,
+                },
+                StatusCode::BAD_REQUEST,
+                "connector_kind_not_allowed",
+            ),
+            (
+                ArtifactFetchError::TooLarge {
+                    connector: Some("records".into()),
+                    kind: ArtifactKind::Parameters,
+                },
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "artifact_too_large",
+            ),
+            (
+                ArtifactFetchError::Transport {
+                    connector: "records".into(),
+                    kind: ArtifactKind::Parameters,
+                },
+                StatusCode::BAD_GATEWAY,
+                "connector_transport_failed",
+            ),
+            (
+                ArtifactFetchError::InvalidResponse {
+                    connector: "records".into(),
+                    kind: ArtifactKind::Parameters,
+                    reason: "missing protocol version",
+                },
+                StatusCode::BAD_GATEWAY,
+                "connector_invalid_response",
+            ),
+            (
+                ArtifactFetchError::Timeout {
+                    connector: "records".into(),
+                    kind: ArtifactKind::Parameters,
+                },
+                StatusCode::GATEWAY_TIMEOUT,
+                "connector_timeout",
+            ),
+        ];
+
+        for (source, status, code) in cases {
+            let error = ApiError::from(anyhow::Error::new(source).context("resolving schedule"));
+            assert_eq!(error.status, status);
+            assert_eq!(error.code, code);
+            assert!(!error.message.contains("response body"));
+        }
+
+        let upstream = ApiError::from(ArtifactFetchError::UpstreamStatus {
+            connector: "records".into(),
+            kind: ArtifactKind::Parameters,
+            status: 503,
+        });
+        assert_eq!(upstream.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(upstream.code, "connector_upstream_failed");
+        assert!(upstream.message.contains("503"));
     }
 
     #[test]
@@ -887,5 +1036,186 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(10),
             "dense fallback materialization must remain a single bounded scan"
         );
+    }
+
+    #[tokio::test]
+    async fn schedule_snapshot_resolves_file_blueprint_and_connector_parameters() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let blueprint_path = directory.path().join("connector-blueprint.yaml");
+        std::fs::write(
+            &blueprint_path,
+            br#"api_version: scheduler/v1
+executor:
+  kind: command
+  program: /usr/bin/example-task
+  args:
+    - "{{params.customer_id}}"
+parameters_schema:
+  type: object
+  additionalProperties: false
+  required: [customer_id, enabled]
+  properties:
+    customer_id:
+      type: integer
+      minimum: 1
+      maximum: 100
+    enabled:
+      type: boolean
+"#,
+        )
+        .expect("blueprint fixture");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("connector listener");
+        let address = listener.local_addr().expect("connector address");
+        let sidecar = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("connector request");
+            let request = read_mock_request(&mut stream).await;
+            let header_end = request
+                .windows(4)
+                .position(|value| value == b"\r\n\r\n")
+                .expect("request headers")
+                + 4;
+            let payload: Value =
+                serde_json::from_slice(&request[header_end..]).expect("connector request JSON");
+            assert_eq!(payload["api_version"], "scheduler.connector/v1");
+            assert_eq!(payload["kind"], "parameters");
+            assert_eq!(payload["resource"], "/accounts/current?revision=17");
+
+            let body = br#"{"customer_id":42,"enabled":true}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-Scheduler-Connector-Api-Version: scheduler.connector/v1\r\nETag: \"parameters-revision-17\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("connector response headers");
+            stream
+                .write_all(body)
+                .await
+                .expect("connector response body");
+        });
+
+        let database = directory.path().join("coordinator.db");
+        let store = scheduler_store::Store::connect(&sqlite_file_url(&database), None)
+            .await
+            .expect("test store");
+        let cipher = SnapshotCipher::from_base64("test", &SnapshotCipher::generate_base64())
+            .expect("snapshot cipher");
+        let mut adapters =
+            AdapterRegistry::with_defaults(vec![directory.path().to_path_buf()], HashMap::new())
+                .expect("default adapters");
+        adapters
+            .register_connectors(ConnectorConfig {
+                api_version: "scheduler/connectors/v1".into(),
+                connectors: HashMap::from([(
+                    "records".into(),
+                    ConnectorEndpointConfig {
+                        base_url: format!("http://{address}"),
+                        bearer_token_env: None,
+                        allowed_kinds: vec![ArtifactKind::Parameters],
+                        connect_timeout_seconds: 2,
+                        timeout_seconds: 5,
+                        allow_insecure_http: false,
+                    },
+                )]),
+            })
+            .expect("connector registration");
+        let state = AppState {
+            store,
+            cipher,
+            adapters,
+            auth: crate::auth::AuthManager::new("test-admin-token", false).expect("auth"),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            internal_rest_url: "http://127.0.0.1:1".into(),
+            internal_admin_token: "test-admin-token".into(),
+        };
+        let spec = ScheduleSpec {
+            name: "connector snapshot".into(),
+            blueprint_ref: ArtifactRef {
+                uri: reqwest::Url::from_file_path(&blueprint_path)
+                    .expect("blueprint file URL")
+                    .to_string(),
+            },
+            parameters_ref: ArtifactRef {
+                uri: "connector://records/accounts/current?revision=17".into(),
+            },
+            required_labels: Default::default(),
+            cron: None,
+            webhook_enabled: false,
+            enabled: true,
+        };
+
+        let (encrypted, digest) = resolve_and_encrypt(&state, &spec)
+            .await
+            .expect("resolved encrypted snapshot");
+        sidecar.await.expect("connector sidecar");
+        let plaintext = state.cipher.decrypt(&encrypted).expect("decrypt snapshot");
+        assert_ne!(encrypted, plaintext, "snapshot must be encrypted at rest");
+        assert_eq!(digest, hex::encode(Sha256::digest(&plaintext)));
+        let resolved: ResolvedScheduleSnapshot =
+            serde_json::from_slice(&plaintext).expect("resolved snapshot JSON");
+        assert_eq!(
+            resolved.base_parameters,
+            serde_json::json!({"customer_id": 42, "enabled": true})
+        );
+        assert_eq!(
+            resolved.parameters_source_version.as_deref(),
+            Some("\"parameters-revision-17\"")
+        );
+        assert!(resolved.blueprint_source_version.is_some());
+        let execution = resolve_snapshot(&resolved, &resolved.base_parameters, &Default::default())
+            .expect("validated execution snapshot");
+        let ExecutorSpec::Command(command) = execution.executor else {
+            panic!("expected command executor");
+        };
+        assert_eq!(command.args, vec!["42"]);
+
+        let schedule_id = Uuid::new_v4();
+        state
+            .store
+            .create_schedule(NewSchedule {
+                id: schedule_id,
+                spec,
+                encrypted_snapshot: encrypted,
+                snapshot_digest: digest,
+                key_id: state.cipher.key_id().into(),
+                webhook_public_id: None,
+                webhook_secret_hash: None,
+            })
+            .await
+            .expect("persist schedule");
+        let persisted_record = state
+            .store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("load schedule")
+            .expect("persisted schedule");
+        let persisted_plaintext = state
+            .cipher
+            .decrypt(&persisted_record.encrypted_snapshot)
+            .expect("decrypt persisted snapshot");
+        let persisted: ResolvedScheduleSnapshot =
+            serde_json::from_slice(&persisted_plaintext).expect("persisted snapshot JSON");
+        assert_eq!(
+            persisted.parameters_source_version.as_deref(),
+            Some("\"parameters-revision-17\"")
+        );
+
+        // The one-request sidecar has already exited. Run creation must use
+        // only the persisted encrypted schedule snapshot and never refetch.
+        let run = create_run_from_schedule(
+            &state,
+            &persisted_record,
+            &serde_json::json!({}),
+            "manual",
+            Utc::now(),
+            None,
+        )
+        .await
+        .expect("run from persisted snapshot");
+        assert_eq!(run.state, scheduler_core::RunState::Queued);
     }
 }

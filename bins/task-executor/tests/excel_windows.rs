@@ -18,6 +18,7 @@ fn basic_arguments() -> Vec<serde_json::Value> {
 }
 
 async fn run_macro(
+    module_name: &str,
     macro_name: &str,
     args: Vec<serde_json::Value>,
 ) -> scheduler_core::ExecutionResult {
@@ -33,6 +34,7 @@ async fn run_macro(
         snapshot: ExecutionSnapshot {
             executor: ExecutorSpec::ExcelMacro(ExcelMacroSpec {
                 workbook_path: workbook,
+                module_name: Some(module_name.into()),
                 macro_name: macro_name.into(),
                 args,
                 read_only: true,
@@ -70,12 +72,12 @@ async fn run_macro(
 #[tokio::test]
 #[ignore = "requires interactive Windows runner with licensed Excel and test workbook"]
 async fn excel_zero_and_one_map_to_scheduler_outcomes() {
-    let success = run_macro("TestModule.ReturnZero", basic_arguments()).await;
+    let success = run_macro("TestModule", "ReturnZero", basic_arguments()).await;
     assert_eq!(success.outcome, ExecutionOutcome::Succeeded);
     assert_eq!(success.exit_code, Some(0));
     assert!(success.diagnostic.is_none());
 
-    let failure = run_macro("TestModule.ReturnOne", basic_arguments()).await;
+    let failure = run_macro("TestModule", "ReturnOne", basic_arguments()).await;
     assert_eq!(failure.outcome, ExecutionOutcome::Failed);
     assert_eq!(failure.exit_code, Some(1));
     let diagnostic = failure.diagnostic.expect("diagnostic");
@@ -86,14 +88,14 @@ async fn excel_zero_and_one_map_to_scheduler_outcomes() {
 #[tokio::test]
 #[ignore = "requires interactive Windows runner with licensed Excel and test workbook"]
 async fn excel_vba_error_and_process_crash_are_distinguished() {
-    let vba_error = run_macro("TestModule.RaiseVbaError", basic_arguments()).await;
+    let vba_error = run_macro("TestModule", "RaiseVbaError", basic_arguments()).await;
     assert_eq!(vba_error.outcome, ExecutionOutcome::InfrastructureError);
     let diagnostic = vba_error.diagnostic.expect("VBA diagnostic");
     assert_eq!(diagnostic.code, FailureCode::ExcelMacroFailed);
     assert_eq!(diagnostic.origin, FailureOrigin::ExcelMacro);
     assert!(diagnostic.status.expect("COM status").hresult.is_some());
 
-    let crash = run_macro("TestModule.CrashExcel", basic_arguments()).await;
+    let crash = run_macro("TestModule", "CrashExcel", basic_arguments()).await;
     assert_eq!(crash.outcome, ExecutionOutcome::InfrastructureError);
     let diagnostic = crash.diagnostic.expect("crash diagnostic");
     assert_eq!(diagnostic.code, FailureCode::ExcelProcessCrashed);
@@ -106,7 +108,8 @@ async fn excel_process_id_signature_preserves_all_seventeen_values_and_order() {
     // Keep this argument list synchronized with the licensed workbook fixture
     // contract documented in docs/testing.md.
     let result = run_macro(
-        "TestModule.ValidateProcessIdArguments",
+        "TestModule",
+        "ValidateProcessIdArguments",
         vec![
             serde_json::json!(2_147_483_647_i64),
             serde_json::json!("Monthly Processing.xlsm"),

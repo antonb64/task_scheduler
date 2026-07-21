@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/antonb64/task_scheduler/main/schemas/schedule-v1.schema.json",
+  "title": "Task Scheduler Schedule v1",
+  "description": "The ScheduleSpec accepted by the v1 management API. Unknown properties are intentionally permitted because the Rust v1 model ignores them.",
+  "type": "object",
+  "required": [
+    "name",
+    "blueprint_ref",
+    "parameters_ref"
+  ],
+  "properties": {
+    "name": {
+      "type": "string",
+      "pattern": "\\S"
+    },
+    "blueprint_ref": {
+      "$ref": "#/$defs/artifact_ref"
+    },
+    "parameters_ref": {
+      "$ref": "#/$defs/artifact_ref"
+    },
+    "required_labels": {
+      "$ref": "#/$defs/labels",
+      "default": {}
+    },
+    "cron": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/cron"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
+    "webhook_enabled": {
+      "type": "boolean",
+      "default": false
+    },
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    }
+  },
+  "$defs": {
+    "artifact_ref": {
+      "type": "object",
+      "required": [
+        "uri"
+      ],
+      "properties": {
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^[A-Za-z][A-Za-z0-9+.-]*:"
+        }
+      }
+    },
+    "labels": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "string"
+      }
+    },
+    "cron": {
+      "type": "object",
+      "required": [
+        "expression",
+        "timezone"
+      ],
+      "properties": {
+        "expression": {
+          "type": "string",
+          "pattern": "\\S"
+        },
+        "timezone": {
+          "type": "string",
+          "pattern": "\\S"
+        }
+      },
+      "description": "The coordinator additionally parses expression with the Rust cron grammar and timezone as an IANA timezone."
+    }
+  }
+}

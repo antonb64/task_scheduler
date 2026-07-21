@@ -1,0 +1,375 @@
+# Tasks, schedules, and triggers
+
+A blueprint describes how to execute work and validates its parameters. A parameter document supplies reusable base values. A schedule binds references to both artifacts, placement labels, and optional cron/webhook triggers.
+
+When a schedule is created or updated, the coordinator fetches both artifacts, parses and validates them, and encrypts a resolved snapshot. It does not fetch artifacts again for every run. Each trigger then deep-merges its overrides, validates the result, renders an immutable execution snapshot, and queues a run.
+
+## Artifact locations
+
+A schedule can reference:
+
+- `file:///absolute/path`: read by the coordinator, constrained by `SCHEDULER_ARTIFACT_ROOTS`.
+- `https://host/path` or `http://host/path`: fetched directly by the coordinator with five-second connect and 20-second total timeouts and at most three redirects. The built-in HTTP adapter has no bootstrap authentication setting.
+- `connector://name/resource?query`: sent to a configured named connector sidecar. See [Custom connectors](connectors.md).
+
+Blueprint artifacts are limited to 1 MiB and may be YAML or JSON. Parameter artifacts are limited to 4 MiB and must be JSON objects. A `file://` path points to the coordinator filesystem, not the eventual agent filesystem. Paths inside an executor blueprint, such as `workbook_path`, are evaluated on the selected agent.
+
+Connector failures never silently fall back to a file. Select a `file://` reference explicitly when a local artifact is the intended source.
+
+## Schedule document
+
+The formal schema is [`schemas/schedule-v1.schema.json`](../schemas/schedule-v1.schema.json). `taskctl schedules create --spec` accepts JSON or YAML; the REST API accepts JSON.
+
+```yaml
+name: Echo every weekday
+blueprint_ref:
+  uri: file:///srv/task-scheduler/artifacts/echo.yaml
+parameters_ref:
+  uri: file:///srv/task-scheduler/artifacts/echo.json
+required_labels:
+  pool: general
+cron:
+  expression: "0 0 9 * * Mon-Fri"
+  timezone: Europe/Vienna
+webhook_enabled: true
+enabled: true
+```
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `name` | Required, nonempty | Operator-visible schedule name. |
+| `blueprint_ref.uri` | Required | Blueprint artifact URI. |
+| `parameters_ref.uri` | Required | Base parameter artifact URI. |
+| `required_labels` | `{}` | Additional exact-match placement labels merged over the blueprint labels. Schedule values win on duplicate keys. |
+| `cron` | `null` | `{expression, timezone}` repeated trigger. |
+| `webhook_enabled` | `false` | Whether the schedule has an authenticated public webhook. |
+| `enabled` | `true` | Paused schedules do not create or accept new runs. |
+
+Creating or updating a schedule fails if either artifact cannot be fetched, the blueprint is invalid, the base parameters fail its schema, or the cron/timezone is invalid. Updates increment the schedule revision. Already queued/running runs retain their old execution snapshots.
+
+Copyable examples:
+
+- [`examples/schedules/echo.example.yaml`](../examples/schedules/echo.example.yaml)
+- [`examples/schedules/echo.example.json`](../examples/schedules/echo.example.json)
+
+## Blueprint document
+
+The formal schema is [`schemas/blueprint-v1.schema.json`](../schemas/blueprint-v1.schema.json).
+
+Version 1 ignores unknown blueprint/schedule object fields for forward compatibility. Validate documents against the published schemas and review spelling carefully; an unknown typo is not guaranteed to fail at deserialization. Connector bootstrap documents are stricter and reject unknown fields.
+
+```yaml
+api_version: scheduler/v1
+
+executor:
+  kind: command
+  program: /opt/company-tasks/import-customer
+  args:
+    - --customer-id
+    - "{{params.customer.id}}"
+    - --mode={{params.mode}}
+  env:
+    IMPORT_REGION: "{{params.region}}"
+  working_directory: /opt/company-tasks
+
+parameters_schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  additionalProperties: false
+  required: [customer, mode, region]
+  properties:
+    customer:
+      type: object
+      additionalProperties: false
+      required: [id]
+      properties:
+        id:
+          type: string
+          minLength: 1
+    mode:
+      enum: [preview, apply]
+    region:
+      type: string
+
+required_labels:
+  pool: general
+
+policy:
+  max_attempts: 3
+  timeout_seconds: 3600
+  initial_backoff_seconds: 5
+  backoff_cap_seconds: 300
+```
+
+Top-level fields:
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `api_version` | Required | Must be exactly `scheduler/v1`. |
+| `executor` | Required | A `command` or `excel_macro` executor. |
+| `parameters_schema` | `{"type":"object"}` | JSON Schema used for base values and every trigger-specific merged document. |
+| `required_labels` | `{}` | Exact-match placement labels. |
+| `policy` | Defaults below | Attempt, timeout, and retry policy. |
+
+Policy fields:
+
+| Field | Default | Rules |
+| --- | --- | --- |
+| `max_attempts` | Current global `default_max_attempts`, initially 3 | At least 1. Counts durably accepted attempts; transport failures before acceptance do not consume it. |
+| `timeout_seconds` | Current global `default_timeout_seconds`, initially 3600 | At least 1. Enforced by `task-executor`. |
+| `initial_backoff_seconds` | 5 | Base delay before retry. |
+| `backoff_cap_seconds` | 300 | Maximum exponential base delay. |
+
+The retry delay doubles with the accepted attempt count, is capped, and receives up to 20 percent positive jitter. Any non-successful accepted attempt is retried until the snapshot's `max_attempts` is exhausted. This includes a macro return value of `1`, timeouts, lease expiry, and retryable infrastructure failures. Cancellation prevents retries.
+
+## Parameter schema and documents
+
+Parameters use JSON Schema 2020-12. Include `additionalProperties: false` when unexpected input should fail rather than be ignored. For values mapped to VBA `Long`, constrain the range explicitly:
+
+```yaml
+parameters_schema:
+  $schema: https://json-schema.org/draft/2020-12/schema
+  type: object
+  additionalProperties: false
+  required: [id, enabled]
+  properties:
+    id:
+      type: integer
+      minimum: -2147483648
+      maximum: 2147483647
+    enabled:
+      type: boolean
+```
+
+The parameter artifact is JSON:
+
+```json
+{
+  "id": 42,
+  "enabled": true
+}
+```
+
+Manual and webhook overrides must also be JSON objects. Merge behavior is recursive for objects; arrays, scalars, and null replace the saved value at that key. The final merged document is validated before a run is committed.
+
+Validation errors returned to operators deliberately identify schema keywords and schema paths without including runtime parameter values or their object keys.
+
+## Parameter templates
+
+Executor string fields can contain `{{params.path.to.value}}` expressions.
+
+- An embedded expression renders strings, numbers, booleans, or null into a string.
+- A missing path fails run creation.
+- Arrays and objects cannot be embedded in a string.
+- For Excel argument entries only, a string consisting entirely of one expression preserves the JSON scalar type.
+- Text that does not contain `{{params.` is literal, including unrelated double braces.
+
+Example command arguments:
+
+```yaml
+args:
+  - "{{params.input_path}}"
+  - "--batch={{params.batch_number}}"
+```
+
+If `batch_number` is `42`, the command receives `--batch=42`. Arguments are passed directly to the program; no shell parses quotes, substitutions, pipes, or semicolons.
+
+## Command executor
+
+```yaml
+executor:
+  kind: command
+  program: /opt/company-tasks/worker
+  args:
+    - --input
+    - "{{params.input}}"
+  env:
+    MODE: "{{params.mode}}"
+  working_directory: /opt/company-tasks
+```
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `kind` | Required | `command`. |
+| `program` | Required, nonempty | Executable path or a name resolved through the agent account's `PATH`. |
+| `args` | `[]` | Structured argument list. |
+| `env` | `{}` | Additional environment entries. |
+| `working_directory` | Inherited | Optional working directory. Prefer an explicit absolute path. |
+
+The executor sets `TASK_RUN_ID` and `TASK_ATTEMPT_ID`, overriding conflicting entries in the blueprint environment. Absolute program and working-directory paths must canonicalize under an applied `allowed_command_roots` entry. Relative program names resolved through `PATH` are not root-checked.
+
+The task runs in its own Unix process group or Windows Job Object. Timeout, cancellation, or lease loss first attempts a graceful stop and then terminates the process tree. Stdout and stderr are bounded to 1 MiB each; truncation and byte counts appear in attempt metadata.
+
+## Excel macro executor
+
+Excel blueprints are Windows-only:
+
+```yaml
+executor:
+  kind: excel_macro
+  workbook_path: "C:\\TaskWorkbooks\\Process.xlsm"
+  module_name: ProcessModule
+  macro_name: processID
+  args:
+    - "{{params.id}}"
+    - "{{params.workbook_name}}"
+    - "{{params.recipients}}"
+    - "{{params.selection_variant}}"
+    - "{{params.responsible}}"
+    - "{{params.subject}}"
+    - "{{params.body}}"
+    - "{{params.pdf}}"
+    - "{{params.mailfilter}}"
+    - "{{params.query1}}"
+    - "{{params.query2}}"
+    - "{{params.query3}}"
+    - "{{params.query4}}"
+    - "{{params.query5}}"
+    - "{{params.info}}"
+    - "{{params.bwp_user}}"
+    - "{{params.bwp_password}}"
+  read_only: true
+  save_changes: false
+  visible: false
+```
+
+| Field | Required/default | Meaning |
+| --- | --- | --- |
+| `kind` | Required | `excel_macro`. |
+| `workbook_path` | Required | Absolute preinstalled `.xlsm` or `.xlam` path under an applied workbook root. |
+| `module_name` | Unset | Preferred unqualified standard VBA module name, such as `ProcessModule`. Must not contain `.` or `!`. |
+| `macro_name` | Required | Public procedure name. It must be unqualified when `module_name` is set. |
+| `args` | `[]` | Up to 30 positional JSON scalars or parameter expressions. |
+| `read_only` | `true` | Passed to `Workbooks.Open`. |
+| `save_changes` | `false` | Passed when the workbook is closed. |
+| `visible` | `false` | Visibility of the private Excel instance. This does not make service automation supported. |
+
+The exact requested VBA function is supported:
+
+```vb
+Function processID(ByVal id As Long, workbookName As String, recipients As String, selectionVariant As String, responsible As String, subject As String, body As String, pdf As Boolean, mailfilter As Boolean, Optional query1 As String = "", Optional query2 As String = "", Optional query3 As String = "", Optional query4 As String = "", Optional query5 As String = "", Optional info As Boolean = False, Optional bwpUser As String = "", Optional bwpPassword As String = "") As Integer
+```
+
+Its 17 arguments are passed in the order shown above. The complete tested files are:
+
+- [`examples/blueprints/process-id.yaml`](../examples/blueprints/process-id.yaml)
+- [`examples/parameters/process-id.json`](../examples/parameters/process-id.json)
+
+`processID` must be a public Function in the standard VBA module `ProcessModule`, not a worksheet, workbook, class, or private module procedure. The executor constructs the fully qualified target from the name of the workbook it actually opened plus `module_name` and `macro_name`; the blueprint does not hard-code a workbook-qualified macro reference.
+
+For backward compatibility, omitting `module_name` keeps legacy blueprints such as `macro_name: ProcessModule.processID` working. New blueprints should use the separate fields because validation can then reject ambiguous/qualified module input before Excel starts.
+
+JSON values map deterministically to COM variants: booleans to Boolean, strings to String, 32-bit integers to Int32, larger signed/unsigned integers to their 64-bit types, non-integers to Double, and null to `DBNull`. Arrays and objects are rejected. `Application.Run` is positional: omit only trailing optional values. To supply a later optional value, include explicit values such as `""` or `false` for every preceding position. JSON null is not the same as omitting a VBA optional argument.
+
+The executor opens a private Excel COM instance, qualifies the macro with the actual opened workbook name, invokes it, and interprets integer `0` as success and integer `1` as task failure. Other values/types, VBA/COM exceptions, a crashed Excel process, isolation failure, and cleanup failure are classified separately.
+
+Before invocation it creates hidden workbook-scoped names `TASK_RUN_ID` and `TASK_ATTEMPT_ID`. VBA can use them for idempotency:
+
+```vb
+Dim runId As String
+runId = CStr(Evaluate("TASK_RUN_ID"))
+```
+
+Existing names with either reserved identifier cause a safe failure. The executor deletes the temporary names, closes the workbook, quits the private instance, and releases COM objects. A watchdog kills a hung instance. Never run this automation from a Windows service, never attach it to a user's existing Excel process, and never allow macros to display dialogs.
+
+## Create and edit schedules
+
+From the UI, open `/schedules`, choose **New schedule**, enter the artifact URIs and optional cron/labels, and save. Artifact resolution and schema validation happen before the new schedule is committed. Editing repeats resolution and increments the revision.
+
+CLI:
+
+```sh
+export SCHEDULER_URL=https://scheduler.example.com:8443
+export SCHEDULER_ADMIN_TOKEN='<admin-token>'
+
+taskctl schedules create --spec examples/schedules/echo.example.yaml
+taskctl schedules list
+taskctl schedules show <schedule-id>
+```
+
+There is currently no schedule-delete endpoint. Pause obsolete schedules instead.
+
+## Manual and future runs
+
+Run with saved parameters:
+
+```sh
+taskctl schedules run <schedule-id>
+```
+
+Merge a JSON override:
+
+```sh
+taskctl schedules run <schedule-id> --parameters override.json
+```
+
+Queue for a future UTC instant and make client retries idempotent:
+
+```sh
+taskctl schedules run <schedule-id> \
+  --run-at 2026-08-01T08:00:00Z \
+  --idempotency-key customer-import-2026-08-01
+```
+
+The initial response is `202 Accepted`. Repeating the same idempotency key for that schedule returns the existing run with `200 OK`.
+
+## Cron triggers
+
+Cron expressions have seconds and an optional year:
+
+```text
+second minute hour day-of-month month day-of-week [year]
+```
+
+Examples:
+
+```text
+0 */15 * * * *          every 15 minutes
+0 0 9 * * Mon-Fri      09:00 on weekdays
+0 30 2 * * *            02:30 every local day
+```
+
+Use an IANA timezone such as `UTC`, `Europe/Vienna`, or `America/New_York`. The UI previews the next five UTC occurrences. Nonexistent local times in a spring-forward gap are skipped. Both absolute instants of an ambiguous fall-back time are queued.
+
+The coordinator persists every occurrence under a unique `(schedule_id, scheduled_at)` key and does not coalesce overlap or downtime catch-up. It scans at most 1,000 next occurrences per schedule per one-second pass, so a large backlog drains in batches. Editing the cron expression or timezone resets the materialization cursor at edit time; other edits preserve it. Runs already committed keep their previous snapshot.
+
+Pause and resume:
+
+```sh
+taskctl schedules pause <schedule-id>
+taskctl schedules resume <schedule-id>
+```
+
+## Webhook triggers
+
+Set `webhook_enabled: true` when creating the schedule. The create response/UI shows a public ID and secret once. Store the secret immediately.
+
+```sh
+curl -i \
+  -H "Authorization: Bearer $WEBHOOK_SECRET" \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: source-event-123' \
+  -d '{"query1":"SELECT * FROM CurrentData","info":true}' \
+  "https://scheduler.example.com:8443/hooks/v1/$PUBLIC_ID"
+```
+
+The body is the parameter override object. It is deep-merged and validated before the run is created. Initial creation returns `202`; repeating the key returns the existing run. A missing/incorrect secret returns `401`; a disabled schedule or old/rotated public ID is not found.
+
+Rotate both the public ID and secret with:
+
+```sh
+taskctl schedules rotate-webhook <schedule-id>
+```
+
+The old URL and secret stop working. Editing the schedule with `webhook_enabled: false` disables the endpoint without deleting run history.
+
+## Inspect, cancel, and retry
+
+```sh
+taskctl runs list --limit 100
+taskctl runs show <run-id>
+taskctl runs cancel <run-id>
+taskctl runs retry <run-id>
+```
+
+Cancellation durably marks a queued/running run first, prevents further retries, and asks the agent to terminate an active process tree. Only failed terminal runs can be manually retried. Manual retry resets the retry budget while preserving attempt history and continuing attempt numbering.

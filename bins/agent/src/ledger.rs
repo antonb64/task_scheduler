@@ -356,6 +356,16 @@ mod tests {
         (path, url)
     }
 
+    #[test]
+    fn windows_drive_ledger_url_keeps_the_drive_root_for_its_owner_lock() {
+        let lock =
+            ledger_lock_path("sqlite://C:/TaskScheduler/data/agent.db").expect("Windows drive URL");
+        assert_eq!(
+            lock,
+            PathBuf::from("C:/TaskScheduler/data/agent.db.owner.lock")
+        );
+    }
+
     #[tokio::test]
     async fn a_live_agent_claims_an_attempt_only_once() {
         let (path, url) = database();

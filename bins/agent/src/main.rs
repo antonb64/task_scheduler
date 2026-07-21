@@ -57,6 +57,8 @@ struct ActiveTask {
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
+    scheduler_core::validate_agent_id(&config.agent_id)
+        .context("invalid SCHEDULER_AGENT_ID/--agent-id")?;
     let _telemetry = scheduler_telemetry::init("scheduler-agent", config.otlp_endpoint.as_deref())?;
     let ledger = Ledger::connect(&config.database_url).await?;
     let (connected, _) = watch::channel(false);

@@ -37,6 +37,8 @@ pub struct Config {
         value_delimiter = ','
     )]
     pub artifact_roots: Vec<PathBuf>,
+    #[arg(long, env = "SCHEDULER_CONNECTOR_CONFIG")]
+    pub connector_config: Option<PathBuf>,
     #[arg(long, env = "SCHEDULER_GRPC_TLS_CERT")]
     pub grpc_tls_cert: Option<PathBuf>,
     #[arg(long, env = "SCHEDULER_GRPC_TLS_KEY")]
@@ -49,4 +51,31 @@ pub struct Config {
     pub http_tls_key: Option<PathBuf>,
     #[arg(long, env = "SCHEDULER_SECURE_COOKIES", default_value_t = false)]
     pub secure_cookies: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connector_config_path_can_be_set_from_the_cli() {
+        let config = Config::try_parse_from([
+            "coordinator",
+            "--master-key",
+            "test-key-is-validated-after-parsing",
+            "--admin-token",
+            "test-admin-token",
+            "--artifact-root",
+            "artifacts",
+            "--connector-config",
+            "connectors.yaml",
+        ])
+        .expect("coordinator arguments");
+
+        assert_eq!(
+            config.connector_config,
+            Some(PathBuf::from("connectors.yaml"))
+        );
+        assert_eq!(config.artifact_roots, vec![PathBuf::from("artifacts")]);
+    }
 }
