@@ -42,9 +42,30 @@ impl Database {
 
     async fn reopen(&mut self) {
         self.store.pool().close().await;
-        self.store = Store::connect(&self.url, None)
-            .await
-            .expect("reopen simulation store");
+        // Windows can retain the final SQLite/WAL file lock for a few
+        // scheduler ticks after every pool handle has closed. A real process
+        // restart naturally has this delay; the in-process crash simulator
+        // must model it explicitly instead of treating an OS cleanup race as
+        // a scheduler invariant failure.
+        let mut delay = std::time::Duration::from_millis(10);
+        for attempt in 0..8 {
+            match Store::connect(&self.url, None).await {
+                Ok(store) => {
+                    self.store = store;
+                    return;
+                }
+                Err(error)
+                    if attempt < 7
+                        && (error.to_string().contains("database is locked")
+                            || error.to_string().contains("database is busy")) =>
+                {
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(std::time::Duration::from_millis(500));
+                }
+                Err(error) => panic!("reopen simulation store: {error:#}"),
+            }
+        }
+        unreachable!("bounded reconnect loop always returns or panics")
     }
 }
 
