@@ -1,0 +1,92 @@
+api_version: scheduler/v1
+executor:
+  kind: excel_macro
+  workbook_path: "C:\\TaskWorkbooks\\Process.xlsm"
+  macro_name: "ProcessModule.processID"
+  args:
+    - "{{params.id}}"
+    - "{{params.workbook_name}}"
+    - "{{params.recipients}}"
+    - "{{params.selection_variant}}"
+    - "{{params.responsible}}"
+    - "{{params.subject}}"
+    - "{{params.body}}"
+    - "{{params.pdf}}"
+    - "{{params.mailfilter}}"
+    - "{{params.query1}}"
+    - "{{params.query2}}"
+    - "{{params.query3}}"
+    - "{{params.query4}}"
+    - "{{params.query5}}"
+    - "{{params.info}}"
+    - "{{params.bwp_user}}"
+    - "{{params.bwp_password}}"
+  read_only: true
+  save_changes: false
+  visible: false
+parameters_schema:
+  type: object
+  additionalProperties: false
+  required:
+    - id
+    - workbook_name
+    - recipients
+    - selection_variant
+    - responsible
+    - subject
+    - body
+    - pdf
+    - mailfilter
+    - query1
+    - query2
+    - query3
+    - query4
+    - query5
+    - info
+    - bwp_user
+    - bwp_password
+  properties:
+    id:
+      type: integer
+      minimum: -2147483648
+      maximum: 2147483647
+    workbook_name:
+      type: string
+    recipients:
+      type: string
+    selection_variant:
+      type: string
+    responsible:
+      type: string
+    subject:
+      type: string
+    body:
+      type: string
+    pdf:
+      type: boolean
+    mailfilter:
+      type: boolean
+    query1:
+      type: string
+    query2:
+      type: string
+    query3:
+      type: string
+    query4:
+      type: string
+    query5:
+      type: string
+    info:
+      type: boolean
+    bwp_user:
+      type: string
+    bwp_password:
+      type: string
+required_labels:
+  os: windows
+  capability: excel
+policy:
+  max_attempts: 3
+  timeout_seconds: 900
+  initial_backoff_seconds: 30
+  backoff_cap_seconds: 300

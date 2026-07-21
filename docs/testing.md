@@ -129,3 +129,60 @@ Excel automation tests that require desktop Excel remain on a separately managed
 interactive Windows runner with a licensed Excel installation. The portable CI
 tests compile the Windows implementation and test the fake Excel boundary, but
 cannot validate Office installation or Trust Center configuration.
+
+### Licensed Excel workbook fixture
+
+Set `SCHEDULER_TEST_XLSM` to an absolute path to the trusted or signed `.xlsm`
+fixture on an interactive Windows runner. The workbook must contain a public
+standard module named `TestModule`. In addition to the return, VBA-error, crash,
+and hang macros used by the other ignored tests, it must expose
+`TestModule.ValidateProcessIdArguments` with this signature:
+
+```vb
+Public Function ValidateProcessIdArguments( _
+    ByVal id As Long, ByVal workbookName As String, _
+    ByVal recipients As String, ByVal selectionVariant As String, _
+    ByVal responsible As String, ByVal subject As String, _
+    ByVal body As String, ByVal pdf As Boolean, _
+    ByVal mailfilter As Boolean, Optional ByVal query1 As String = "", _
+    Optional ByVal query2 As String = "", Optional ByVal query3 As String = "", _
+    Optional ByVal query4 As String = "", Optional ByVal query5 As String = "", _
+    Optional ByVal info As Boolean = False, Optional ByVal bwpUser As String = "", _
+    Optional ByVal bwpPassword As String = "") As Integer
+```
+
+The macro must compare all 17 typed VBA parameter values against this contract,
+return `0` only when every check passes, and return `1` for any mismatch. This
+proves positional ordering and compatibility with the declared VBA parameter
+types; a typed VBA parameter does not expose the original incoming COM Variant
+subtype after VBA has performed argument coercion.
+
+| Position | VBA parameter | Expected value |
+| ---: | --- | --- |
+| 1 | `id As Long` | `2147483647` |
+| 2 | `workbookName As String` | `Monthly Processing.xlsm` |
+| 3 | `recipients As String` | `operations@example.com;finance@example.com` |
+| 4 | `selectionVariant As String` | `CURRENT_AND_ARCHIVED` |
+| 5 | `responsible As String` | `Ada Lovelace` |
+| 6 | `subject As String` | `Processing result – July` |
+| 7 | `body As String` | Two lines: `Line 1`, then `Line 2 with 'quotes' and {{literal braces}}` |
+| 8 | `pdf As Boolean` | `True` |
+| 9 | `mailfilter As Boolean` | `False` |
+| 10 | `query1 As String` | `SELECT * FROM CurrentData WHERE Status = 'Ready'` |
+| 11–14 | `query2` through `query5 As String` | Empty string |
+| 15 | `info As Boolean` | `False` |
+| 16 | `bwpUser As String` | `example-user` |
+| 17 | `bwpPassword As String` | `example-password` |
+
+The fixture must also read `CStr(Evaluate("TASK_RUN_ID"))` and
+`CStr(Evaluate("TASK_ATTEMPT_ID"))`, then require non-empty, distinct UUID
+strings. This verifies that Excel macros receive stable run-level idempotency
+and attempt-level diagnostic identifiers through temporary workbook-scoped
+defined names. Portable source-contract tests separately verify that the
+secret-bearing scheduler bootstrap variables are scrubbed before Excel starts.
+
+The ignored test
+`excel_process_id_signature_preserves_all_seventeen_values_and_order` invokes
+this macro and requires scheduler success with exit code `0`. Returning `1`
+proves that ordering, scalar conversion, or value preservation failed and is
+reported by the scheduler as a macro task failure.

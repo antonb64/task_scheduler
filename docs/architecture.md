@@ -62,7 +62,7 @@ Every completed attempt records a safe diagnostic separately from its encrypted 
 
 The executor distinguishes command failures, operating-system process crashes, spawn/isolation failures, timeout, cancellation, and agent lease loss. Excel diagnostics distinguish application startup, workbook open, macro invocation/VBA failure, macro return `1`, invalid return values, Excel process/RPC disconnection, and cleanup failures. The management UI, REST attempt endpoint, CLI, audit events, logs, and OTLP metrics use the same classification.
 
-Only bounded sizes and truncation flags are included in this public diagnostic record. Raw stdout, stderr, PowerShell/COM exception text, resolved parameters, and environment values remain inside the encrypted result and are never copied into audit metadata or telemetry.
+Only bounded sizes and truncation flags are included in this public diagnostic record. The Excel host deliberately suppresses raw PowerShell/COM exception text; only the safe diagnostic code, lifecycle stage, summary, and HRESULT are retained. Raw command stdout and stderr remain bounded inside the task result and can also be emitted as `scheduler.task_output` telemetry, so command tasks must never print secrets. The scheduler does not copy resolved parameters or environment values into audit metadata or telemetry.
 
 ## Security
 

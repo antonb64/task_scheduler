@@ -14,6 +14,8 @@ use scheduler_core::{
     OutputMetadata,
 };
 use serde::Deserialize;
+#[cfg(any(windows, test))]
+use serde::Serialize;
 use tokio::{
     io::{AsyncRead, AsyncReadExt},
     process::{Child, Command},
@@ -146,16 +148,7 @@ async fn run_excel(
     spec: &ExcelMacroSpec,
     control: watch::Receiver<ControlState>,
 ) -> Result<ExecutionResult> {
-    let payload = serde_json::json!({
-        "workbook_path": spec.workbook_path,
-        "macro_name": spec.macro_name,
-        "args": spec.args,
-        "read_only": spec.read_only,
-        "save_changes": spec.save_changes,
-        "visible": spec.visible,
-        "run_id": assignment.run_id,
-        "attempt_id": assignment.attempt_id,
-    });
+    let payload = build_excel_payload(spec, assignment.run_id, assignment.attempt_id)?;
     let encoded_script = encode_powershell(EXCEL_SCRIPT);
     let job_name = format!("Local\\TaskSchedulerExcel-{}", uuid::Uuid::new_v4());
     let mut command = Command::new("powershell.exe");
@@ -183,6 +176,74 @@ async fn run_excel(
         Some(&job_name),
     )
     .await
+}
+
+#[cfg(any(windows, test))]
+fn build_excel_payload(
+    spec: &ExcelMacroSpec,
+    run_id: uuid::Uuid,
+    attempt_id: uuid::Uuid,
+) -> Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "workbook_path": spec.workbook_path,
+        "macro_name": spec.macro_name,
+        "args": marshal_excel_arguments(&spec.args)?,
+        "read_only": spec.read_only,
+        "save_changes": spec.save_changes,
+        "visible": spec.visible,
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+    }))
+}
+
+/// Stable JSON-to-COM boundary used by the Windows PowerShell host.
+///
+/// PowerShell versions do not all materialize JSON numbers as the same .NET
+/// type. Tagging every value here makes the eventual COM Variant deterministic
+/// and keeps integer text lossless until it is parsed into its requested width.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum ExcelArgumentPayload {
+    Null,
+    Boolean(bool),
+    String(String),
+    Int32(String),
+    Int64(String),
+    Uint64(String),
+    Double(String),
+}
+
+#[cfg(any(windows, test))]
+fn marshal_excel_arguments(args: &[serde_json::Value]) -> Result<Vec<ExcelArgumentPayload>> {
+    args.iter()
+        .map(|argument| {
+            Ok(match argument {
+                serde_json::Value::Null => ExcelArgumentPayload::Null,
+                serde_json::Value::Bool(value) => ExcelArgumentPayload::Boolean(*value),
+                serde_json::Value::String(value) => ExcelArgumentPayload::String(value.clone()),
+                serde_json::Value::Number(value) => {
+                    if let Some(value) = value.as_i64() {
+                        if let Ok(value) = i32::try_from(value) {
+                            ExcelArgumentPayload::Int32(value.to_string())
+                        } else {
+                            ExcelArgumentPayload::Int64(value.to_string())
+                        }
+                    } else if let Some(value) = value.as_u64() {
+                        ExcelArgumentPayload::Uint64(value.to_string())
+                    } else {
+                        // serde_json only permits finite JSON numbers, so its
+                        // canonical representation can be parsed losslessly by
+                        // the invariant-culture PowerShell decoder.
+                        ExcelArgumentPayload::Double(value.to_string())
+                    }
+                }
+                serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+                    bail!("Excel arguments must be JSON scalar values")
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(not(windows))]
@@ -444,6 +505,7 @@ fn excel_failure_diagnostic(
         let code = match marker.code.as_str() {
             "excel_startup_failed" => FailureCode::ExcelStartupFailed,
             "excel_workbook_open_failed" => FailureCode::ExcelWorkbookOpenFailed,
+            "excel_correlation_setup_failed" => FailureCode::ExcelCorrelationSetupFailed,
             "excel_macro_failed" => FailureCode::ExcelMacroFailed,
             "excel_invalid_return" => FailureCode::ExcelInvalidReturn,
             "excel_process_crashed" => FailureCode::ExcelProcessCrashed,
@@ -460,6 +522,7 @@ fn excel_failure_diagnostic(
         let stage = match marker.stage.as_str() {
             "excel_startup" => FailureStage::ExcelStartup,
             "workbook_open" => FailureStage::WorkbookOpen,
+            "correlation_setup" => FailureStage::CorrelationSetup,
             "macro_invoke" => FailureStage::MacroInvoke,
             "macro_result" => FailureStage::MacroResult,
             "cleanup" => FailureStage::Cleanup,
@@ -764,7 +827,7 @@ fn encode_powershell(script: &str) -> String {
     STANDARD.encode(bytes)
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, test))]
 const EXCEL_SCRIPT: &str = r#"
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @'
@@ -779,14 +842,45 @@ public static class SchedulerNative {
   [DllImport("kernel32.dll", SetLastError=true)] public static extern bool CloseHandle(IntPtr handle);
 }
 '@
+function Test-ReservedDefinedNameConflict {
+  param([object]$Workbook, [string]$ReservedName)
+  $names = $null
+  try {
+    $names = $Workbook.Names
+    for ($index = 1; $index -le [int]$names.Count; $index++) {
+      $candidate = $null
+      try {
+        $candidate = $names.Item($index)
+        $candidateName = [string]$candidate.Name
+        $separator = $candidateName.LastIndexOf('!')
+        if ($separator -ge 0) { $candidateName = $candidateName.Substring($separator + 1) }
+        if ([string]::Equals($candidateName, $ReservedName, [StringComparison]::OrdinalIgnoreCase)) {
+          return $true
+        }
+      } finally {
+        if ($null -ne $candidate) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($candidate) }
+      }
+    }
+    return $false
+  } finally {
+    if ($null -ne $names) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($names) }
+  }
+}
 $payloadJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:SCHEDULER_EXCEL_PAYLOAD_B64))
 $payload = $payloadJson | ConvertFrom-Json
+$jobName = [string]$env:SCHEDULER_EXCEL_JOB_NAME
+# The payload can contain credentials and task parameters. Remove both
+# scheduler bootstrap variables before COM activation.
+[Environment]::SetEnvironmentVariable('SCHEDULER_EXCEL_PAYLOAD_B64', $null, 'Process')
+[Environment]::SetEnvironmentVariable('SCHEDULER_EXCEL_JOB_NAME', $null, 'Process')
+$payloadJson = $null
 $excel = $null
 $workbook = $null
+$runIdName = $null
+$attemptIdName = $null
 $stage = 'excel_startup'
 $exitCode = 2
 $diagnostic = $null
-$exceptionDetail = $null
 $jobHandle = [IntPtr]::Zero
 $excelProcessHandle = [IntPtr]::Zero
 $mayQuitExcel = $false
@@ -808,7 +902,7 @@ try {
     throw 'Excel process identity or creation time could not be proven private'
   }
   $mayQuitExcel = $true
-  $jobHandle = [SchedulerNative]::OpenJobObject(5, $false, $env:SCHEDULER_EXCEL_JOB_NAME)
+  $jobHandle = [SchedulerNative]::OpenJobObject(5, $false, $jobName)
   if ($jobHandle -eq [IntPtr]::Zero) { throw 'Cannot open the executor Job Object' }
   $excelProcessHandle = [SchedulerNative]::OpenProcess(0x1101, $false, $excelPid)
   if ($excelProcessHandle -eq [IntPtr]::Zero) { throw 'Cannot open the private Excel process for isolation' }
@@ -828,10 +922,62 @@ try {
   $excel.UserControl = $false
   $stage = 'workbook_open'
   $workbook = $excel.Workbooks.Open([string]$payload.workbook_path, 0, [bool]$payload.read_only)
-  $macro = "'" + $workbook.Name + "'!" + [string]$payload.macro_name
+  $stage = 'correlation_setup'
+  try {
+    $runId = ([Guid]([string]$payload.run_id)).ToString('D')
+    $attemptId = ([Guid]([string]$payload.attempt_id)).ToString('D')
+  } catch {
+    throw 'Scheduler correlation identifiers are not valid UUID strings'
+  }
+  if ([string]::Equals($runId, $attemptId, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'Scheduler run and attempt identifiers must be distinct'
+  }
+  if ((Test-ReservedDefinedNameConflict $workbook 'TASK_RUN_ID') -or
+      (Test-ReservedDefinedNameConflict $workbook 'TASK_ATTEMPT_ID')) {
+    throw 'Workbook contains a reserved scheduler correlation defined name'
+  }
+  $workbookNames = $null
+  try {
+    $workbookNames = $workbook.Names
+    $runIdName = $workbookNames.Add('TASK_RUN_ID', ('="' + $runId + '"'), $false)
+    $attemptIdName = $workbookNames.Add('TASK_ATTEMPT_ID', ('="' + $attemptId + '"'), $false)
+  } finally {
+    if ($null -ne $workbookNames) { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($workbookNames) }
+  }
+  if ($null -eq $runIdName -or $null -eq $attemptIdName) {
+    throw 'Excel did not create the scheduler correlation defined names'
+  }
+  # Excel quotes workbook names in macro references with apostrophes and
+  # represents a literal apostrophe by doubling it.
+  $escapedWorkbookName = ([string]$workbook.Name).Replace("'", "''")
+  $macro = "'" + $escapedWorkbookName + "'!" + [string]$payload.macro_name
   $invokeArgs = New-Object System.Collections.Generic.List[Object]
   $invokeArgs.Add($macro)
-  foreach ($arg in $payload.args) { $invokeArgs.Add($arg) }
+  $invariantCulture = [Globalization.CultureInfo]::InvariantCulture
+  foreach ($arg in $payload.args) {
+    switch ([string]$arg.kind) {
+      'null' { $invokeArgs.Add([DBNull]::Value); break }
+      'boolean' { $invokeArgs.Add([bool]$arg.value); break }
+      'string' { $invokeArgs.Add([string]$arg.value); break }
+      'int32' {
+        $invokeArgs.Add([int32]::Parse([string]$arg.value, [Globalization.NumberStyles]::Integer, $invariantCulture))
+        break
+      }
+      'int64' {
+        $invokeArgs.Add([int64]::Parse([string]$arg.value, [Globalization.NumberStyles]::Integer, $invariantCulture))
+        break
+      }
+      'uint64' {
+        $invokeArgs.Add([uint64]::Parse([string]$arg.value, [Globalization.NumberStyles]::Integer, $invariantCulture))
+        break
+      }
+      'double' {
+        $invokeArgs.Add([double]::Parse([string]$arg.value, [Globalization.NumberStyles]::Float, $invariantCulture))
+        break
+      }
+      default { throw "Unsupported scheduler Excel argument kind: $([string]$arg.kind)" }
+    }
+  }
   $stage = 'macro_invoke'
   $result = $excel.GetType().InvokeMember('Run', [Reflection.BindingFlags]::InvokeMethod, $null, $excel, $invokeArgs.ToArray())
   $stage = 'macro_result'
@@ -843,13 +989,13 @@ try {
   if ($code -ne 0 -and $code -ne 1) { throw "Macro returned unsupported value: $code" }
   $exitCode = $code
 } catch {
-  $exceptionDetail = $_.Exception.ToString()
   $hresult = [int64]$_.Exception.HResult
   $hresultHex = ('0x{0:X8}' -f ($hresult -band 0xffffffffL))
   $failureCode = switch ($stage) {
     'excel_startup' { 'excel_startup_failed' }
     'isolation' { 'excel_startup_failed' }
     'workbook_open' { 'excel_workbook_open_failed' }
+    'correlation_setup' { 'excel_correlation_setup_failed' }
     'macro_invoke' { 'excel_macro_failed' }
     'macro_result' { 'excel_invalid_return' }
     default { 'excel_automation_failed' }
@@ -858,6 +1004,7 @@ try {
     'excel_startup' { 'private Excel application could not be started' }
     'isolation' { 'private Excel process identity or isolation could not be established' }
     'workbook_open' { 'Excel could not open the configured workbook' }
+    'correlation_setup' { 'Excel correlation defined names could not be installed safely' }
     'macro_invoke' { 'Excel or VBA failed while invoking the macro' }
     'macro_result' { 'Excel macro returned an unsupported value' }
     default { 'Excel automation failed' }
@@ -871,6 +1018,7 @@ try {
       'excel_startup' { 10 }
       'isolation' { 10 }
       'workbook_open' { 11 }
+      'correlation_setup' { 16 }
       'macro_invoke' { 12 }
       'macro_result' { 13 }
       default { 2 }
@@ -879,6 +1027,10 @@ try {
   $diagnostic = @{ code = $failureCode; stage = $stage; summary = $summary; hresult = $hresult; hresult_hex = $hresultHex }
 } finally {
   $cleanupFailed = $false
+  if ($null -ne $attemptIdName) { try { $attemptIdName.Delete() } catch { $cleanupFailed = $true } }
+  if ($null -ne $attemptIdName) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($attemptIdName) } catch { $cleanupFailed = $true } }
+  if ($null -ne $runIdName) { try { $runIdName.Delete() } catch { $cleanupFailed = $true } }
+  if ($null -ne $runIdName) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($runIdName) } catch { $cleanupFailed = $true } }
   if ($null -ne $workbook) { try { $workbook.Close([bool]$payload.save_changes) } catch { $cleanupFailed = $true } }
   if ($null -ne $excel -and $mayQuitExcel) { try { $excel.Quit() } catch { $cleanupFailed = $true } }
   if ($null -ne $workbook) { try { [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($workbook) } catch { $cleanupFailed = $true } }
@@ -894,13 +1046,134 @@ try {
 if ($null -ne $diagnostic) {
   [Console]::Error.WriteLine('SCHEDULER_DIAGNOSTIC:' + ($diagnostic | ConvertTo-Json -Compress))
 }
-if ($null -ne $exceptionDetail) { [Console]::Error.WriteLine($exceptionDetail) }
 exit $exitCode
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn process_id_signature_is_marshaled_in_order_with_explicit_com_types() {
+        // Mirrors the 17 positional parameters of the production processID
+        // macro, including all trailing optional parameters.
+        let arguments = vec![
+            serde_json::json!(2_147_483_647),
+            serde_json::json!("Monthly Processing.xlsm"),
+            serde_json::json!("operations@example.com;finance@example.com"),
+            serde_json::json!("CURRENT_AND_ARCHIVED"),
+            serde_json::json!("Ada Lovelace"),
+            serde_json::json!("Processing result – July"),
+            serde_json::json!("Line 1\nLine 2 with 'quotes' and {{literal braces}}"),
+            serde_json::json!(true),
+            serde_json::json!(false),
+            serde_json::json!("SELECT * FROM CurrentData WHERE Status = 'Ready'"),
+            serde_json::json!(""),
+            serde_json::json!(""),
+            serde_json::json!(""),
+            serde_json::json!(""),
+            serde_json::json!(false),
+            serde_json::json!("example-user"),
+            serde_json::json!("example-password"),
+        ];
+
+        let marshalled = marshal_excel_arguments(&arguments).expect("scalar arguments");
+        assert_eq!(
+            marshalled,
+            vec![
+                ExcelArgumentPayload::Int32("2147483647".into()),
+                ExcelArgumentPayload::String("Monthly Processing.xlsm".into()),
+                ExcelArgumentPayload::String("operations@example.com;finance@example.com".into()),
+                ExcelArgumentPayload::String("CURRENT_AND_ARCHIVED".into()),
+                ExcelArgumentPayload::String("Ada Lovelace".into()),
+                ExcelArgumentPayload::String("Processing result – July".into()),
+                ExcelArgumentPayload::String(
+                    "Line 1\nLine 2 with 'quotes' and {{literal braces}}".into(),
+                ),
+                ExcelArgumentPayload::Boolean(true),
+                ExcelArgumentPayload::Boolean(false),
+                ExcelArgumentPayload::String(
+                    "SELECT * FROM CurrentData WHERE Status = 'Ready'".into(),
+                ),
+                ExcelArgumentPayload::String(String::new()),
+                ExcelArgumentPayload::String(String::new()),
+                ExcelArgumentPayload::String(String::new()),
+                ExcelArgumentPayload::String(String::new()),
+                ExcelArgumentPayload::Boolean(false),
+                ExcelArgumentPayload::String("example-user".into()),
+                ExcelArgumentPayload::String("example-password".into()),
+            ]
+        );
+
+        let json = serde_json::to_value(&marshalled).expect("payload JSON");
+        assert_eq!(
+            json[0],
+            serde_json::json!({"kind": "int32", "value": "2147483647"})
+        );
+        assert_eq!(
+            json[7],
+            serde_json::json!({"kind": "boolean", "value": true})
+        );
+        assert_eq!(json[16]["value"], "example-password");
+
+        let run_id = uuid::Uuid::from_u128(1);
+        let attempt_id = uuid::Uuid::from_u128(2);
+        let payload = build_excel_payload(
+            &ExcelMacroSpec {
+                workbook_path: "C:\\Tasks\\O'Brien.xlsm".into(),
+                macro_name: "Module.processID".into(),
+                args: arguments,
+                read_only: true,
+                save_changes: false,
+                visible: false,
+            },
+            run_id,
+            attempt_id,
+        )
+        .expect("Excel payload");
+        assert_eq!(payload["run_id"], run_id.to_string());
+        assert_eq!(payload["attempt_id"], attempt_id.to_string());
+        assert_eq!(payload["args"], json);
+    }
+
+    #[test]
+    fn numeric_argument_widths_are_lossless_and_deterministic() {
+        let arguments = vec![
+            serde_json::json!(i32::MIN),
+            serde_json::json!(i32::MAX),
+            serde_json::json!(i64::from(i32::MIN) - 1),
+            serde_json::json!(i64::from(i32::MAX) + 1),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(i64::MAX),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1.25e100_f64),
+            serde_json::Value::Null,
+        ];
+
+        let marshalled = marshal_excel_arguments(&arguments).expect("numeric arguments");
+        assert_eq!(
+            marshalled,
+            vec![
+                ExcelArgumentPayload::Int32(i32::MIN.to_string()),
+                ExcelArgumentPayload::Int32(i32::MAX.to_string()),
+                ExcelArgumentPayload::Int64((i64::from(i32::MIN) - 1).to_string()),
+                ExcelArgumentPayload::Int64((i64::from(i32::MAX) + 1).to_string()),
+                ExcelArgumentPayload::Int64(i64::MIN.to_string()),
+                ExcelArgumentPayload::Int64(i64::MAX.to_string()),
+                ExcelArgumentPayload::Uint64(u64::MAX.to_string()),
+                ExcelArgumentPayload::Double(arguments[7].as_number().unwrap().to_string()),
+                ExcelArgumentPayload::Null,
+            ]
+        );
+    }
+
+    #[test]
+    fn excel_argument_marshalling_rejects_compound_json_values() {
+        for value in [serde_json::json!([]), serde_json::json!({"nested": true})] {
+            let error = marshal_excel_arguments(&[value]).expect_err("compound argument");
+            assert!(error.to_string().contains("scalar"));
+        }
+    }
 
     #[test]
     fn excel_return_one_is_a_macro_failure_with_status_code() {
@@ -939,7 +1212,19 @@ mod tests {
         assert_eq!(diagnostic.stage, FailureStage::MacroInvoke);
     }
 
-    #[cfg(windows)]
+    #[test]
+    fn excel_correlation_setup_failure_is_classified() {
+        let stderr = concat!(
+            "SCHEDULER_DIAGNOSTIC:",
+            r#"{"code":"excel_correlation_setup_failed","stage":"correlation_setup","summary":"Excel correlation defined names could not be installed safely","hresult":-2146827284,"hresult_hex":"0x800A03EC"}"#
+        );
+        let diagnostic = excel_failure_diagnostic(Some(16), None, 42, stderr);
+        assert_eq!(diagnostic.code, FailureCode::ExcelCorrelationSetupFailed);
+        assert_eq!(diagnostic.origin, FailureOrigin::ExcelAutomation);
+        assert_eq!(diagnostic.stage, FailureStage::CorrelationSetup);
+        assert_eq!(diagnostic.status.expect("status").status_code, Some(16));
+    }
+
     #[test]
     fn excel_script_proves_identity_and_job_membership_before_opening_workbook() {
         for required in [
@@ -954,5 +1239,111 @@ mod tests {
         let isolation = EXCEL_SCRIPT.find("IsProcessInJob").expect("membership");
         let workbook = EXCEL_SCRIPT.find("Workbooks.Open").expect("open");
         assert!(isolation < workbook);
+    }
+
+    #[test]
+    fn excel_script_reconstructs_types_and_escapes_workbook_apostrophes() {
+        for required in [
+            "([string]$workbook.Name).Replace(\"'\", \"''\")",
+            "[int32]::Parse",
+            "[int64]::Parse",
+            "[uint64]::Parse",
+            "[double]::Parse",
+            "[bool]$arg.value",
+            "[DBNull]::Value",
+        ] {
+            assert!(EXCEL_SCRIPT.contains(required), "missing {required}");
+        }
+        let escaped_name = EXCEL_SCRIPT.find("$escapedWorkbookName").expect("escape");
+        let macro_name = EXCEL_SCRIPT.find("$macro =").expect("macro qualification");
+        assert!(escaped_name < macro_name);
+
+        assert_eq!(
+            serde_json::to_value(ExcelArgumentPayload::Null).expect("null tag"),
+            serde_json::json!({"kind": "null"})
+        );
+        assert_eq!(
+            serde_json::to_value(ExcelArgumentPayload::Uint64("42".into())).expect("uint tag"),
+            serde_json::json!({"kind": "uint64", "value": "42"})
+        );
+    }
+
+    #[test]
+    fn excel_script_scrubs_bootstrap_before_com_activation() {
+        let parsed = EXCEL_SCRIPT
+            .find("$payload = $payloadJson | ConvertFrom-Json")
+            .expect("payload parse");
+        let activation = EXCEL_SCRIPT
+            .find("New-Object -ComObject Excel.Application")
+            .expect("Excel activation");
+        for required_before_activation in [
+            "$jobName = [string]$env:SCHEDULER_EXCEL_JOB_NAME",
+            "SetEnvironmentVariable('SCHEDULER_EXCEL_PAYLOAD_B64', $null, 'Process')",
+            "SetEnvironmentVariable('SCHEDULER_EXCEL_JOB_NAME', $null, 'Process')",
+            "$payloadJson = $null",
+        ] {
+            let position = EXCEL_SCRIPT
+                .find(required_before_activation)
+                .unwrap_or_else(|| panic!("missing {required_before_activation}"));
+            assert!(
+                parsed < position,
+                "{required_before_activation} precedes parse"
+            );
+            assert!(
+                position < activation,
+                "{required_before_activation} occurs after COM activation"
+            );
+        }
+
+        assert!(EXCEL_SCRIPT.contains("OpenJobObject(5, $false, $jobName)"));
+        let inherited_script = &EXCEL_SCRIPT[activation..];
+        assert!(!inherited_script.contains("$env:SCHEDULER_EXCEL_PAYLOAD_B64"));
+        assert!(!inherited_script.contains("$env:SCHEDULER_EXCEL_JOB_NAME"));
+    }
+
+    #[test]
+    fn excel_script_installs_and_cleans_hidden_workbook_correlation_names() {
+        for required in [
+            "Test-ReservedDefinedNameConflict $workbook 'TASK_RUN_ID'",
+            "Test-ReservedDefinedNameConflict $workbook 'TASK_ATTEMPT_ID'",
+            "$workbookNames.Add('TASK_RUN_ID', ('=\"' + $runId + '\"'), $false)",
+            "$workbookNames.Add('TASK_ATTEMPT_ID', ('=\"' + $attemptId + '\"'), $false)",
+            "$attemptIdName.Delete()",
+            "$runIdName.Delete()",
+            "'correlation_setup' { 'excel_correlation_setup_failed' }",
+        ] {
+            assert!(EXCEL_SCRIPT.contains(required), "missing {required}");
+        }
+        assert!(!EXCEL_SCRIPT.contains("$env:TASK_RUN_ID"));
+        assert!(!EXCEL_SCRIPT.contains("$env:TASK_ATTEMPT_ID"));
+
+        let workbook_open = EXCEL_SCRIPT.find("Workbooks.Open").expect("workbook open");
+        let run_name_add = EXCEL_SCRIPT
+            .find("$workbookNames.Add('TASK_RUN_ID'")
+            .expect("run name add");
+        let macro_invoke = EXCEL_SCRIPT
+            .find("$stage = 'macro_invoke'")
+            .expect("macro invocation");
+        let attempt_name_delete = EXCEL_SCRIPT
+            .find("$attemptIdName.Delete()")
+            .expect("attempt name delete");
+        let run_name_delete = EXCEL_SCRIPT
+            .find("$runIdName.Delete()")
+            .expect("run name delete");
+        let workbook_close = EXCEL_SCRIPT
+            .find("$workbook.Close")
+            .expect("workbook close");
+        assert!(workbook_open < run_name_add && run_name_add < macro_invoke);
+        assert!(attempt_name_delete < workbook_close && run_name_delete < workbook_close);
+    }
+
+    #[test]
+    fn excel_script_suppresses_raw_exception_detail() {
+        assert!(!EXCEL_SCRIPT.contains("Exception.ToString"));
+        assert!(!EXCEL_SCRIPT.contains("exceptionDetail"));
+        assert!(EXCEL_SCRIPT.contains(
+            "[Console]::Error.WriteLine('SCHEDULER_DIAGNOSTIC:' + ($diagnostic | ConvertTo-Json -Compress))"
+        ));
+        assert!(EXCEL_SCRIPT.contains("$hresult = [int64]$_.Exception.HResult"));
     }
 }

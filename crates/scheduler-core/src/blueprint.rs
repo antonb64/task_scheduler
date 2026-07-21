@@ -85,7 +85,22 @@ pub fn validate_parameters(schema: &Value, parameters: &Value) -> Result<()> {
     let validator = jsonschema::validator_for(schema).context("invalid parameters schema")?;
     let errors = validator
         .iter_errors(parameters)
-        .map(|error| error.to_string())
+        .map(|error| {
+            let schema_path = match error.schema_path.as_str() {
+                "" => "<root>",
+                path => path,
+            };
+            let keyword = error
+                .schema_path
+                .as_str()
+                .rsplit('/')
+                .find(|component| !component.is_empty())
+                .unwrap_or("unknown");
+            // `instance_path` is deliberately excluded. Object keys are runtime
+            // parameter data and can themselves contain credentials or other
+            // values that must never reach APIs, audit logs, or telemetry.
+            format!("`{keyword}` validation failed (schema path {schema_path})")
+        })
         .collect::<Vec<_>>();
     if !errors.is_empty() {
         bail!("parameters failed validation: {}", errors.join("; "));
@@ -327,5 +342,156 @@ policy:
         )
         .expect_err("object arguments are not COM scalar variants");
         assert!(error.to_string().contains("scalar"));
+    }
+
+    #[test]
+    fn process_id_example_preserves_all_vba_arguments_and_long_bounds() {
+        let blueprint = parse_blueprint(
+            include_bytes!("../../../examples/blueprints/process-id.yaml"),
+            Some("application/yaml"),
+        )
+        .expect("processID blueprint");
+        let parameters: Value = serde_json::from_slice(include_bytes!(
+            "../../../examples/parameters/process-id.json"
+        ))
+        .expect("processID parameters");
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint,
+            base_parameters: parameters.clone(),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+
+        let snapshot = resolve_snapshot(&resolved, &parameters, &BTreeMap::new())
+            .expect("resolve processID example");
+        let ExecutorSpec::ExcelMacro(excel) = snapshot.executor else {
+            panic!("wrong executor");
+        };
+        assert_eq!(excel.macro_name, "ProcessModule.processID");
+        assert_eq!(excel.args.len(), 17);
+        assert_eq!(
+            excel.args,
+            vec![
+                serde_json::json!(2_147_483_647_i64),
+                serde_json::json!("Monthly Processing.xlsm"),
+                serde_json::json!("operations@example.com;finance@example.com"),
+                serde_json::json!("CURRENT_AND_ARCHIVED"),
+                serde_json::json!("Ada Lovelace"),
+                serde_json::json!("Processing result – July"),
+                serde_json::json!("Line 1\nLine 2 with 'quotes' and {{literal braces}}"),
+                serde_json::json!(true),
+                serde_json::json!(false),
+                serde_json::json!("SELECT * FROM CurrentData WHERE Status = 'Ready'"),
+                serde_json::json!(""),
+                serde_json::json!(""),
+                serde_json::json!(""),
+                serde_json::json!(""),
+                serde_json::json!(false),
+                serde_json::json!("example-user"),
+                serde_json::json!("example-password"),
+            ]
+        );
+        assert!(excel.args[0].is_i64());
+        assert!(excel.args[1..7].iter().all(Value::is_string));
+        assert!(excel.args[7..9].iter().all(Value::is_boolean));
+        assert!(excel.args[9..14].iter().all(Value::is_string));
+        assert!(excel.args[14].is_boolean());
+        assert!(excel.args[15..17].iter().all(Value::is_string));
+
+        for boundary in [-2_147_483_648_i64, 2_147_483_647_i64] {
+            let mut boundary_parameters = parameters.clone();
+            boundary_parameters["id"] = serde_json::json!(boundary);
+            resolve_snapshot(&resolved, &boundary_parameters, &BTreeMap::new())
+                .expect("VBA Long boundary should validate");
+        }
+        for outside in [-2_147_483_649_i64, 2_147_483_648_i64] {
+            let mut invalid_parameters = parameters.clone();
+            invalid_parameters["id"] = serde_json::json!(outside);
+            let error = resolve_snapshot(&resolved, &invalid_parameters, &BTreeMap::new())
+                .expect_err("value outside VBA Long range must be rejected");
+            assert!(error.to_string().contains("parameters failed validation"));
+        }
+    }
+
+    #[test]
+    fn excel_application_run_accepts_thirty_macro_arguments_but_not_thirty_one() {
+        let mut blueprint = Blueprint {
+            api_version: "scheduler/v1".into(),
+            executor: ExecutorSpec::ExcelMacro(ExcelMacroSpec {
+                workbook_path: "C:\\Tasks\\book.xlsm".into(),
+                macro_name: "Module.Run".into(),
+                args: vec![Value::Null; 30],
+                read_only: true,
+                save_changes: false,
+                visible: false,
+            }),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            required_labels: BTreeMap::new(),
+            policy: ExecutionPolicy::default(),
+        };
+        validate_blueprint(&blueprint).expect("Application.Run supports 30 arguments");
+
+        let ExecutorSpec::ExcelMacro(excel) = &mut blueprint.executor else {
+            unreachable!();
+        };
+        excel.args.push(Value::Null);
+        let error = validate_blueprint(&blueprint).expect_err("31 arguments must be rejected");
+        assert!(error.to_string().contains("at most 30"));
+    }
+
+    #[test]
+    fn parameter_validation_errors_are_actionable_without_exposing_values() {
+        const SECRET: &str = "UNIQUE-SECRET-SENTINEL-7f19099d-do-not-log";
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["credential"],
+            "properties": {
+                "credential": {
+                    "type": "string",
+                    "maxLength": 8
+                }
+            }
+        });
+        let mut parameters = serde_json::json!({"credential": SECRET});
+        parameters
+            .as_object_mut()
+            .expect("object parameters")
+            .insert(SECRET.into(), serde_json::json!("unexpected dynamic key"));
+
+        let validation_error = validate_parameters(&schema, &parameters)
+            .expect_err("oversized credential must be rejected")
+            .to_string();
+        assert!(!validation_error.contains(SECRET));
+        assert!(validation_error.contains("`maxLength`"));
+        assert!(validation_error.contains("schema path /properties/credential/maxLength"));
+        assert!(validation_error.contains("`additionalProperties`"));
+        assert!(validation_error.contains("schema path /additionalProperties"));
+
+        let resolved = ResolvedScheduleSnapshot {
+            blueprint: Blueprint {
+                api_version: "scheduler/v1".into(),
+                executor: ExecutorSpec::Command(CommandSpec {
+                    program: "runner".into(),
+                    args: vec!["{{params.credential}}".into()],
+                    env: BTreeMap::new(),
+                    working_directory: None,
+                }),
+                parameters_schema: schema,
+                required_labels: BTreeMap::new(),
+                policy: ExecutionPolicy::default(),
+            },
+            base_parameters: parameters.clone(),
+            blueprint_source_version: None,
+            parameters_source_version: None,
+        };
+        let resolution_error = resolve_snapshot(&resolved, &parameters, &BTreeMap::new())
+            .expect_err("snapshot resolution must retain safe validation diagnostics")
+            .to_string();
+        assert!(!resolution_error.contains(SECRET));
+        assert!(resolution_error.contains("`maxLength`"));
+        assert!(resolution_error.contains("schema path /properties/credential/maxLength"));
+        assert!(resolution_error.contains("`additionalProperties`"));
+        assert!(resolution_error.contains("schema path /additionalProperties"));
     }
 }

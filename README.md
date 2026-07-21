@@ -9,7 +9,7 @@ A single-coordinator, at-least-once task scheduler for commands and interactive 
 - `task-executor` supervises one command or Excel macro in a separate process tree.
 - `taskctl` provides the administrative CLI.
 
-At-least-once delivery permits duplicate execution near a lease boundary. Tasks must use `TASK_RUN_ID` as an idempotency key. `TASK_ATTEMPT_ID` identifies a particular execution.
+At-least-once delivery permits duplicate execution near a lease boundary. Command tasks receive `TASK_RUN_ID` as an idempotency key and `TASK_ATTEMPT_ID` for a particular execution. Excel macros receive the same values through temporary workbook-defined names.
 
 ## Local development
 
@@ -52,6 +52,12 @@ Bootstrap values—network listeners, database/key/certificate paths, and coordi
 Excel macro blueprints are Windows-only and require desktop Excel in a logged-in interactive session. Use [the scheduled-task helper](deploy/windows/Register-Agent.ps1) to start the agent at logon; do not run it as a Windows service.
 
 The executor creates a private Excel COM instance, opens an allowlisted preinstalled workbook, calls `Application.Run` with up to 30 positional JSON scalar arguments, and maps return `0` to success and `1` to task failure. Other values and COM errors are infrastructure failures. Workbooks must be trusted/signed, macros must not show dialogs, and Excel concurrency is capped at one per agent.
+
+The [`processID` example](examples/blueprints/process-id.yaml) demonstrates a larger VBA function with 17 positional arguments, including a VBA `Long`, strings, booleans, five optional queries, and credentials. Its matching [parameter document](examples/parameters/process-id.json) supplies explicit defaults for every optional position. Exact `{{params.name}}` expressions preserve the JSON scalar type; embedded expressions render to strings.
+
+`Application.Run` is positional. Trailing optional VBA arguments may be left out of `args`, but supplying a later optional argument requires entries for all earlier positions, normally `""` or `false`. Constrain VBA `Long` values to `-2147483648..2147483647` in the parameter schema, as the example does. Keep credential-bearing parameter artifacts protected; resolved snapshots remain encrypted by the coordinator and parameter values are excluded from APIs, audit metadata, and telemetry.
+
+Excel tasks receive the same stable correlation identifiers as command tasks. While the macro runs, the executor installs hidden, workbook-scoped names `TASK_RUN_ID` and `TASK_ATTEMPT_ID`; VBA can read them with `CStr(Evaluate("TASK_RUN_ID"))` and `CStr(Evaluate("TASK_ATTEMPT_ID"))`. The executor rejects conflicting reserved names and deletes both temporary names before closing the workbook. It does not rely on process-environment inheritance for Excel identifiers. The secret-bearing bootstrap payload is removed from the PowerShell process environment before the private Excel instance is activated.
 
 Node settings must list absolute `allowed_workbook_roots`. Absolute command paths and working directories likewise require `allowed_command_roots`; commands resolved through `PATH` remain available.
 
