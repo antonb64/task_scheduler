@@ -65,4 +65,6 @@ cargo test --workspace
 
 Windows Excel integration requires a self-hosted runner with licensed desktop Excel. The portable tests use a fake boundary and exercise process execution, lease expiry, cryptography, cron parsing, templating, storage transitions, idempotency, and settings locking.
 
+See [the testing guide](docs/testing.md) for deterministic simulation, CI soak sharding, and exact failure replay.
+
 See [docs/architecture.md](docs/architecture.md) and [docs/api.md](docs/api.md) for protocol and operational details.

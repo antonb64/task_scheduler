@@ -13,7 +13,7 @@ use scheduler_core::{
     resolve_snapshot,
 };
 use scheduler_protocol::control::{CoordinatorMessage, coordinator_message};
-use scheduler_store::{NewRun, NewSchedule, ScheduleRecord};
+use scheduler_store::{CronOccurrenceResult, NewRun, NewSchedule, ScheduleRecord};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -602,6 +602,26 @@ pub async fn create_run_from_schedule(
     scheduled_at: DateTime<Utc>,
     idempotency_key: Option<String>,
 ) -> Result<scheduler_core::RunView> {
+    let new = build_run_from_schedule(
+        state,
+        schedule,
+        overrides,
+        trigger_kind,
+        scheduled_at,
+        idempotency_key,
+    )
+    .await?;
+    state.store.create_run(new).await
+}
+
+async fn build_run_from_schedule(
+    state: &AppState,
+    schedule: &ScheduleRecord,
+    overrides: &Value,
+    trigger_kind: &str,
+    scheduled_at: DateTime<Utc>,
+    idempotency_key: Option<String>,
+) -> Result<NewRun> {
     if !schedule.view.spec.enabled {
         bail!("schedule is paused");
     }
@@ -610,21 +630,18 @@ pub async fn create_run_from_schedule(
     let parameters = merge_parameters(&resolved.base_parameters, overrides)?;
     let snapshot = resolve_snapshot(&resolved, &parameters, &schedule.view.spec.required_labels)?;
     let encrypted = state.cipher.encrypt(&serde_json::to_vec(&snapshot)?)?;
-    state
-        .store
-        .create_run(NewRun {
-            id: Uuid::new_v4(),
-            schedule_id: schedule.view.id,
-            trigger_kind: trigger_kind.into(),
-            scheduled_at,
-            encrypted_snapshot: encrypted,
-            key_id: state.cipher.key_id().into(),
-            max_attempts: snapshot.policy.max_attempts,
-            initial_backoff_seconds: snapshot.policy.initial_backoff_seconds,
-            backoff_cap_seconds: snapshot.policy.backoff_cap_seconds,
-            idempotency_key,
-        })
-        .await
+    Ok(NewRun {
+        id: Uuid::new_v4(),
+        schedule_id: schedule.view.id,
+        trigger_kind: trigger_kind.into(),
+        scheduled_at,
+        encrypted_snapshot: encrypted,
+        key_id: state.cipher.key_id().into(),
+        max_attempts: snapshot.policy.max_attempts,
+        initial_backoff_seconds: snapshot.policy.initial_backoff_seconds,
+        backoff_cap_seconds: snapshot.policy.backoff_cap_seconds,
+        idempotency_key,
+    })
 }
 
 fn validate_schedule_spec(spec: &ScheduleSpec) -> Result<()> {
@@ -789,31 +806,47 @@ pub async fn materialize_cron(state: &AppState) -> Result<()> {
         let Some(cron) = schedule.view.spec.cron.as_ref() else {
             continue;
         };
-        let mut cursor = schedule.last_cron_at.unwrap_or(schedule.view.created_at);
-        for _ in 0..1_000 {
-            let Some(next) = scheduler_core::schedule::next_occurrences(cron, cursor, 1)?
-                .into_iter()
-                .next()
-            else {
-                break;
-            };
-            if next > now {
-                break;
-            }
-            create_run_from_schedule(state, &schedule, &serde_json::json!({}), "cron", next, None)
-                .await?;
-            state
+        let cursor = schedule.last_cron_at.unwrap_or(schedule.view.created_at);
+        for next in due_cron_batch(cron, cursor, now)? {
+            let new = build_run_from_schedule(
+                state,
+                &schedule,
+                &serde_json::json!({}),
+                "cron",
+                next,
+                None,
+            )
+            .await?;
+            match state
                 .store
-                .advance_cron_cursor(schedule.view.id, next)
-                .await?;
-            cursor = next;
+                .create_cron_occurrence(new, schedule.view.revision, cron)
+                .await?
+            {
+                CronOccurrenceResult::Applied(_) => {}
+                CronOccurrenceResult::StaleSchedule => break,
+            }
         }
     }
     Ok(())
 }
 
+fn due_cron_batch(
+    cron: &scheduler_core::CronSpec,
+    cursor: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<Vec<DateTime<Utc>>> {
+    Ok(
+        scheduler_core::schedule::next_occurrences(cron, cursor, 1_000)?
+            .into_iter()
+            .take_while(|occurrence| *occurrence <= now)
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    use chrono::TimeZone;
+
     use super::*;
 
     #[test]
@@ -828,5 +861,31 @@ mod tests {
         let stale = require_if_match(&headers, 8).expect_err("mismatch");
         assert_eq!(stale.status, StatusCode::PRECONDITION_FAILED);
         assert_eq!(stale.code, "precondition_failed");
+    }
+
+    #[test]
+    fn cron_materialization_batches_dense_fallback_scan_once() {
+        let cron = scheduler_core::CronSpec {
+            expression: "* * * * * *".into(),
+            timezone: "Europe/Vienna".into(),
+        };
+        let cursor = Utc
+            .with_ymd_and_hms(2026, 10, 25, 0, 59, 59)
+            .single()
+            .expect("valid cursor");
+        let now = cursor + chrono::Duration::seconds(1_000);
+
+        // Around a fallback, next_occurrences deliberately rewinds to the local day's start.
+        // One 1,000-item scan is bounded; calling count=1 a thousand times would rescan that
+        // prefix and make this regression pathologically slow.
+        let started = std::time::Instant::now();
+        let due = due_cron_batch(&cron, cursor, now).expect("batch");
+        assert_eq!(due.len(), 1_000);
+        assert_eq!(due.first(), Some(&(cursor + chrono::Duration::seconds(1))));
+        assert_eq!(due.last(), Some(&now));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "dense fallback materialization must remain a single bounded scan"
+        );
     }
 }

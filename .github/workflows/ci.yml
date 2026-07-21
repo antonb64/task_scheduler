@@ -3,6 +3,17 @@ name: ci
 on:
   push:
   pull_request:
+  schedule:
+    # A weekly deterministic soak complements the fast simulation run on each change.
+    - cron: "17 2 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   rust:
@@ -19,3 +30,31 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  simulation-fast:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Run deterministic simulations
+        env:
+          SCHEDULER_SIM_PROFILE: fast
+        run: ./scripts/test-simulations.sh
+
+  simulation-soak:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: Run deterministic simulation soak shard ${{ matrix.shard }}
+        env:
+          SCHEDULER_SIM_PROFILE: soak
+          SCHEDULER_SIM_SHARD_INDEX: ${{ matrix.shard }}
+          SCHEDULER_SIM_SHARD_COUNT: 8
+        run: ./scripts/test-simulations.sh
