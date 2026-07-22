@@ -1,6 +1,6 @@
 # Installation and node setup
 
-This guide installs one authoritative coordinator and one or more agents. Commands use release binaries built from this repository. Package or copy the four executables in a way appropriate for your operating system.
+This guide installs one authoritative coordinator and one or more agents. Commands use release binaries built from this repository. Package or copy the four executables in a way appropriate for your operating system. Versioned Linux, Windows, Intel macOS, and Apple Silicon macOS archives are also published by the [release workflow](releases.md).
 
 ## 1. Build and lay out the binaries
 

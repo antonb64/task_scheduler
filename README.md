@@ -62,6 +62,7 @@ For Windows Excel execution, run the agent after interactive user logon, not as 
 - [HTTP API](docs/api.md)
 - [Architecture and delivery guarantees](docs/architecture.md)
 - [Tests and deterministic simulation](docs/testing.md)
+- [Release process and binary archives](docs/releases.md)
 
 Formal documents are available under [`schemas/`](schemas/). The examples under [`examples/`](examples/) are intended to be copied and edited.
 

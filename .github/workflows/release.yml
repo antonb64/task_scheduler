@@ -1,0 +1,293 @@
+name: release
+
+on:
+  push:
+    branches:
+      - "release/v*.*.*"
+
+# A release branch is a one-shot, immutable version source. A later push to the
+# same branch will fail publication once its vX.Y.Z tag exists.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: 1.88.0
+
+jobs:
+  validate:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install the pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Match the branch and workspace versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF_NAME" =~ ^release/v((0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$ ]]; then
+            version="${BASH_REMATCH[1]}"
+          else
+            echo "release branch must be named release/vX.Y.Z" >&2
+            exit 1
+          fi
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          workspace_versions="$(jq -r '.packages[].version' <<< "$metadata" | sort -u)"
+          if [[ "$workspace_versions" != "$version" ]]; then
+            echo "release branch version $version does not match every workspace package:" >&2
+            echo "$workspace_versions" >&2
+            exit 1
+          fi
+
+          binary_targets="$(
+            jq -r '.packages[].targets[] | select(.kind | index("bin")) | .name' <<< "$metadata" |
+              sort
+          )"
+          expected_binary_targets="$(printf '%s\n' agent coordinator task-executor taskctl | sort)"
+          if [[ "$binary_targets" != "$expected_binary_targets" ]]; then
+            echo "release packaging does not cover the exact workspace binary set:" >&2
+            echo "$binary_targets" >&2
+            exit 1
+          fi
+
+          git fetch --force --tags origin
+          if git show-ref --verify --quiet "refs/tags/v$version"; then
+            echo "tag v$version already exists; release versions are immutable" >&2
+            exit 1
+          fi
+
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "release commit must already be reachable from origin/main" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build and test (${{ matrix.name }})
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            macos_deployment_target: ""
+          - name: windows-x86_64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            macos_deployment_target: ""
+          - name: macos-x86_64
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            macos_deployment_target: "12.0"
+          - name: macos-aarch64
+            os: macos-15
+            target: aarch64-apple-darwin
+            macos_deployment_target: "12.0"
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+      RELEASE_TARGET: ${{ matrix.target }}
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos_deployment_target }}
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install the pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+          rustup target add "$RELEASE_TARGET"
+
+      - name: Check formatting and lints
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup component add rustfmt clippy
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --locked --target "$RELEASE_TARGET" -- -D warnings
+
+      - name: Run the workspace tests
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+      - name: Run deterministic scheduler simulations
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        env:
+          SCHEDULER_SIM_PROFILE: fast
+        run: ./scripts/test-simulations.sh
+
+      - name: Reclaim test artifacts before the release build
+        run: cargo clean
+
+      - name: Build all release binaries
+        run: cargo build --release --workspace --bins --locked --target ${{ matrix.target }}
+
+      - name: Package Unix release
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_root="task-scheduler-${RELEASE_TAG}-${RELEASE_TARGET}"
+          staging="$RUNNER_TEMP/$archive_root"
+          mkdir -p "$staging" dist
+
+          for binary in coordinator agent task-executor taskctl; do
+            install -m 0755 "target/${RELEASE_TARGET}/release/$binary" "$staging/$binary"
+          done
+          cp README.md LICENSE "$staging/"
+          cp -R docs examples schemas deploy "$staging/"
+
+          {
+            printf 'version=%s\n' "$RELEASE_VERSION"
+            printf 'tag=%s\n' "$RELEASE_TAG"
+            printf 'commit=%s\n' "$GITHUB_SHA"
+            printf 'target=%s\n' "$RELEASE_TARGET"
+            printf 'rust_toolchain=%s\n' "$RUST_TOOLCHAIN"
+          } > "$staging/BUILD-METADATA.txt"
+
+          test "$("$staging/coordinator" --version)" = "coordinator $RELEASE_VERSION"
+          test "$("$staging/agent" --version)" = "agent $RELEASE_VERSION"
+          test "$("$staging/taskctl" --version)" = "taskctl $RELEASE_VERSION"
+          test -x "$staging/task-executor"
+
+          archive="dist/$archive_root.tar.gz"
+          tar -C "$RUNNER_TEMP" -czf "$archive" "$archive_root"
+          tar -tzf "$archive" >/dev/null
+
+      - name: Package Windows release
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $archiveRoot = "task-scheduler-$env:RELEASE_TAG-$env:RELEASE_TARGET"
+          $staging = Join-Path $env:RUNNER_TEMP $archiveRoot
+          New-Item -ItemType Directory -Path $staging -Force | Out-Null
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+
+          foreach ($binary in @("coordinator", "agent", "task-executor", "taskctl")) {
+            Copy-Item "target/$env:RELEASE_TARGET/release/$binary.exe" $staging
+          }
+          Copy-Item README.md, LICENSE $staging
+          Copy-Item docs, examples, schemas, deploy -Destination $staging -Recurse
+
+          @(
+            "version=$env:RELEASE_VERSION"
+            "tag=$env:RELEASE_TAG"
+            "commit=$env:GITHUB_SHA"
+            "target=$env:RELEASE_TARGET"
+            "rust_toolchain=$env:RUST_TOOLCHAIN"
+          ) | Set-Content -Path (Join-Path $staging "BUILD-METADATA.txt") -Encoding utf8
+
+          foreach ($binary in @("coordinator", "agent", "taskctl")) {
+            $reportedVersion = & (Join-Path $staging "$binary.exe") --version
+            if ($LASTEXITCODE -ne 0 -or $reportedVersion -ne "$binary $env:RELEASE_VERSION") {
+              throw "$binary reported an unexpected version: $reportedVersion"
+            }
+          }
+          if (-not (Test-Path (Join-Path $staging "task-executor.exe") -PathType Leaf)) {
+            throw "task-executor.exe is missing"
+          }
+
+          $archive = Join-Path (Resolve-Path dist) "$archiveRoot.zip"
+          Compress-Archive -Path $staging -DestinationPath $archive -CompressionLevel Optimal
+          $verify = Join-Path $env:RUNNER_TEMP "verify-$env:RELEASE_TARGET"
+          Expand-Archive -Path $archive -DestinationPath $verify
+          foreach ($binary in @("coordinator", "agent", "task-executor", "taskctl")) {
+            $path = Join-Path $verify "$archiveRoot/$binary.exe"
+            if (-not (Test-Path $path -PathType Leaf)) { throw "$binary.exe is missing from archive" }
+          }
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.name }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [validate, build]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+    steps:
+      - name: Check out the release commit and tags
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Download every platform archive
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate and verify checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_count="$(find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) | wc -l | tr -d ' ')"
+          if [[ "$archive_count" != "4" ]]; then
+            echo "expected four release archives, found $archive_count" >&2
+            find dist -maxdepth 1 -type f -print >&2
+            exit 1
+          fi
+
+          cd dist
+          sha256sum task-scheduler-*.tar.gz task-scheduler-*.zip > SHA256SUMS
+          sha256sum --check SHA256SUMS
+
+      - name: Refuse to replace an existing version
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force --tags origin
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "tag $RELEASE_TAG already exists; refusing to replace an immutable release" >&2
+            exit 1
+          fi
+
+      - name: Create tag and GitHub release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "Task Scheduler $RELEASE_TAG" \
+            --generate-notes \
+            --latest
