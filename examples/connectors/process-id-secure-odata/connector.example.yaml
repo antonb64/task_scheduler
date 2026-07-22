@@ -1,0 +1,9 @@
+api_version: scheduler/connectors/v1
+connectors:
+  process-id-odata:
+    base_url: http://127.0.0.1:9010
+    bearer_token_env: PROCESS_ID_CONNECTOR_TOKEN
+    allowed_kinds:
+      - parameters
+    connect_timeout_seconds: 2
+    timeout_seconds: 15

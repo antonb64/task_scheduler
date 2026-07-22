@@ -191,14 +191,83 @@ pub fn resolve_snapshot(
     required_labels.extend(schedule_labels.clone());
     let parameters_digest = hex::encode(Sha256::digest(serde_json::to_vec(parameters)?));
     let blueprint_digest = hex::encode(Sha256::digest(serde_json::to_vec(&resolved.blueprint)?));
+    let sensitive_parameter_paths = sensitive_parameter_paths(
+        &resolved.blueprint.parameters_schema,
+        &resolved.blueprint.parameter_bindings,
+    );
     Ok(ExecutionSnapshot {
         executor,
         policy: resolved.blueprint.policy.clone(),
         required_labels,
         blueprint_digest,
         parameters_digest,
+        parameters: Some(parameters.clone()),
+        sensitive_parameter_paths,
         late_bindings,
     })
+}
+
+pub fn sensitive_parameter_paths(
+    schema: &Value,
+    bindings: &BTreeMap<String, crate::ParameterBinding>,
+) -> Vec<String> {
+    fn escape_pointer_segment(segment: &str) -> String {
+        segment.replace('~', "~0").replace('/', "~1")
+    }
+
+    fn sensitive_name(name: &str) -> bool {
+        let normalized = name
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        [
+            "password",
+            "passwd",
+            "passphrase",
+            "secret",
+            "token",
+            "credential",
+            "apikey",
+            "accesskey",
+            "privatekey",
+        ]
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    }
+
+    fn collect(schema: &Value, path: &str, name: Option<&str>, paths: &mut Vec<String>) {
+        let annotated = schema.get("writeOnly").and_then(Value::as_bool) == Some(true)
+            || schema.get("x-sensitive").and_then(Value::as_bool) == Some(true)
+            || schema
+                .get("format")
+                .and_then(Value::as_str)
+                .is_some_and(|format| matches!(format, "password" | "secret"));
+        if annotated || name.is_some_and(sensitive_name) {
+            if !path.is_empty() {
+                paths.push(path.to_owned());
+            }
+            return;
+        }
+        let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+            return;
+        };
+        for (name, property_schema) in properties {
+            let child = format!("{path}/{}", escape_pointer_segment(name));
+            collect(property_schema, &child, Some(name), paths);
+        }
+    }
+
+    let mut paths = Vec::new();
+    collect(schema, "", None, &mut paths);
+    paths.extend(bindings.iter().filter_map(|(name, binding)| {
+        binding
+            .sensitive
+            .then(|| format!("/{}", escape_pointer_segment(name)))
+    }));
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 pub(crate) fn render_executor(executor: &ExecutorSpec, parameters: &Value) -> Result<ExecutorSpec> {
@@ -370,6 +439,41 @@ policy:
             panic!("wrong executor");
         };
         assert_eq!(command.args, ["--name=Ada; rm -rf /"]);
+        assert_eq!(
+            snapshot.parameters,
+            Some(serde_json::json!({"user": {"name": "Ada; rm -rf /"}}))
+        );
+    }
+
+    #[test]
+    fn captures_write_only_and_bound_sensitive_parameter_paths() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "customer": {"type": "string"},
+                "legacy_password": {"type": "string"},
+                "credentials": {
+                    "type": "object",
+                    "properties": {
+                        "api/token": {"type": "string", "writeOnly": true}
+                    }
+                }
+            }
+        });
+        let bindings = BTreeMap::from([(
+            "agent_secret".into(),
+            crate::ParameterBinding {
+                source: crate::ParameterBindingSource::SecretFile,
+                name: "agent-secret".into(),
+                value_type: crate::ParameterBindingValueType::String,
+                sensitive: true,
+            },
+        )]);
+
+        assert_eq!(
+            sensitive_parameter_paths(&schema, &bindings),
+            ["/agent_secret", "/credentials", "/legacy_password"]
+        );
     }
 
     #[test]

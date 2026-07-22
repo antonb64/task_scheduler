@@ -53,6 +53,7 @@ Copyable examples:
 - [`examples/schedules/echo.example.yaml`](../examples/schedules/echo.example.yaml)
 - [`examples/schedules/echo.example.json`](../examples/schedules/echo.example.json)
 - [`examples/schedules/monthly-collection.example.yaml`](../examples/schedules/monthly-collection.example.yaml)
+- [`examples/schedules/process-id-secure-odata.example.yaml`](../examples/schedules/process-id-secure-odata.example.yaml)
 
 ## Blueprint document
 
@@ -154,6 +155,23 @@ The parameter artifact is JSON:
 ```
 
 Manual and webhook overrides must also be JSON objects. Merge behavior is recursive for objects; arrays, scalars, and null replace the saved value at that key. The final merged document is validated before a run is committed.
+
+Mark stored values which must be hidden in the management UI with the JSON
+Schema annotation `writeOnly: true`. The coordinator still encrypts the entire
+execution snapshot at rest. Run and batch detail pages show the exact captured
+parameter document, but replace write-only values with a redaction marker by
+default. An authenticated administrator can explicitly enable debug mode on a
+detail page to reveal stored values; those responses use
+`Cache-Control: no-store`. For backward compatibility, common secret-bearing
+property names
+such as `password`, `secret`, `token`, `credential`, and `api_key` are also
+redacted conservatively. Prefer the explicit schema annotation for new
+blueprints.
+
+Agent-local `parameter_bindings` are different: their values are resolved only
+on the selected agent and are never returned to or persisted by the
+coordinator. The detail page lists those parameters as agent-local, but even
+debug mode cannot reveal a value the coordinator never received.
 
 Validation errors returned to operators deliberately identify schema keywords and schema paths without including runtime parameter values or their object keys.
 
@@ -282,6 +300,7 @@ Complete secure Excel examples, with all 17 `processID` arguments but without cr
 
 - [`examples/blueprints/process-id-secure.yaml`](../examples/blueprints/process-id-secure.yaml)
 - [`examples/parameters/process-id-secure.json`](../examples/parameters/process-id-secure.json)
+- [`examples/connectors/process-id-secure-odata`](../examples/connectors/process-id-secure-odata) (Rust OData adapter for the `daily` parameter group)
 
 ## Parameter templates
 

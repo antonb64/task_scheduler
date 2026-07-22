@@ -275,6 +275,12 @@ async fn sqlite_uses_the_composite_keyset_indexes() {
              ORDER BY created_at DESC,id DESC LIMIT 50",
         ),
         (
+            "idx_runs_schedule_keyset",
+            "EXPLAIN QUERY PLAN SELECT id FROM runs WHERE schedule_id='fixture' \
+             AND created_at<'9999-12-31T23:59:59.999Z' \
+             ORDER BY created_at DESC,id DESC LIMIT 50",
+        ),
+        (
             "idx_blueprint_revisions_keyset",
             "EXPLAIN QUERY PLAN SELECT digest FROM blueprint_revisions \
              WHERE loaded_at<'9999-12-31T23:59:59.999Z' \

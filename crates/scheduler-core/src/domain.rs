@@ -168,6 +168,17 @@ pub struct ExecutionSnapshot {
     #[serde(default)]
     pub blueprint_digest: String,
     pub parameters_digest: String,
+    /// Exact coordinator-resolved parameters used to create this execution.
+    ///
+    /// Agent-local bindings are deliberately absent because their values never
+    /// leave the selected agent. `Option` keeps snapshots written by older
+    /// coordinators readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<Value>,
+    /// JSON Pointer paths which the management UI must redact unless its
+    /// authenticated debug view was explicitly enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_parameter_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub late_bindings: Option<crate::LateBindingSnapshot>,
 }
@@ -520,5 +531,25 @@ mod tests {
         settings = GlobalSettings::default();
         settings.otlp_endpoint = Some("file:///tmp/collector".into());
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn execution_snapshots_from_older_coordinators_remain_readable() {
+        let snapshot: ExecutionSnapshot = serde_json::from_value(serde_json::json!({
+            "executor": {"kind": "command", "program": "runner"},
+            "policy": {
+                "max_attempts": 1,
+                "timeout_seconds": 60,
+                "initial_backoff_seconds": 1,
+                "backoff_cap_seconds": 30
+            },
+            "required_labels": {},
+            "blueprint_digest": "blueprint",
+            "parameters_digest": "parameters"
+        }))
+        .expect("legacy snapshot");
+
+        assert!(snapshot.parameters.is_none());
+        assert!(snapshot.sensitive_parameter_paths.is_empty());
     }
 }

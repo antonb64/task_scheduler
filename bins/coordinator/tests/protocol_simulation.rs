@@ -538,6 +538,8 @@ fn execution_snapshot() -> ExecutionSnapshot {
         required_labels: blueprint.required_labels,
         blueprint_digest: "simulation-blueprint".into(),
         parameters_digest: "simulation-parameters".into(),
+        parameters: Some(serde_json::json!({})),
+        sensitive_parameter_paths: Vec::new(),
         late_bindings: None,
     }
 }

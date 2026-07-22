@@ -297,6 +297,8 @@ mod tests {
                 required_labels: BTreeMap::new(),
                 blueprint_digest: "test-blueprint".into(),
                 parameters_digest: "nonsecret".into(),
+                parameters: Some(serde_json::json!({})),
+                sensitive_parameter_paths: vec!["/credential".into()],
                 late_bindings: Some(LateBindingSnapshot {
                     executor_template: template,
                     parameters_schema: serde_json::json!({

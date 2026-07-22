@@ -1,0 +1,11 @@
+name: secure daily process from OData
+blueprint_ref:
+  uri: file:///absolute/path/to/task_scheduler/examples/blueprints/process-id-secure.yaml
+parameters_ref:
+  uri: connector://process-id-odata/workbooks/2147483647/groups/daily
+required_labels: {}
+cron:
+  expression: "0 0 6 * * * *"
+  timezone: Europe/Vienna
+webhook_enabled: false
+enabled: true

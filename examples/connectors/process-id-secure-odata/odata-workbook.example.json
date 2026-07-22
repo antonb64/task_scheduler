@@ -1,0 +1,39 @@
+{
+  "@odata.context": "https://odata.example.com/v1/$metadata#Workbooks/$entity",
+  "Id": 2147483647,
+  "WorkbookName": "Daily Processing.xlsm",
+  "ParameterSets": [
+    {
+      "Group": "daily",
+      "Recipients": "operations@example.com;finance@example.com",
+      "SelectionVariant": "CURRENT_AND_ARCHIVED",
+      "Responsible": "Ada Lovelace",
+      "Subject": "Daily processing result",
+      "Body": "The daily process has completed.",
+      "Pdf": true,
+      "Mailfilter": false,
+      "Query1": "SELECT * FROM CurrentData WHERE Status = 'Ready'",
+      "Query2": "",
+      "Query3": "",
+      "Query4": "",
+      "Query5": "",
+      "Info": false
+    },
+    {
+      "Group": "monthly",
+      "Recipients": "finance@example.com",
+      "SelectionVariant": "MONTH_END",
+      "Responsible": "Grace Hopper",
+      "Subject": "Monthly processing result",
+      "Body": "The monthly process has completed.",
+      "Pdf": true,
+      "Mailfilter": true,
+      "Query1": "SELECT * FROM MonthlyData",
+      "Query2": "",
+      "Query3": "",
+      "Query4": "",
+      "Query5": "",
+      "Info": true
+    }
+  ]
+}

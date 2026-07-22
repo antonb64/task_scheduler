@@ -1250,13 +1250,14 @@ impl Store {
             .num_milliseconds()
             .max(0) as u64;
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT a.run_id,a.state AS attempt_state,r.attempt_count,r.max_attempts,r.initial_backoff_seconds,r.backoff_cap_seconds,r.state AS run_state FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.lease_token=?")
+        let row = sqlx::query("SELECT a.run_id,a.agent_id,a.state AS attempt_state,r.attempt_count,r.max_attempts,r.initial_backoff_seconds,r.backoff_cap_seconds,r.state AS run_state FROM attempts a JOIN runs r ON r.id=a.run_id WHERE a.id=? AND a.lease_token=?")
             .bind(attempt_id.to_string()).bind(lease_token).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
             tx.rollback().await?;
             bail!("attempt or lease token is invalid");
         };
         let run_id: String = row.get("run_id");
+        let agent_id: String = row.get("agent_id");
         let attempt_state: String = row.get("attempt_state");
         let current_state: String = row.get("run_state");
         if require_expired_lease && attempt_state != "expiring" {
@@ -1276,6 +1277,7 @@ impl Store {
         if current_state == "cancelled" {
             sqlx::query("UPDATE attempts SET state='late_result',outcome=?,encrypted_result=?,result_key_id=?,diagnostic_json=?,output_metadata_json=?,exit_code=?,signal=?,duration_ms=?,started_at=?,finished_at=?,updated_at=? WHERE id=?")
                 .bind(outcome).bind(encrypted_result).bind(key_id).bind(&diagnostic_json).bind(&output_metadata_json).bind(result.exit_code).bind(&result.signal).bind(duration_ms as i64).bind(format_time(result.started_at)).bind(format_time(result.finished_at)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
+            update_node_processing_stats_tx(&mut tx, &agent_id, result).await?;
             append_audit_tx(
                 &mut tx,
                 "run",
@@ -1289,6 +1291,7 @@ impl Store {
         }
         sqlx::query("UPDATE attempts SET state='finished',outcome=?,encrypted_result=?,result_key_id=?,diagnostic_json=?,output_metadata_json=?,exit_code=?,signal=?,duration_ms=?,started_at=?,finished_at=?,updated_at=? WHERE id=?")
             .bind(outcome).bind(encrypted_result).bind(key_id).bind(&diagnostic_json).bind(&output_metadata_json).bind(result.exit_code).bind(&result.signal).bind(duration_ms as i64).bind(format_time(result.started_at)).bind(format_time(result.finished_at)).bind(format_time(now)).bind(attempt_id.to_string()).execute(&mut *tx).await?;
+        update_node_processing_stats_tx(&mut tx, &agent_id, result).await?;
         let successful = outcome == "succeeded";
         let attempt_count = row.get::<i64, _>("attempt_count") as u32;
         let max_attempts = row.get::<i64, _>("max_attempts") as u32;
@@ -1927,6 +1930,33 @@ async fn update_daily_schedule_stats_tx(
     .bind(i64::try_from(duration_ms).unwrap_or(i64::MAX))
     .bind(format_time(result.finished_at))
     .bind(run_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn update_node_processing_stats_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    agent_id: &str,
+    result: &ExecutionResult,
+) -> Result<()> {
+    let outcome = result.outcome.as_str();
+    let succeeded = i64::from(outcome == "succeeded");
+    let failed = i64::from(!matches!(outcome, "succeeded" | "cancelled"));
+    let cancelled = i64::from(outcome == "cancelled");
+    sqlx::query(
+        "INSERT INTO node_processing_stats(agent_id,processed_tasks,succeeded,failed,cancelled,last_processed_at) \
+         VALUES (?,1,?,?,?,?) ON CONFLICT(agent_id) DO UPDATE SET \
+         processed_tasks=processed_tasks+1,succeeded=succeeded+excluded.succeeded,\
+         failed=failed+excluded.failed,cancelled=cancelled+excluded.cancelled,\
+         last_processed_at=CASE WHEN last_processed_at IS NULL OR excluded.last_processed_at>last_processed_at \
+         THEN excluded.last_processed_at ELSE last_processed_at END",
+    )
+    .bind(agent_id)
+    .bind(succeeded)
+    .bind(failed)
+    .bind(cancelled)
+    .bind(format_time(result.finished_at))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -2671,6 +2701,76 @@ mod tests {
         assert_eq!(rollup.get::<i64, _>("cancelled"), 0);
         assert_eq!(rollup.get::<i64, _>("retries"), 0);
         assert_eq!(rollup.get::<i64, _>("duration_count"), 1);
+
+        let node_rollup = sqlx::query(
+            "SELECT processed_tasks,succeeded,failed,cancelled FROM node_processing_stats \
+             WHERE agent_id='node-a'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("node processing rollup");
+        assert_eq!(node_rollup.get::<i64, _>("processed_tasks"), 1);
+        assert_eq!(node_rollup.get::<i64, _>("succeeded"), 1);
+        assert_eq!(node_rollup.get::<i64, _>("failed"), 0);
+        assert_eq!(node_rollup.get::<i64, _>("cancelled"), 0);
+    }
+
+    #[tokio::test]
+    async fn node_processing_rollup_counts_each_completed_retry_attempt() {
+        let (_directory, store) = test_store().await;
+        let (_, run_id) = schedule_and_run(&store).await;
+
+        let failed_attempt = store
+            .create_attempt(run_id, "node-a", 60)
+            .await
+            .expect("failed attempt")
+            .expect("present");
+        store
+            .accept_attempt(failed_attempt.id, &failed_attempt.lease_token, 60)
+            .await
+            .expect("accept failed attempt");
+        store
+            .finish_attempt(
+                failed_attempt.id,
+                &failed_attempt.lease_token,
+                &completion(scheduler_core::ExecutionOutcome::Failed),
+                vec![4],
+                "v1",
+            )
+            .await
+            .expect("finish failed attempt");
+
+        let successful_attempt = store
+            .create_attempt(run_id, "node-a", 60)
+            .await
+            .expect("successful attempt")
+            .expect("present");
+        store
+            .accept_attempt(successful_attempt.id, &successful_attempt.lease_token, 60)
+            .await
+            .expect("accept successful attempt");
+        store
+            .finish_attempt(
+                successful_attempt.id,
+                &successful_attempt.lease_token,
+                &completion(scheduler_core::ExecutionOutcome::Succeeded),
+                vec![4],
+                "v1",
+            )
+            .await
+            .expect("finish successful attempt");
+
+        let rollup = sqlx::query(
+            "SELECT processed_tasks,succeeded,failed,cancelled FROM node_processing_stats \
+             WHERE agent_id='node-a'",
+        )
+        .fetch_one(store.pool())
+        .await
+        .expect("node processing rollup");
+        assert_eq!(rollup.get::<i64, _>("processed_tasks"), 2);
+        assert_eq!(rollup.get::<i64, _>("succeeded"), 1);
+        assert_eq!(rollup.get::<i64, _>("failed"), 1);
+        assert_eq!(rollup.get::<i64, _>("cancelled"), 0);
     }
 
     #[tokio::test]

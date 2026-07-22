@@ -1295,17 +1295,14 @@ pub async fn list_batch_items(
         .as_deref()
         .map(|key| keyed_text_digest(&state.cipher, "collection-provider-key", key))
         .transpose()?;
-    let rows = sqlx::query(
-        "SELECT id,batch_id,item_index,parameters_digest,state,failure_code,run_id,created_at,updated_at,provider_key_encrypted FROM batch_items WHERE batch_id=? AND (? IS NULL OR provider_key_hmac=?) AND (? IS NULL OR item_index>? OR (item_index=? AND id>?)) ORDER BY item_index,id LIMIT ?",
+    let rows = batch_item_page_rows(
+        state.store.pool(),
+        id,
+        provider_digest.as_deref(),
+        cursor_index,
+        cursor_id.as_deref(),
+        limit as usize,
     )
-    .bind(id.to_string())
-    .bind(&provider_digest)
-    .bind(&provider_digest)
-    .bind(cursor_index)
-    .bind(cursor_index)
-    .bind(&cursor_id)
-    .bind(i64::from(limit + 1))
-    .fetch_all(state.store.pool())
     .await?;
     let has_more = rows.len() > limit as usize;
     let items = rows
@@ -1349,6 +1346,33 @@ pub async fn list_batch_items(
         items,
         next_cursor,
     })?))
+}
+
+pub(crate) async fn batch_item_page_rows(
+    pool: &sqlx::SqlitePool,
+    batch_id: Uuid,
+    provider_digest: Option<&str>,
+    cursor_index: Option<i64>,
+    cursor_id: Option<&str>,
+    limit: usize,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query(
+        "SELECT id,batch_id,item_index,parameters_digest,state,failure_code,run_id,created_at,updated_at,\
+         provider_key_encrypted,encrypted_parameters FROM batch_items WHERE batch_id=? \
+         AND (? IS NULL OR provider_key_hmac=?) \
+         AND (? IS NULL OR item_index>? OR (item_index=? AND id>?)) \
+         ORDER BY item_index,id LIMIT ?",
+    )
+    .bind(batch_id.to_string())
+    .bind(provider_digest)
+    .bind(provider_digest)
+    .bind(cursor_index)
+    .bind(cursor_index)
+    .bind(cursor_index)
+    .bind(cursor_id)
+    .bind((limit + 1) as i64)
+    .fetch_all(pool)
+    .await?)
 }
 
 fn parse_database_time(value: String) -> Result<DateTime<Utc>> {
@@ -1845,6 +1869,44 @@ parameters_schema:
             Some("collection_item_schema_invalid")
         );
         assert_eq!(state.store.queued_runs(10).await.expect("runs").len(), 1);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            "Bearer test-admin-token".parse().expect("authorization"),
+        );
+        let first_page = list_batch_items(
+            State(state.clone()),
+            headers.clone(),
+            Path(created.id),
+            Query(BatchListQuery {
+                limit: Some(1),
+                cursor: None,
+                provider_key: None,
+            }),
+        )
+        .await
+        .expect("first API item page")
+        .0;
+        assert_eq!(first_page["items"].as_array().expect("items").len(), 1);
+        let cursor = first_page["next_cursor"]
+            .as_str()
+            .expect("next cursor")
+            .to_owned();
+        let second_page = list_batch_items(
+            State(state.clone()),
+            headers,
+            Path(created.id),
+            Query(BatchListQuery {
+                limit: Some(1),
+                cursor: Some(cursor),
+                provider_key: None,
+            }),
+        )
+        .await
+        .expect("second API item page")
+        .0;
+        assert_eq!(second_page["items"].as_array().expect("items").len(), 1);
+        assert!(second_page.get("next_cursor").is_none());
         let audit = state
             .store
             .audit_events("batch", &created.id.to_string(), 100)

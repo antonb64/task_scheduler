@@ -11,7 +11,8 @@ use axum::{
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use scheduler_core::{
-    AgentView, ArtifactRef, CronSpec, GlobalSettings, NodeSettings, RunState, RunView, ScheduleSpec,
+    AgentView, ArtifactRef, CronSpec, ExecutionSnapshot, FailureDiagnostic, GlobalSettings,
+    NodeSettings, ParameterBinding, ResolvedScheduleSnapshot, RunState, RunView, ScheduleSpec,
 };
 use scheduler_store::{BatchItemView, BatchView, EditLock, NewSchedule};
 use serde::{Deserialize, Serialize};
@@ -72,7 +73,7 @@ pub fn router(state: AppState) -> Router {
 <title>{{ title }} · Task Scheduler</title>
 <script src="https://unpkg.com/htmx.org@2.0.4"></script>
 <style>
-:root{--ink:#121711;--paper:#f2efe4;--panel:#e4e0d3;--line:#979c88;--acid:#d8ff3e;--amber:#ffb000;--bad:#b92e22;--good:#287a3a}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Aptos Mono","IBM Plex Mono","Courier New",monospace;font-size:14px}header{display:flex;align-items:baseline;gap:28px;padding:14px 22px;border-bottom:3px solid var(--ink);background:var(--ink);color:var(--paper)}header strong{font-size:17px;letter-spacing:.08em;text-transform:uppercase}nav a{color:var(--paper);margin-right:18px;text-decoration:none}nav a:hover{color:var(--acid)}main{max-width:1400px;margin:0 auto;padding:24px}h1{font-size:27px;margin:0 0 22px;text-transform:uppercase;letter-spacing:.04em}h2{font-size:16px;margin:28px 0 10px;text-transform:uppercase}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.metric,.panel{border:1px solid var(--line);background:#faf8ef;padding:15px}.metric b{display:block;font-size:28px;margin-top:8px}table{width:100%;border-collapse:collapse;background:#faf8ef}th,td{text-align:left;padding:9px 10px;border:1px solid var(--line);vertical-align:top}th{background:var(--panel);text-transform:uppercase;font-size:12px}a{color:#2657a5}button,.button{border:1px solid var(--ink);background:var(--ink);color:white;padding:8px 12px;font:inherit;text-decoration:none;cursor:pointer}button:hover,.button:hover{background:var(--acid);color:var(--ink)}button.danger{background:var(--bad)}input,textarea,select{width:100%;padding:9px;border:1px solid var(--line);background:white;font:inherit}textarea{min-height:260px}label{display:block;margin:14px 0 5px;font-weight:bold}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.actions form{display:inline}.badge{display:inline-block;border:1px solid currentColor;padding:2px 6px;text-transform:uppercase;font-size:11px}.good{color:var(--good)}.bad{color:var(--bad)}.muted{color:#5d6255}.notice{border-left:7px solid var(--amber);padding:12px;background:#fff3cf;margin:12px 0}.secret{padding:12px;background:var(--ink);color:var(--acid);overflow-wrap:anywhere}code{font-family:inherit}footer{padding:25px;color:#676b5e;text-align:center}@media(max-width:700px){header{display:block}nav{margin-top:12px}.row{grid-template-columns:1fr}main{padding:14px}th:nth-child(n+5),td:nth-child(n+5){display:none}}
+:root{--ink:#121711;--paper:#f2efe4;--panel:#e4e0d3;--line:#979c88;--acid:#d8ff3e;--amber:#ffb000;--bad:#b92e22;--good:#287a3a}*{box-sizing:border-box}body{margin:0;background:var(--paper);color:var(--ink);font-family:"Aptos Mono","IBM Plex Mono","Courier New",monospace;font-size:14px}header{display:flex;align-items:baseline;gap:28px;padding:14px 22px;border-bottom:3px solid var(--ink);background:var(--ink);color:var(--paper)}header strong{font-size:17px;letter-spacing:.08em;text-transform:uppercase}nav a{color:var(--paper);margin-right:18px;text-decoration:none}nav a:hover{color:var(--acid)}main{max-width:1400px;margin:0 auto;padding:24px}h1{font-size:27px;margin:0 0 22px;text-transform:uppercase;letter-spacing:.04em}h2{font-size:16px;margin:28px 0 10px;text-transform:uppercase}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}.metric,.panel{border:1px solid var(--line);background:#faf8ef;padding:15px}.metric b{display:block;font-size:28px;margin-top:8px}table{width:100%;border-collapse:collapse;background:#faf8ef}th,td{text-align:left;padding:9px 10px;border:1px solid var(--line);vertical-align:top}th{background:var(--panel);text-transform:uppercase;font-size:12px}a{color:#2657a5}button,.button{border:1px solid var(--ink);background:var(--ink);color:white;padding:8px 12px;font:inherit;text-decoration:none;cursor:pointer}button:hover,.button:hover{background:var(--acid);color:var(--ink)}button.danger{background:var(--bad)}input,textarea,select{width:100%;padding:9px;border:1px solid var(--line);background:white;font:inherit}textarea{min-height:260px}label{display:block;margin:14px 0 5px;font-weight:bold}.row{display:grid;grid-template-columns:1fr 1fr;gap:16px}.actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.actions form{display:inline}.badge{display:inline-block;border:1px solid currentColor;padding:2px 6px;text-transform:uppercase;font-size:11px}.good{color:var(--good)}.bad{color:var(--bad)}.muted{color:#5d6255}.notice{border-left:7px solid var(--amber);padding:12px;background:#fff3cf;margin:12px 0}.filter-bar{display:grid;grid-template-columns:minmax(260px,1fr) auto;gap:12px;align-items:end;margin:12px 0 18px;padding:14px;border:1px solid var(--ink);background:var(--panel)}.filter-bar label{margin:0}.diagnostic{border-left:5px solid var(--line);padding-left:9px;line-height:1.45}.diagnostic.bad{border-color:var(--bad)}.failure-strip{border:2px solid var(--bad);background:#fff0e4;padding:14px;margin:14px 0}.failure-strip code{color:var(--bad);font-weight:bold}.parameter-block{margin:0;min-width:320px;max-width:620px;padding:12px;border:1px solid var(--line);background:var(--ink);color:#fff7e9;line-height:1.45;white-space:pre-wrap;overflow-wrap:anywhere}.debug-strip{border:3px solid var(--bad);background:#ffe3ce;padding:14px;margin:14px 0}.debug-strip strong{color:var(--bad)}.mode-toggle{display:flex;gap:8px;align-items:center;margin:0}.mode-toggle input{width:auto}.error-panel{max-width:960px;border:2px solid var(--bad);background:#fff8f0;padding:20px;box-shadow:8px 8px 0 var(--ink)}.error-label{display:inline-block;margin-bottom:16px;padding:3px 7px;background:var(--bad);color:white;font-size:11px;font-weight:bold;letter-spacing:.08em;text-transform:uppercase}.error-panel h1{margin-bottom:10px}.error-detail{margin:20px 0;padding:16px;border-left:7px solid var(--bad);background:var(--ink);color:#fff7e9;line-height:1.55;overflow-wrap:anywhere;white-space:pre-wrap}.error-meta{padding-top:12px;border-top:1px solid var(--line);color:#5d6255}.secret{padding:12px;background:var(--ink);color:var(--acid);overflow-wrap:anywhere}code{font-family:inherit}footer{padding:25px;color:#676b5e;text-align:center}@media(max-width:700px){header{display:block}nav{margin-top:12px}.row,.filter-bar{grid-template-columns:1fr}main{padding:14px}.parameter-block{min-width:220px}.error-panel{padding:15px;box-shadow:5px 5px 0 var(--ink)}th:nth-child(n+5),td:nth-child(n+5){display:none}}
 </style></head><body><header><strong>Task Control / {{ node_name }}</strong><nav><a href="/">Overview</a><a href="/schedules">Schedules</a><a href="/batches">Batches</a><a href="/runs">Runs</a><a href="/blueprints">Blueprints</a><a href="/nodes">Nodes</a><a href="/settings/global">Settings</a></nav><form method="get" action="/search" class="actions" style="margin-left:auto"><input aria-label="Search by ID" name="q" minlength="8" placeholder="ID or digest" required><button type="submit">Search</button></form><form method="post" action="/logout"><input type="hidden" name="csrf" value="{{ csrf }}"><button type="submit">Sign out</button></form></header><main>{{ content|safe }}</main><footer>Single coordinator authority · at-least-once delivery</footer></body></html>"##,
     ext = "html"
 )]
@@ -171,6 +172,7 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         )
         .fetch_one(state.store.pool())
         .await?;
+        let node_processing = node_processing_statistics(state.store.pool()).await?;
         Ok::<_, anyhow::Error>((
             schedules,
             agents,
@@ -180,6 +182,7 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
             active_batches,
             recent_failures,
             quarantined,
+            node_processing,
         ))
     }
     .await;
@@ -192,6 +195,7 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         active_batches,
         recent_failures,
         quarantined,
+        node_processing,
     ) = match result {
         Ok(data) => data,
         Err(error) => return error_page(&session.csrf, &error),
@@ -279,12 +283,69 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
             }
         }
     }
+    let mut node_rows = String::new();
+    for agent in &agents {
+        let stats = node_processing.get(&agent.id).cloned().unwrap_or_default();
+        node_rows.push_str(&node_processing_row(agent, &stats));
+    }
     let content = format!(
-        r#"<div class="actions"><h1 style="margin-right:auto">Cluster overview</h1><a class="button" href="/dashboard/edit">Customize</a></div><div class="grid"><div class="metric">Schedules<b>{}</b></div><div class="metric">Queued<b>{queued}</b></div><div class="metric">Running<b>{running}</b></div>{metrics}</div><h2>Selected schedule health</h2><div class="grid">{schedule_cards}</div><h2>System posture</h2><div class="panel"><p><span class="badge good">Coordinator authoritative</span> Durable SQLite state and leased delivery are active.</p><p class="muted">Dashboard settings revision r{} is shared through every node UI.</p></div>"#,
+        r#"<div class="actions"><h1 style="margin-right:auto">Cluster overview</h1><a class="button" href="/dashboard/edit">Customize</a></div><div class="grid"><div class="metric">Schedules<b>{}</b></div><div class="metric">Queued<b>{queued}</b></div><div class="metric">Running<b>{running}</b></div>{metrics}</div><h2>Node throughput · lifetime</h2><div class="panel"><p class="muted">Processed tasks count completed execution attempts. A retry is additional work and counts again on the node that handled it.</p><table><thead><tr><th>Node</th><th>Connection</th><th>Active slots</th><th>Tasks processed</th><th>Outcomes</th><th>Last processed</th></tr></thead><tbody>{node_rows}</tbody></table></div><h2>Selected schedule health</h2><div class="grid">{schedule_cards}</div><h2>System posture</h2><div class="panel"><p><span class="badge good">Coordinator authoritative</span> Durable SQLite state and leased delivery are active.</p><p class="muted">Dashboard settings revision r{} is shared through every node UI.</p></div>"#,
         schedules.len(),
         dashboard.revision,
     );
     page("Overview", &session.csrf, &content)
+}
+
+#[derive(Debug, Clone, Default)]
+struct NodeProcessingStatistics {
+    processed_tasks: i64,
+    succeeded: i64,
+    failed: i64,
+    cancelled: i64,
+    last_processed_at: Option<String>,
+}
+
+fn node_processing_row(agent: &AgentView, stats: &NodeProcessingStatistics) -> String {
+    format!(
+        r#"<tr><td><a href="/nodes/{}"><code>{}</code></a><br><span class="muted">{}</span></td><td><span class="badge {}">{}</span></td><td>{}/{}</td><td><strong>{}</strong></td><td><span class="good">{}</span> succeeded<br><span class="bad">{}</span> failed · {} cancelled</td><td>{}</td></tr>"#,
+        esc(&agent.id),
+        esc(&agent.id),
+        esc(&agent.hostname),
+        if agent.connected { "good" } else { "bad" },
+        if agent.connected { "online" } else { "offline" },
+        agent.running,
+        agent.capacity,
+        stats.processed_tasks,
+        stats.succeeded,
+        stats.failed,
+        stats.cancelled,
+        esc(stats.last_processed_at.as_deref().unwrap_or("never")),
+    )
+}
+
+async fn node_processing_statistics(
+    pool: &sqlx::SqlitePool,
+) -> anyhow::Result<BTreeMap<String, NodeProcessingStatistics>> {
+    let rows = sqlx::query(
+        "SELECT agent_id,processed_tasks,succeeded,failed,cancelled,last_processed_at \
+         FROM node_processing_stats ORDER BY agent_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok((
+                row.try_get("agent_id")?,
+                NodeProcessingStatistics {
+                    processed_tasks: row.try_get("processed_tasks")?,
+                    succeeded: row.try_get("succeeded")?,
+                    failed: row.try_get("failed")?,
+                    cancelled: row.try_get("cancelled")?,
+                    last_processed_at: row.try_get("last_processed_at")?,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone)]
@@ -1214,6 +1275,137 @@ struct BatchPageQuery {
     cursor: Option<String>,
     limit: Option<usize>,
     provider_key: Option<String>,
+    #[serde(default)]
+    debug: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct BatchSeedForUi {
+    resolved: ResolvedScheduleSnapshot,
+}
+
+#[derive(Debug)]
+struct ParameterVisibility {
+    sensitive_paths: Vec<String>,
+    bindings: BTreeMap<String, ParameterBinding>,
+}
+
+impl ParameterVisibility {
+    fn from_resolved(resolved: &ResolvedScheduleSnapshot) -> Self {
+        Self {
+            sensitive_paths: scheduler_core::sensitive_parameter_paths(
+                &resolved.blueprint.parameters_schema,
+                &resolved.blueprint.parameter_bindings,
+            ),
+            bindings: resolved.blueprint.parameter_bindings.clone(),
+        }
+    }
+
+    fn from_execution(snapshot: &ExecutionSnapshot) -> Self {
+        let bindings = snapshot
+            .late_bindings
+            .as_ref()
+            .map(|late| late.bindings.clone())
+            .unwrap_or_default();
+        let sensitive_paths = if snapshot.sensitive_parameter_paths.is_empty() {
+            snapshot
+                .late_bindings
+                .as_ref()
+                .map(|late| {
+                    scheduler_core::sensitive_parameter_paths(&late.parameters_schema, &bindings)
+                })
+                .unwrap_or_default()
+        } else {
+            snapshot.sensitive_parameter_paths.clone()
+        };
+        Self {
+            sensitive_paths,
+            bindings,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct BatchDetailData {
+    view: BatchView,
+    parameter_visibility: Option<ParameterVisibility>,
+}
+
+#[derive(Debug)]
+struct BatchItemUiView {
+    item: BatchItemView,
+    parameters: Option<serde_json::Value>,
+}
+
+fn collection_failure_location(code: &str) -> &'static str {
+    if code.contains("item")
+        || matches!(
+            code,
+            "collection_duplicate_key"
+                | "collection_conflicting_duplicate_key"
+                | "collection_input_poisoned"
+        )
+    {
+        "coordinator / collection item validation"
+    } else if code.contains("commit") || code.contains("finalization") {
+        "coordinator / collection persistence"
+    } else {
+        "coordinator / collection ingestion"
+    }
+}
+
+fn collection_failure_summary(code: &str) -> &'static str {
+    match code {
+        "collection_file_not_allowed" => {
+            "The collection file is outside the coordinator's allowed artifact roots."
+        }
+        "collection_source_unavailable" => "The coordinator could not read the collection source.",
+        "collection_source_timeout" | "collection_connector_timeout" => {
+            "The collection source did not respond before its timeout."
+        }
+        "collection_source_transport" | "collection_connector_transport" => {
+            "The coordinator could not establish or complete the source connection."
+        }
+        "collection_document_invalid" | "collection_ndjson_line_invalid" => {
+            "The source is not a valid supported JSON or NDJSON collection document."
+        }
+        "collection_snapshot_drift" => "The source changed while this batch was being ingested.",
+        "collection_cursor_invalid" | "collection_cursor_cycle" => {
+            "The paginated source returned an invalid or repeated cursor."
+        }
+        "collection_item_schema_invalid" => {
+            "The merged parameters do not satisfy the blueprint parameter schema."
+        }
+        "collection_item_render_failed" => {
+            "The item could not be rendered into an executable task snapshot."
+        }
+        "collection_item_invalid_shape" => "The collection entry is not a valid item object.",
+        "collection_item_missing_key" | "collection_item_invalid_key" => {
+            "The collection entry has no valid stable provider key."
+        }
+        "collection_item_invalid_parameters" | "collection_item_merge_failed" => {
+            "The item's parameters are invalid or could not be merged with the base parameters."
+        }
+        "collection_duplicate_key" | "collection_conflicting_duplicate_key" => {
+            "The source returned the same provider key with conflicting parameters."
+        }
+        "collection_input_poisoned" => {
+            "The same ambiguous failure was reproduced on enough healthy nodes to quarantine this input."
+        }
+        _ => "The collection worker reported this safe failure code while processing the batch.",
+    }
+}
+
+fn collection_failure_panel(code: Option<&str>) -> String {
+    code.map(|code| {
+        format!(
+            r#"<div class="failure-strip"><strong>What went wrong</strong><br><code>{}</code> — {}<br><strong>Where</strong><br>{}</div>"#,
+            esc(code),
+            esc(collection_failure_summary(code)),
+            esc(collection_failure_location(code)),
+        )
+    })
+    .unwrap_or_default()
 }
 
 async fn batches(
@@ -1241,8 +1433,19 @@ async fn batches(
         } else {
             ""
         };
+        let failure = batch.failure_code.as_deref().map_or_else(
+            || "—".into(),
+            |code| {
+                format!(
+                    r#"<div class="diagnostic bad"><code>{}</code><br><strong>{}</strong><br><span class="muted">{}</span></div>"#,
+                    esc(code),
+                    esc(collection_failure_location(code)),
+                    esc(collection_failure_summary(code)),
+                )
+            },
+        );
         rows.push_str(&format!(
-            r#"<tr><td><a href="/batches/{}"><code>{}</code></a></td><td><a href="/schedules/{}/edit"><code>{}</code></a><br>r{}</td><td><span class="badge {}">{}</span></td><td>{}</td><td>{} total · {} valid · {} invalid · {} poisoned · {} held</td><td>{}</td></tr>"#,
+            r#"<tr><td><a href="/batches/{}"><code>{}</code></a></td><td><a href="/schedules/{}/edit"><code>{}</code></a><br>r{}</td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{} total · {} valid · {} invalid · {} poisoned · {} held</td><td>{}</td></tr>"#,
             batch.id,
             &batch.id.to_string()[..8],
             batch.schedule_id,
@@ -1250,6 +1453,7 @@ async fn batches(
             batch.schedule_revision,
             class,
             esc(&state_name),
+            failure,
             esc(&batch.trigger_kind),
             batch.item_count,
             batch.valid_item_count,
@@ -1263,9 +1467,137 @@ async fn batches(
         "Batches",
         &session.csrf,
         &format!(
-            r#"<h1>Parameter collection batches</h1><table><thead><tr><th>Batch</th><th>Schedule revision</th><th>State</th><th>Trigger</th><th>Items</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
+            r#"<h1>Parameter collection batches</h1><table><thead><tr><th>Batch</th><th>Schedule revision</th><th>State</th><th>What went wrong / where</th><th>Trigger</th><th>Items</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
             pagination_controls("/batches", &page_data)
         ),
+    )
+}
+
+async fn load_batch_detail(state: &AppState, id: Uuid) -> anyhow::Result<Option<BatchDetailData>> {
+    // The detail page needs the stable batch view and its immutable seed only.
+    // Avoid decoding operational lease/cursor fields so stale worker metadata
+    // cannot make an otherwise inspectable batch fail to open.
+    let row = sqlx::query(
+        "SELECT id,schedule_id,schedule_revision,state,trigger_kind,scheduled_at,item_count,\
+         valid_item_count,invalid_item_count,poisoned_item_count,held_item_count,failure_code,\
+         created_at,updated_at,encrypted_snapshot FROM batches WHERE id=?",
+    )
+    .bind(id.to_string())
+    .fetch_optional(state.store.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let encrypted_seed: Vec<u8> = row.try_get("encrypted_snapshot")?;
+    let view = batch_view_from_ui_row(row)?;
+    let parameter_visibility = state
+        .cipher
+        .decrypt(&encrypted_seed)
+        .ok()
+        .and_then(|plaintext| serde_json::from_slice::<BatchSeedForUi>(&plaintext).ok())
+        .map(|seed| ParameterVisibility::from_resolved(&seed.resolved));
+    Ok(Some(BatchDetailData {
+        view,
+        parameter_visibility,
+    }))
+}
+
+fn parameter_document(
+    parameters: &serde_json::Value,
+    visibility: &ParameterVisibility,
+    debug: bool,
+) -> serde_json::Value {
+    let mut displayed = parameters.clone();
+    if let Some(object) = displayed.as_object_mut() {
+        for (name, binding) in &visibility.bindings {
+            object.entry(name.clone()).or_insert_with(|| {
+                if binding.sensitive {
+                    serde_json::Value::String(if debug {
+                        "<agent-local secret is not persisted by the coordinator>".into()
+                    } else {
+                        "<redacted: agent-local secret>".into()
+                    })
+                } else {
+                    serde_json::Value::String(
+                        "<agent-local value is not persisted by the coordinator>".into(),
+                    )
+                }
+            });
+        }
+    }
+    if !debug {
+        for path in &visibility.sensitive_paths {
+            if let Some(value) = displayed.pointer_mut(path) {
+                *value =
+                    serde_json::Value::String("<redacted: enable debug mode to reveal>".into());
+            }
+        }
+    }
+    displayed
+}
+
+fn parameter_block(
+    parameters: Option<&serde_json::Value>,
+    visibility: Option<&ParameterVisibility>,
+    debug: bool,
+) -> String {
+    let Some(parameters) = parameters else {
+        return r#"<span class="muted">Parameter snapshot unavailable</span>"#.into();
+    };
+    let Some(visibility) = visibility else {
+        return r#"<span class="muted">Parameter visibility metadata unavailable; values hidden</span>"#.into();
+    };
+    let displayed = parameter_document(parameters, visibility, debug);
+    let json = serde_json::to_string_pretty(&displayed)
+        .unwrap_or_else(|_| "<parameter serialization failed>".into());
+    format!(r#"<pre class="parameter-block">{}</pre>"#, esc(&json))
+}
+
+fn debug_mode_notice(debug: bool) -> String {
+    if debug {
+        r#"<div class="debug-strip" role="alert"><strong>Debug mode is active.</strong> Stored secret parameter values are visible on this page. Agent-local secrets are marked unavailable because they never leave the executing node. Do not copy, share, or capture this screen.</div>"#.into()
+    } else {
+        r#"<div class="notice">Exact execution parameters are shown below. Properties marked <code>writeOnly: true</code> and sensitive agent bindings are redacted until debug mode is explicitly enabled.</div>"#.into()
+    }
+}
+
+fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        "no-store, max-age=0".parse().expect("static cache policy"),
+    );
+    response
+}
+
+fn batch_pagination_controls(
+    path: &str,
+    page: &Page<impl Sized>,
+    query: &BatchPageQuery,
+) -> String {
+    let Some(cursor) = page.next_cursor.as_ref() else {
+        return format!(
+            r#"<p class="muted">End of results · showing up to {} rows per page</p>"#,
+            page.limit
+        );
+    };
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("cursor", cursor);
+    serializer.append_pair("limit", &page.limit.to_string());
+    if let Some(provider_key) = query
+        .provider_key
+        .as_deref()
+        .filter(|value| !value.is_empty())
+    {
+        serializer.append_pair("provider_key", provider_key);
+    }
+    if query.debug {
+        serializer.append_pair("debug", "true");
+    }
+    format!(
+        r#"<nav class="actions" aria-label="Pagination"><a class="button" href="{}?{}">Next page</a><span class="muted">Showing up to {} rows</span></nav>"#,
+        path,
+        esc(&serializer.finish()),
+        page.limit,
     )
 }
 
@@ -1278,7 +1610,14 @@ async fn batch_detail(
     let Some(session) = state.auth.session(&headers).await else {
         return Redirect::to("/login").into_response();
     };
-    let batch = match state.store.get_batch(id).await {
+    if query.debug {
+        tracing::warn!(
+            batch_id = %id,
+            session_id = %session.id,
+            "administrator opened batch parameters in debug mode"
+        );
+    }
+    let batch = match load_batch_detail(&state, id).await {
         Ok(Some(batch)) => batch,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(error) => return error_page(&session.csrf, &error),
@@ -1288,7 +1627,8 @@ async fn batch_detail(
         Err(error) => return error_page(&session.csrf, &error),
     };
     let mut rows = String::new();
-    for item in &page_data.items {
+    for item_data in &page_data.items {
+        let item = &item_data.item;
         let item_state = serde_json::to_value(item.state)
             .ok()
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
@@ -1297,18 +1637,40 @@ async fn batch_detail(
             || "—".into(),
             |run| {
                 format!(
-                    r#"<a href="/runs/{run}"><code>{}</code></a>"#,
+                    r#"<a href="/runs/{run}{}"><code>{}</code></a>"#,
+                    if query.debug { "?debug=true" } else { "" },
                     &run.to_string()[..8]
                 )
             },
         );
+        let (failure_location, failure_summary) = item.failure_code.as_deref().map_or_else(
+            || {
+                if item_state == "failed" && item.run_id.is_some() {
+                    (
+                        "selected node / task execution",
+                        "Open the linked run for its exact origin, lifecycle stage, status, and summary.",
+                    )
+                } else {
+                    ("—", "—")
+                }
+            },
+            |code| (collection_failure_location(code), collection_failure_summary(code)),
+        );
+        let parameters = parameter_block(
+            item_data.parameters.as_ref(),
+            batch.parameter_visibility.as_ref(),
+            query.debug,
+        );
         rows.push_str(&format!(
-            r#"<tr><td>{}</td><td><code>{}</code></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            r#"<tr><td>{}</td><td><code>{}</code></td><td><span class="badge {}">{}</span></td><td>{}</td><td><code>{}</code><br><strong>{}</strong><br><span class="muted">{}</span></td><td>{}</td><td>{}</td></tr>"#,
             item.item_index,
             &item.id.to_string()[..8],
             if item_state == "succeeded" { "good" } else if matches!(item_state.as_str(), "failed" | "invalid" | "poisoned" | "held") { "bad" } else { "" },
             esc(&item_state),
+            parameters,
             esc(item.failure_code.as_deref().unwrap_or("—")),
+            esc(failure_location),
+            esc(failure_summary),
             run,
             item.updated_at,
         ));
@@ -1317,11 +1679,18 @@ async fn batch_detail(
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown".into());
-    page(
+    let batch_failure = collection_failure_panel(batch.view.failure_code.as_deref());
+    let debug_notice = debug_mode_notice(query.debug);
+    let visibility_warning = if batch.parameter_visibility.is_none() {
+        r#"<div class="failure-strip"><strong>Parameter visibility metadata could not be decoded.</strong><br>Batch metadata and execution links remain available; parameter values are hidden to avoid an accidental secret disclosure.</div>"#
+    } else {
+        ""
+    };
+    let response = page(
         &format!("Batch {id}"),
         &session.csrf,
         &format!(
-            r#"<div class="actions"><h1 style="margin-right:auto">Batch <code>{id}</code></h1><form method="post" action="/ui/batches/{id}/cancel"><input type="hidden" name="csrf" value="{}"><button class="danger">Cancel batch</button></form><form method="post" action="/ui/batches/{id}/retrigger"><input type="hidden" name="csrf" value="{}"><button>Retrigger</button></form></div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Items<b>{}</b></div><div class="metric">Valid / invalid<b>{}/{}</b></div><div class="metric">Poisoned / held<b>{}/{}</b></div></div><div class="notice">Failure code: <code>{}</code>. Provider keys and parameter values are excluded from this page; exact provider-key lookup is authenticated and returns item metadata only.</div><form method="get"><label>Exact provider key<input name="provider_key" value="{}"></label><button>Find item</button></form><h2>Items</h2><table><thead><tr><th>Index</th><th>Item ID</th><th>State</th><th>Safe failure code</th><th>Run</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
+            r#"<div class="actions"><h1 style="margin-right:auto">Batch <code>{id}</code></h1><form method="post" action="/ui/batches/{id}/cancel"><input type="hidden" name="csrf" value="{}"><button class="danger">Cancel batch</button></form><form method="post" action="/ui/batches/{id}/retrigger"><input type="hidden" name="csrf" value="{}"><button>Retrigger</button></form></div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Items<b>{}</b></div><div class="metric">Valid / invalid<b>{}/{}</b></div><div class="metric">Poisoned / held<b>{}/{}</b></div></div>{batch_failure}{debug_notice}{visibility_warning}<form class="filter-bar" method="get"><label>Exact provider key<input name="provider_key" value="{}"></label><label class="mode-toggle"><input type="checkbox" name="debug" value="true" {}> Reveal stored secret values</label><button>Apply view</button></form><h2>Item executions</h2><table><thead><tr><th>Index</th><th>Item ID</th><th>State</th><th>Exact parameters</th><th>Failure code / where</th><th>Run</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
             esc(&session.csrf),
             esc(&session.csrf),
             esc(&state_name),
@@ -1330,16 +1699,12 @@ async fn batch_detail(
             batch.view.invalid_item_count,
             batch.view.poisoned_item_count,
             batch.view.held_item_count,
-            esc(batch.view.failure_code.as_deref().unwrap_or("none")),
             esc(query.provider_key.as_deref().unwrap_or("")),
-            pagination_controls_with_filter(
-                &format!("/batches/{id}"),
-                &page_data,
-                "provider_key",
-                query.provider_key.as_deref(),
-            ),
+            if query.debug { "checked" } else { "" },
+            batch_pagination_controls(&format!("/batches/{id}"), &page_data, &query),
         ),
-    )
+    );
+    no_store(response)
 }
 
 async fn paged_batches(
@@ -1423,7 +1788,7 @@ async fn paged_batch_items(
     state: &AppState,
     batch_id: Uuid,
     query: &BatchPageQuery,
-) -> anyhow::Result<Page<BatchItemView>> {
+) -> anyhow::Result<Page<BatchItemUiView>> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_PAGE_SIZE)
@@ -1452,24 +1817,27 @@ async fn paged_batch_items(
         .transpose()?;
     let item_index = cursor.as_ref().map(|cursor| i64::from(cursor.item_index));
     let cursor_id = cursor.as_ref().map(|cursor| cursor.id.as_str());
-    let rows = sqlx::query(
-        "SELECT id,batch_id,item_index,parameters_digest,state,failure_code,run_id,created_at,updated_at \
-         FROM batch_items WHERE batch_id=? AND (? IS NULL OR provider_key_hmac=?) \
-         AND (? IS NULL OR item_index>? OR (item_index=? AND id>?)) \
-         ORDER BY item_index,id LIMIT ?",
+    let rows = crate::collection_runtime::batch_item_page_rows(
+        state.store.pool(),
+        batch_id,
+        provider_digest.as_deref(),
+        item_index,
+        cursor_id,
+        limit,
     )
-    .bind(batch_id.to_string())
-    .bind(&provider_digest)
-    .bind(&provider_digest)
-    .bind(item_index)
-    .bind(item_index)
-    .bind(cursor_id)
-    .bind((limit + 1) as i64)
-    .fetch_all(state.store.pool())
     .await?;
     let mut items = rows
         .into_iter()
-        .map(batch_item_view_from_ui_row)
+        .map(|row| {
+            let encrypted_parameters: Vec<u8> = row.try_get("encrypted_parameters")?;
+            let item = batch_item_view_from_ui_row(row)?;
+            let parameters = state
+                .cipher
+                .decrypt(&encrypted_parameters)
+                .ok()
+                .and_then(|plaintext| serde_json::from_slice(&plaintext).ok());
+            Ok(BatchItemUiView { item, parameters })
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     let has_more = items.len() > limit;
     if has_more {
@@ -1480,8 +1848,8 @@ async fn paged_batch_items(
             .last()
             .map(|item| {
                 encode_batch_item_cursor(&BatchItemUiCursor {
-                    item_index: item.item_index,
-                    id: item.id.to_string(),
+                    item_index: item.item.item_index,
+                    id: item.item.id.to_string(),
                 })
             })
             .transpose()?
@@ -1588,32 +1956,117 @@ async fn retrigger_batch(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct RunPageQuery {
+    cursor: Option<String>,
+    limit: Option<usize>,
+    schedule_id: Option<Uuid>,
+}
+
+#[derive(Debug)]
+struct RunListItem {
+    run: RunView,
+    schedule_name: String,
+    latest_diagnostic: Option<FailureDiagnostic>,
+}
+
 async fn runs(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<PageQuery>,
+    Query(query): Query<RunPageQuery>,
 ) -> Response {
     let Some(session) = state.auth.session(&headers).await else {
         return Redirect::to("/login").into_response();
     };
-    match paged_runs(&state, &query).await {
-        Ok(page_data) => {
+    let result = async {
+        let schedules = state.store.list_schedules().await?;
+        if let Some(schedule_id) = query.schedule_id
+            && !schedules.iter().any(|schedule| schedule.id == schedule_id)
+        {
+            anyhow::bail!("selected run-filter schedule does not exist");
+        }
+        Ok::<_, anyhow::Error>((paged_runs(state.store.pool(), &query).await?, schedules))
+    }
+    .await;
+    match result {
+        Ok((page_data, schedules)) => {
             let mut rows = String::new();
             for item in &page_data.items {
-                let state_name = item.state.as_str();
-                rows.push_str(&format!(r#"<tr><td><a href="/runs/{}"><code>{}</code></a></td><td>{}</td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td></tr>"#, item.id, &item.id.to_string()[..8], item.trigger_kind, if state_name == "succeeded" {"good"} else if state_name == "failed" {"bad"} else {""}, state_name, item.scheduled_at, item.attempt_count, item.updated_at));
+                rows.push_str(&run_list_row(item));
             }
+            let mut schedule_options = String::from(r#"<option value="">All schedules</option>"#);
+            for schedule in schedules {
+                schedule_options.push_str(&format!(
+                    r#"<option value="{}" {}>{}</option>"#,
+                    schedule.id,
+                    if query.schedule_id == Some(schedule.id) {
+                        "selected"
+                    } else {
+                        ""
+                    },
+                    esc(&schedule.spec.name),
+                ));
+            }
+            let selected_schedule = query.schedule_id.map(|id| id.to_string());
             page(
                 "Runs",
                 &session.csrf,
                 &format!(
-                    r#"<h1>Runs</h1><table><thead><tr><th>Run</th><th>Trigger</th><th>State</th><th>Scheduled</th><th>Attempts</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
-                    pagination_controls("/runs", &page_data)
+                    r#"<h1>Runs</h1><form class="filter-bar" method="get" action="/runs"><label>Filter by schedule<select name="schedule_id">{schedule_options}</select></label><button type="submit">Apply filter</button></form><table><thead><tr><th>Run</th><th>Schedule</th><th>State</th><th>What went wrong / where</th><th>Trigger</th><th>Scheduled</th><th>Attempts</th><th>Updated</th></tr></thead><tbody>{rows}</tbody></table>{}"#,
+                    pagination_controls_with_filter(
+                        "/runs",
+                        &page_data,
+                        "schedule_id",
+                        selected_schedule.as_deref(),
+                    )
                 ),
             )
         }
         Err(error) => error_page(&session.csrf, &error),
     }
+}
+
+fn run_list_row(item: &RunListItem) -> String {
+    let state_name = item.run.state.as_str();
+    let diagnostic = item.latest_diagnostic.as_ref().map_or_else(
+        || {
+            if item.run.state == RunState::Failed {
+                r#"<div class="diagnostic bad"><strong>No structured diagnosis recorded</strong><br><span class="muted">Open the run audit trail for lifecycle events.</span></div>"#.into()
+            } else {
+                "—".into()
+            }
+        },
+        |diagnostic| {
+            format!(
+                r#"<div class="diagnostic bad"><code>{}</code><br><strong>{} / {}</strong><br><span class="muted">{}</span></div>"#,
+                esc(&json_enum_name(diagnostic.code)),
+                esc(&json_enum_name(diagnostic.origin)),
+                esc(&json_enum_name(diagnostic.stage)),
+                esc(&diagnostic.summary),
+            )
+        },
+    );
+    format!(
+        r#"<tr><td><a href="/runs/{}"><code>{}</code></a></td><td><a href="/schedules/{}/edit">{}</a><br><code>{}</code></td><td><span class="badge {}">{}</span></td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+        item.run.id,
+        &item.run.id.to_string()[..8],
+        item.run.schedule_id,
+        esc(&item.schedule_name),
+        &item.run.schedule_id.to_string()[..8],
+        if state_name == "succeeded" {
+            "good"
+        } else if state_name == "failed" {
+            "bad"
+        } else {
+            ""
+        },
+        state_name,
+        diagnostic,
+        esc(&item.run.trigger_kind),
+        item.run.scheduled_at,
+        item.run.attempt_count,
+        item.run.updated_at,
+    )
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1622,7 +2075,10 @@ struct RunCursor {
     id: String,
 }
 
-async fn paged_runs(state: &AppState, query: &PageQuery) -> anyhow::Result<Page<RunView>> {
+async fn paged_runs(
+    pool: &sqlx::SqlitePool,
+    query: &RunPageQuery,
+) -> anyhow::Result<Page<RunListItem>> {
     let limit = query
         .limit
         .unwrap_or(DEFAULT_PAGE_SIZE)
@@ -1630,19 +2086,40 @@ async fn paged_runs(state: &AppState, query: &PageQuery) -> anyhow::Result<Page<
     let cursor = query.cursor.as_deref().map(decode_run_cursor).transpose()?;
     let cursor_created_at = cursor.as_ref().map(|cursor| cursor.created_at.as_str());
     let cursor_id = cursor.as_ref().map(|cursor| cursor.id.as_str());
-    let rows = sqlx::query(
-        "SELECT id,schedule_id,state,trigger_kind,scheduled_at,attempt_count,created_at,updated_at FROM runs WHERE (? IS NULL OR created_at < ? OR (created_at = ? AND id < ?)) ORDER BY created_at DESC,id DESC LIMIT ?",
-    )
-    .bind(cursor_created_at)
-    .bind(cursor_created_at)
-    .bind(cursor_created_at)
-    .bind(cursor_id)
-    .bind((limit + 1) as i64)
-    .fetch_all(state.store.pool())
-    .await?;
+    let select = "SELECT r.id,r.schedule_id,r.state,r.trigger_kind,r.scheduled_at,r.attempt_count,\
+        r.created_at,r.updated_at,json_extract(s.spec_json,'$.name') AS schedule_name,\
+        (SELECT a.diagnostic_json FROM attempts a WHERE a.run_id=r.id \
+         ORDER BY a.attempt_number DESC,a.created_at DESC,a.id DESC LIMIT 1) AS latest_diagnostic_json \
+        FROM runs r JOIN schedules s ON s.id=r.schedule_id";
+    let rows = if let Some(schedule_id) = query.schedule_id {
+        sqlx::query(&format!(
+            "{select} WHERE r.schedule_id=? AND (? IS NULL OR r.created_at < ? OR (r.created_at = ? AND r.id < ?)) \
+             ORDER BY r.created_at DESC,r.id DESC LIMIT ?"
+        ))
+        .bind(schedule_id.to_string())
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_id)
+        .bind((limit + 1) as i64)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query(&format!(
+            "{select} WHERE (? IS NULL OR r.created_at < ? OR (r.created_at = ? AND r.id < ?)) \
+             ORDER BY r.created_at DESC,r.id DESC LIMIT ?"
+        ))
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_created_at)
+        .bind(cursor_id)
+        .bind((limit + 1) as i64)
+        .fetch_all(pool)
+        .await?
+    };
     let mut items = rows
         .into_iter()
-        .map(run_view_from_ui_row)
+        .map(run_list_item_from_ui_row)
         .collect::<anyhow::Result<Vec<_>>>()?;
     let has_more = items.len() > limit;
     if has_more {
@@ -1651,12 +2128,13 @@ async fn paged_runs(state: &AppState, query: &PageQuery) -> anyhow::Result<Page<
     let next_cursor = if has_more {
         items
             .last()
-            .map(|run| {
+            .map(|item| {
                 encode_run_cursor(&RunCursor {
-                    created_at: run
+                    created_at: item
+                        .run
                         .created_at
                         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-                    id: run.id.to_string(),
+                    id: item.run.id.to_string(),
                 })
             })
             .transpose()?
@@ -1667,6 +2145,19 @@ async fn paged_runs(state: &AppState, query: &PageQuery) -> anyhow::Result<Page<
         items,
         next_cursor,
         limit,
+    })
+}
+
+fn run_list_item_from_ui_row(row: sqlx::sqlite::SqliteRow) -> anyhow::Result<RunListItem> {
+    let schedule_name = row.try_get("schedule_name")?;
+    let latest_diagnostic = row
+        .try_get::<Option<String>, _>("latest_diagnostic_json")?
+        .map(|value| serde_json::from_str(&value))
+        .transpose()?;
+    Ok(RunListItem {
+        run: run_view_from_ui_row(row)?,
+        schedule_name,
+        latest_diagnostic,
     })
 }
 
@@ -1711,30 +2202,103 @@ fn decode_run_cursor(cursor: &str) -> anyhow::Result<RunCursor> {
     Ok(cursor)
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct ExecutionDetailQuery {
+    #[serde(default)]
+    debug: bool,
+}
+
+async fn captured_run_parameters(
+    state: &AppState,
+    run_id: Uuid,
+    snapshot: &ExecutionSnapshot,
+) -> anyhow::Result<CapturedRunParameters> {
+    if let Some(parameters) = snapshot.parameters.clone().or_else(|| {
+        snapshot
+            .late_bindings
+            .as_ref()
+            .map(|late| late.parameters.clone())
+    }) {
+        return Ok(CapturedRunParameters {
+            parameters: Some(parameters),
+            visibility: Some(ParameterVisibility::from_execution(snapshot)),
+        });
+    }
+    // Collection items have always stored the final parameter document, so it
+    // can backfill the UI for child runs created before ExecutionSnapshot began
+    // capturing parameters directly.
+    let row = sqlx::query(
+        "SELECT i.encrypted_parameters,b.encrypted_snapshot AS encrypted_batch_snapshot \
+         FROM batch_items i JOIN batches b ON b.id=i.batch_id WHERE i.run_id=? LIMIT 1",
+    )
+    .bind(run_id.to_string())
+    .fetch_optional(state.store.pool())
+    .await?;
+    let Some(row) = row else {
+        return Ok(CapturedRunParameters {
+            parameters: None,
+            visibility: Some(ParameterVisibility::from_execution(snapshot)),
+        });
+    };
+    let encrypted_parameters: Vec<u8> = row.try_get("encrypted_parameters")?;
+    let encrypted_batch_snapshot: Vec<u8> = row.try_get("encrypted_batch_snapshot")?;
+    let parameters = serde_json::from_slice(&state.cipher.decrypt(&encrypted_parameters)?)?;
+    let visibility = state
+        .cipher
+        .decrypt(&encrypted_batch_snapshot)
+        .ok()
+        .and_then(|plaintext| serde_json::from_slice::<BatchSeedForUi>(&plaintext).ok())
+        .map(|seed| ParameterVisibility::from_resolved(&seed.resolved));
+    Ok(CapturedRunParameters {
+        parameters: Some(parameters),
+        visibility,
+    })
+}
+
+#[derive(Debug)]
+struct CapturedRunParameters {
+    parameters: Option<serde_json::Value>,
+    visibility: Option<ParameterVisibility>,
+}
+
+fn run_schedule_backlink(schedule_id: Uuid) -> String {
+    format!(r#"<a class="button" href="/schedules/{schedule_id}/edit">&larr; Back to schedule</a>"#)
+}
+
 async fn run_detail(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<Uuid>,
+    Query(query): Query<ExecutionDetailQuery>,
 ) -> Response {
     let Some(session) = state.auth.session(&headers).await else {
         return Redirect::to("/login").into_response();
     };
     let result = async {
-        let run = state
+        let run_record = state
             .store
-            .get_run(id)
+            .get_run_record(id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+        let snapshot_plaintext = state.cipher.decrypt(&run_record.encrypted_snapshot)?;
+        let snapshot: ExecutionSnapshot = serde_json::from_slice(&snapshot_plaintext)?;
+        let captured_parameters = captured_run_parameters(&state, id, &snapshot).await?;
+        let run = run_record.view;
+        let schedule = state
+            .store
+            .get_schedule(run.schedule_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("schedule for run not found"))?;
         let events = state
             .store
             .audit_events("run", &id.to_string(), 500)
             .await?;
         let attempts = state.store.run_attempts(id).await?;
-        Ok::<_, anyhow::Error>((run, attempts, events))
+        Ok::<_, anyhow::Error>((run, schedule, attempts, events, captured_parameters))
     }
     .await;
     match result {
-        Ok((run, attempts, events)) => {
+        Ok((run, schedule, attempts, events, captured_parameters)) => {
             let mut event_rows = String::new();
             for event in events {
                 event_rows.push_str(&format!(
@@ -1830,11 +2394,11 @@ async fn run_detail(
                 .find_map(|attempt| attempt.diagnostic.as_ref())
                 .map(|diagnostic| {
                     format!(
-                        r#"<div class="notice"><b>Latest diagnosis:</b> <code>{}</code> at <b>{} / {}</b> — {} Retryable: <b>{}</b>.</div>"#,
+                        r#"<div class="failure-strip"><strong>What went wrong</strong><br><code>{}</code> — {}<br><strong>Where</strong><br>{} / {}<br><span class="muted">Retryable: <b>{}</b></span></div>"#,
                         esc(&json_enum_name(diagnostic.code)),
+                        esc(&diagnostic.summary),
                         esc(&json_enum_name(diagnostic.origin)),
                         esc(&json_enum_name(diagnostic.stage)),
-                        esc(&diagnostic.summary),
                         if diagnostic.retryable { "yes" } else { "no" },
                     )
                 })
@@ -1850,16 +2414,41 @@ async fn run_detail(
                 ),
                 _ => String::new(),
             };
-            page(
+            if query.debug {
+                tracing::warn!(
+                    run_id = %id,
+                    session_id = %session.id,
+                    "administrator opened execution parameters in debug mode"
+                );
+            }
+            let parameter_json = parameter_block(
+                captured_parameters.parameters.as_ref(),
+                captured_parameters.visibility.as_ref(),
+                query.debug,
+            );
+            let debug_notice = debug_mode_notice(query.debug);
+            let debug_action = if query.debug {
+                format!(r#"<a class="button" href="/runs/{id}">Hide secret values</a>"#)
+            } else {
+                format!(
+                    r#"<a class="button danger" href="/runs/{id}?debug=true" onclick="return confirm('Reveal stored secret parameter values on this screen?')">Enable debug mode</a>"#
+                )
+            };
+            let schedule_backlink = run_schedule_backlink(schedule.id);
+            let response = page(
                 "Run detail",
                 &session.csrf,
                 &format!(
-                    r#"<div class="actions"><h1 style="margin-right:auto">Run <code>{id}</code></h1>{actions}</div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Attempts<b>{}</b></div><div class="metric">Trigger<b style="font-size:18px">{}</b></div></div>{latest_diagnosis}<h2>Attempts and diagnostics</h2><table><thead><tr><th>#</th><th>Node</th><th>Outcome</th><th>Where</th><th>Code</th><th>Status</th><th>Duration</th><th>Output</th><th>Summary</th></tr></thead><tbody>{attempt_rows}</tbody></table><h2>Audit trail</h2><table><thead><tr><th>Time</th><th>Event</th><th>Metadata</th></tr></thead><tbody>{event_rows}</tbody></table>"#,
+                    r#"<div class="actions"><h1 style="margin-right:auto">Run <code>{id}</code></h1>{schedule_backlink}{actions}</div><div class="grid"><div class="metric">State<b style="font-size:18px">{}</b></div><div class="metric">Schedule<b style="font-size:18px"><a href="/schedules/{}/edit">{}</a></b><span class="muted"><code>{}</code></span></div><div class="metric">Attempts<b>{}</b></div><div class="metric">Trigger<b style="font-size:18px">{}</b></div></div>{latest_diagnosis}<div class="actions"><h2 style="margin-right:auto">Exact execution parameters</h2>{debug_action}</div>{debug_notice}<div class="panel">{parameter_json}</div><h2>Attempts and diagnostics</h2><table><thead><tr><th>#</th><th>Node</th><th>Outcome</th><th>Where</th><th>Code</th><th>Status</th><th>Duration</th><th>Output</th><th>Summary</th></tr></thead><tbody>{attempt_rows}</tbody></table><h2>Audit trail</h2><table><thead><tr><th>Time</th><th>Event</th><th>Metadata</th></tr></thead><tbody>{event_rows}</tbody></table>"#,
                     run.state.as_str(),
+                    schedule.id,
+                    esc(&schedule.spec.name),
+                    &schedule.id.to_string()[..8],
                     run.attempt_count,
                     esc(&run.trigger_kind)
                 ),
-            )
+            );
+            no_store(response)
         }
         Err(error) => error_page(&session.csrf, &error),
     }
@@ -2991,19 +3580,36 @@ fn page(title: &str, csrf: &str, content: &str) -> Response {
     }
 }
 
+const MAX_UI_ERROR_DETAIL_CHARS: usize = 4_000;
+
 fn error_page(csrf: &str, error: &dyn std::fmt::Display) -> Response {
     let request_id = crate::management::current_request_id();
-    tracing::error!(%request_id, error = %error, "management operation failed");
-    let mut response = page(
-        "Error",
-        csrf,
-        &format!(
-            r#"<h1>Request failed</h1><div class="notice">The operation did not complete. Use request ID <code>{}</code> to locate the diagnostic log.</div><p><a href="javascript:history.back()">Go back</a></p>"#,
-            esc(&request_id)
-        ),
-    );
+    let detail = ui_error_detail(error);
+    tracing::error!(%request_id, error = %detail, "management operation failed");
+    let mut response = page("Error", csrf, &error_page_content(&request_id, &detail));
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     response
+}
+
+fn ui_error_detail(error: &dyn std::fmt::Display) -> String {
+    let rendered = format!("{error:#}");
+    let mut characters = rendered.chars();
+    let mut bounded: String = characters
+        .by_ref()
+        .take(MAX_UI_ERROR_DETAIL_CHARS)
+        .collect();
+    if characters.next().is_some() {
+        bounded.push_str("\n… additional detail truncated");
+    }
+    bounded
+}
+
+fn error_page_content(request_id: &str, detail: &str) -> String {
+    format!(
+        r#"<section class="error-panel" role="alert" aria-labelledby="request-error-title"><span class="error-label">Operation failed</span><h1 id="request-error-title">Request failed</h1><p>The scheduler could not complete this operation. The reported detail is shown below.</p><pre class="error-detail">{}</pre><p class="error-meta">Request ID <code>{}</code> remains available for matching this error with server logs.</p><div class="actions"><button type="button" onclick="history.back()">Go back</button><a class="button" href="/">Overview</a></div></section>"#,
+        esc(detail),
+        esc(request_id),
+    )
 }
 
 fn stable_ui_error(request_id: &str) -> Response {
@@ -3072,6 +3678,429 @@ mod tests {
         let row = node_row(&agent, None);
         assert!(row.contains(r#"class="badge good">applied"#));
         assert!(!row.contains("Rejected:"));
+    }
+
+    #[test]
+    fn dashboard_node_row_shows_lifetime_processed_task_outcomes() {
+        let row = node_processing_row(
+            &agent_view(),
+            &NodeProcessingStatistics {
+                processed_tasks: 42,
+                succeeded: 36,
+                failed: 5,
+                cancelled: 1,
+                last_processed_at: Some("2026-07-22T10:30:00Z".into()),
+            },
+        );
+
+        assert!(row.contains("<strong>42</strong>"));
+        assert!(row.contains("36</span> succeeded"));
+        assert!(row.contains("5</span> failed · 1 cancelled"));
+        assert!(row.contains("2026-07-22T10:30:00Z"));
+        assert!(row.contains("desktop &amp; excel"));
+    }
+
+    #[test]
+    fn run_row_shows_schedule_and_escaped_failure_location() {
+        let now = Utc::now();
+        let run_id = Uuid::new_v4();
+        let schedule_id = Uuid::new_v4();
+        let row = run_list_row(&RunListItem {
+            run: RunView {
+                id: run_id,
+                schedule_id,
+                state: RunState::Failed,
+                trigger_kind: "collection".into(),
+                scheduled_at: now,
+                attempt_count: 2,
+                created_at: now,
+                updated_at: now,
+            },
+            schedule_name: "Monthly <Excel>".into(),
+            latest_diagnostic: Some(FailureDiagnostic::new(
+                scheduler_core::FailureCode::ExcelWorkbookOpenFailed,
+                scheduler_core::FailureOrigin::ExcelAutomation,
+                scheduler_core::FailureStage::WorkbookOpen,
+                "Workbook <missing> & inaccessible",
+                false,
+            )),
+        });
+
+        assert!(row.contains(&format!(r#"/schedules/{schedule_id}/edit"#)));
+        assert!(row.contains("Monthly &lt;Excel&gt;"));
+        assert!(row.contains("excel_workbook_open_failed"));
+        assert!(row.contains("excel_automation / workbook_open"));
+        assert!(row.contains("Workbook &lt;missing&gt; &amp; inaccessible"));
+        assert!(!row.contains("Workbook <missing>"));
+    }
+
+    #[test]
+    fn run_schedule_backlink_targets_the_originating_schedule() {
+        let schedule_id = Uuid::new_v4();
+        let link = run_schedule_backlink(schedule_id);
+
+        assert_eq!(
+            link,
+            format!(
+                r#"<a class="button" href="/schedules/{schedule_id}/edit">&larr; Back to schedule</a>"#
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn run_pages_filter_by_schedule_and_load_the_latest_diagnosis() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database_path = directory.path().join("run-filter.db");
+        let store =
+            scheduler_store::Store::connect(&format!("sqlite://{}", database_path.display()), None)
+                .await
+                .expect("store");
+        let schedule_id = Uuid::new_v4();
+        let run_id = Uuid::new_v4();
+        let attempt_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let spec = serde_json::json!({
+            "name": "Filtered schedule",
+            "blueprint_ref": {"uri": "file:///blueprint.yaml"},
+            "parameters_ref": {"uri": "file:///parameters.json"},
+            "required_labels": {},
+            "cron": null,
+            "webhook_enabled": false,
+            "enabled": true
+        });
+        sqlx::query(
+            "INSERT INTO schedules(id,name,spec_json,encrypted_snapshot,snapshot_digest,key_id,\
+             revision,enabled,webhook_enabled,created_at,updated_at) \
+             VALUES (?, 'Filtered schedule', ?, X'01', 'snapshot', 'v1', 1, 1, 0, ?, ?)",
+        )
+        .bind(schedule_id.to_string())
+        .bind(spec.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .expect("schedule");
+        sqlx::query(
+            "INSERT INTO runs(id,schedule_id,state,trigger_kind,scheduled_at,not_before,\
+             encrypted_snapshot,key_id,max_attempts,initial_backoff_seconds,backoff_cap_seconds,\
+             attempt_count,created_at,updated_at) \
+             VALUES (?,?,'failed','manual',?,?,X'02','v1',1,1,1,1,?,?)",
+        )
+        .bind(run_id.to_string())
+        .bind(schedule_id.to_string())
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .expect("run");
+        let diagnostic = FailureDiagnostic::new(
+            scheduler_core::FailureCode::ProcessSpawnFailed,
+            scheduler_core::FailureOrigin::Agent,
+            scheduler_core::FailureStage::ProcessStart,
+            "The process could not be started",
+            true,
+        );
+        sqlx::query(
+            "INSERT INTO attempts(id,run_id,agent_id,attempt_number,lease_token,state,\
+             lease_expires_at,outcome,diagnostic_json,finished_at,created_at,updated_at) \
+             VALUES (?,?, 'node-a',1,'lease','finished',?,'infrastructure_error',?,?,?,?)",
+        )
+        .bind(attempt_id.to_string())
+        .bind(run_id.to_string())
+        .bind(&now)
+        .bind(serde_json::to_string(&diagnostic).expect("diagnostic"))
+        .bind(&now)
+        .bind(&now)
+        .bind(&now)
+        .execute(store.pool())
+        .await
+        .expect("attempt");
+
+        let page = paged_runs(
+            store.pool(),
+            &RunPageQuery {
+                cursor: None,
+                limit: Some(50),
+                schedule_id: Some(schedule_id),
+            },
+        )
+        .await
+        .expect("filtered runs");
+
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].schedule_name, "Filtered schedule");
+        assert_eq!(
+            page.items[0]
+                .latest_diagnostic
+                .as_ref()
+                .map(|value| value.code),
+            Some(scheduler_core::FailureCode::ProcessSpawnFailed)
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_detail_ignores_stale_operational_metadata_and_loads_parameters() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let database_path = directory.path().join("batch-detail.db");
+        let store =
+            scheduler_store::Store::connect(&format!("sqlite://{}", database_path.display()), None)
+                .await
+                .expect("store");
+        let cipher = scheduler_core::SnapshotCipher::from_base64(
+            "test",
+            &scheduler_core::SnapshotCipher::generate_base64(),
+        )
+        .expect("cipher");
+        let state = AppState {
+            store,
+            cipher,
+            adapters: scheduler_core::AdapterRegistry::with_defaults(
+                vec![directory.path().to_path_buf()],
+                std::collections::HashMap::new(),
+            )
+            .expect("adapters"),
+            auth: crate::auth::AuthManager::new("test-admin-token", false).expect("auth"),
+            sessions: std::sync::Arc::new(tokio::sync::RwLock::new(
+                std::collections::HashMap::new(),
+            )),
+            internal_rest_url: "http://127.0.0.1:1".into(),
+            internal_admin_token: "test-admin-token".into(),
+            collection_sources: crate::collection_runtime::CollectionSourceRegistry::new(
+                vec![directory.path().to_path_buf()],
+                None,
+            )
+            .expect("collection sources"),
+            collection_worker_id: "test-collector".into(),
+        };
+        let schedule_id = Uuid::new_v4();
+        let batch_id = Uuid::new_v4();
+        let trigger_id = Uuid::new_v4();
+        let item_id = Uuid::new_v4();
+        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let spec = serde_json::json!({
+            "name": "Bound collection",
+            "blueprint_ref": {"uri": "file:///blueprint.yaml"},
+            "parameters_ref": {"uri": "file:///parameters.json"},
+            "required_labels": {},
+            "cron": null,
+            "webhook_enabled": false,
+            "enabled": true
+        });
+        let resolved: ResolvedScheduleSnapshot = serde_json::from_value(serde_json::json!({
+            "blueprint": {
+                "api_version": "scheduler/v1",
+                "executor": {
+                    "kind": "command",
+                    "program": "echo",
+                    "args": [],
+                    "env": {"TASK_PASSWORD": "{{params.password}}"}
+                },
+                "parameters_schema": {
+                    "type": "object",
+                    "required": ["id", "password"],
+                    "properties": {
+                        "id": {"type": "integer"},
+                        "password": {"type": "string"}
+                    }
+                },
+                "parameter_bindings": {
+                    "password": {
+                        "source": "environment",
+                        "name": "TASK_PASSWORD",
+                        "value_type": "string",
+                        "sensitive": true
+                    }
+                },
+                "required_labels": {},
+                "policy": {
+                    "max_attempts": 3,
+                    "timeout_seconds": 60,
+                    "initial_backoff_seconds": 1,
+                    "backoff_cap_seconds": 30
+                }
+            },
+            "base_parameters": {},
+            "blueprint_source_version": null,
+            "parameters_source_version": null
+        }))
+        .expect("resolved snapshot");
+        let encrypted_seed = state
+            .cipher
+            .encrypt(
+                &serde_json::to_vec(&serde_json::json!({
+                    "resolved": resolved,
+                    "collection": {
+                        "source_ref": {"uri": "file:///collection.json"},
+                        "page_size": 500,
+                        "max_items": 10000,
+                        "max_active_runs": 32,
+                        "poison_distinct_nodes": 2
+                    },
+                    "required_labels": {}
+                }))
+                .expect("seed JSON"),
+            )
+            .expect("encrypted seed");
+        let parameters = serde_json::json!({"id": 1});
+        let encrypted_parameters = state
+            .cipher
+            .encrypt(&serde_json::to_vec(&parameters).expect("parameters JSON"))
+            .expect("encrypted parameters");
+
+        sqlx::query(
+            "INSERT INTO schedules(id,name,spec_json,encrypted_snapshot,snapshot_digest,key_id,\
+             revision,enabled,webhook_enabled,created_at,updated_at) \
+             VALUES (?, 'Bound collection', ?, X'01', 'schedule', 'test', 3, 1, 0, ?, ?)",
+        )
+        .bind(schedule_id.to_string())
+        .bind(spec.to_string())
+        .bind(&now)
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .expect("schedule");
+        sqlx::query(
+            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,target_kind,\
+             target_id,created_at) VALUES (?,?,'manual',?,'batch',?,?)",
+        )
+        .bind(trigger_id.to_string())
+        .bind(schedule_id.to_string())
+        .bind(&now)
+        .bind(batch_id.to_string())
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .expect("trigger identity");
+        sqlx::query(
+            "INSERT INTO batches(id,trigger_identity_id,schedule_id,schedule_revision,state,\
+             trigger_kind,scheduled_at,encrypted_snapshot,snapshot_digest,key_id,page_size,\
+             max_items,max_active_runs,poison_distinct_nodes,ingestion_complete,item_count,\
+             valid_item_count,lease_expires_at,created_at,updated_at) \
+             VALUES (?,?,?,3,'running','manual',?,?,'batch','test',500,10000,32,2,1,1,1,?,?,?)",
+        )
+        .bind(batch_id.to_string())
+        .bind(trigger_id.to_string())
+        .bind(schedule_id.to_string())
+        .bind(&now)
+        .bind(encrypted_seed)
+        .bind("stale-operational-timestamp")
+        .bind(&now)
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .expect("batch");
+        sqlx::query(
+            "INSERT INTO batch_items(id,batch_id,item_index,provider_key_encrypted,\
+             provider_key_hmac,encrypted_parameters,key_id,parameters_digest,state,created_at,updated_at) \
+             VALUES (?,?,0,X'01','provider',?,'test','parameters','queued',?,?)",
+        )
+        .bind(item_id.to_string())
+        .bind(batch_id.to_string())
+        .bind(encrypted_parameters)
+        .bind(&now)
+        .bind(&now)
+        .execute(state.store.pool())
+        .await
+        .expect("batch item");
+
+        assert!(
+            state.store.get_batch(batch_id).await.is_err(),
+            "the full operational record demonstrates the stale timestamp failure"
+        );
+        let detail = load_batch_detail(&state, batch_id)
+            .await
+            .expect("batch detail query")
+            .expect("batch detail");
+        let page = paged_batch_items(&state, batch_id, &BatchPageQuery::default())
+            .await
+            .expect("batch items");
+
+        assert_eq!(detail.view.state, scheduler_core::BatchState::Running);
+        assert!(detail.parameter_visibility.is_some());
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].parameters.as_ref(), Some(&parameters));
+    }
+
+    #[test]
+    fn collection_failure_panel_explains_what_and_where() {
+        let panel = collection_failure_panel(Some("collection_file_not_allowed"));
+
+        assert!(panel.contains("What went wrong"));
+        assert!(panel.contains("outside the coordinator's allowed artifact roots"));
+        assert!(panel.contains("coordinator / collection ingestion"));
+    }
+
+    #[test]
+    fn error_page_shows_the_escaped_error_chain_and_request_id() {
+        use anyhow::Context as _;
+
+        let error = Err::<(), _>(anyhow::anyhow!("invalid <collection> & item"))
+            .context("loading parameter collection")
+            .expect_err("error chain");
+        let detail = ui_error_detail(&error);
+        let content = error_page_content("request-42", &detail);
+
+        assert!(content.contains("loading parameter collection"));
+        assert!(content.contains("invalid &lt;collection&gt; &amp; item"));
+        assert!(!content.contains("invalid <collection>"));
+        assert!(content.contains("request-42"));
+        assert!(content.contains(r#"role="alert""#));
+    }
+
+    #[test]
+    fn error_detail_is_bounded() {
+        let error = "x".repeat(MAX_UI_ERROR_DETAIL_CHARS + 10);
+        let detail = ui_error_detail(&error);
+
+        assert!(detail.ends_with("… additional detail truncated"));
+        assert_eq!(
+            detail.chars().count(),
+            MAX_UI_ERROR_DETAIL_CHARS + "\n… additional detail truncated".chars().count()
+        );
+    }
+
+    #[test]
+    fn execution_parameters_redact_by_default_and_reveal_in_debug_mode() {
+        let parameters = serde_json::json!({
+            "customer": 42,
+            "credentials": {"password": "stored-secret"}
+        });
+        let visibility = ParameterVisibility {
+            sensitive_paths: vec!["/credentials/password".into(), "/node_token".into()],
+            bindings: BTreeMap::from([(
+                "node_token".into(),
+                ParameterBinding {
+                    source: scheduler_core::ParameterBindingSource::SecretFile,
+                    name: "node-token".into(),
+                    value_type: scheduler_core::ParameterBindingValueType::String,
+                    sensitive: true,
+                },
+            )]),
+        };
+
+        let redacted = parameter_document(&parameters, &visibility, false);
+        let redacted_json = serde_json::to_string(&redacted).expect("redacted JSON");
+        assert!(redacted_json.contains("customer"));
+        assert!(!redacted_json.contains("stored-secret"));
+        assert!(redacted_json.contains("enable debug mode"));
+
+        let debug = parameter_document(&parameters, &visibility, true);
+        let debug_json = serde_json::to_string(&debug).expect("debug JSON");
+        assert!(debug_json.contains("stored-secret"));
+        assert!(debug_json.contains("agent-local secret is not persisted"));
+    }
+
+    #[test]
+    fn missing_visibility_metadata_never_falls_back_to_raw_parameters() {
+        let rendered = parameter_block(
+            Some(&serde_json::json!({"password": "must-not-render"})),
+            None,
+            true,
+        );
+        assert!(!rendered.contains("must-not-render"));
+        assert!(rendered.contains("values hidden"));
     }
 
     #[test]
@@ -3251,13 +4280,18 @@ mod tests {
             next_cursor: Some("cursor_value".into()),
             limit: 50,
         };
-        let controls = pagination_controls_with_filter(
+        let controls = batch_pagination_controls(
             "/batches/id",
             &page,
-            "provider_key",
-            Some("customer 42/monthly&final"),
+            &BatchPageQuery {
+                cursor: None,
+                limit: Some(50),
+                provider_key: Some("customer 42/monthly&final".into()),
+                debug: true,
+            },
         );
         assert!(controls.contains("cursor=cursor_value"));
         assert!(controls.contains("provider_key=customer+42%2Fmonthly%26final"));
+        assert!(controls.contains("debug=true"));
     }
 }

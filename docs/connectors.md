@@ -247,6 +247,19 @@ curl -i http://127.0.0.1:9010/v1/artifacts/fetch \
 
 Then create/update a schedule whose `parameters_ref.uri` is `connector://customer-data/customers/42?environment=production`.
 
+## Rust OData process-by-ID example
+
+[`examples/connectors/process-id-secure-odata`](../examples/connectors/process-id-secure-odata)
+contains a buildable Rust sidecar for the secure Excel `processID` blueprint.
+It treats the upstream as an OData `Workbooks` service, fetches one workbook by
+integer ID, expands only the `daily` parameter group, and converts that group
+to a scheduler parameter artifact. Credentials used by the macro remain
+agent-local bindings and never pass through OData or the connector response.
+
+The directory includes the assumed OData response shape, connector bootstrap
+configuration, run instructions, and a matching schedule under
+[`examples/schedules/process-id-secure-odata.example.yaml`](../examples/schedules/process-id-secure-odata.example.yaml).
+
 ## Parameter-collection page protocol
 
 For a collection URI such as:

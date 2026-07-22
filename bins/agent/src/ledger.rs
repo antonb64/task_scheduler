@@ -346,6 +346,8 @@ mod tests {
                 required_labels: BTreeMap::new(),
                 blueprint_digest: "test-blueprint".into(),
                 parameters_digest: "test-parameters".into(),
+                parameters: None,
+                sensitive_parameter_paths: Vec::new(),
                 late_bindings: None,
             },
         }

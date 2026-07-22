@@ -31,6 +31,8 @@ fn assignment(program: &str, args: Vec<String>, lease_seconds: u64) -> Execution
             required_labels: BTreeMap::new(),
             blueprint_digest: "test-blueprint".into(),
             parameters_digest: "test".into(),
+            parameters: None,
+            sensitive_parameter_paths: Vec::new(),
             late_bindings: None,
         },
     }

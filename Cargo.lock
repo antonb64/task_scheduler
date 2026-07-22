@@ -14,7 +14,7 @@ dependencies = [
 
 [[package]]
 name = "agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -618,7 +618,7 @@ checksum = "c2459377285ad874054d797f3ccebf984978aa39129f6eafde5cdc8315b612f8"
 
 [[package]]
 name = "coordinator"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "argon2",
@@ -2142,6 +2142,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "process-id-secure-odata-connector"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower",
+ "url",
+]
+
+[[package]]
 name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2764,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2792,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "prost",
  "protoc-bin-vendored",
@@ -2804,7 +2820,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-store"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2822,7 +2838,7 @@ dependencies = [
 
 [[package]]
 name = "scheduler-telemetry"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "http",
@@ -3326,7 +3342,7 @@ dependencies = [
 
 [[package]]
 name = "task-executor"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3345,7 +3361,7 @@ dependencies = [
 
 [[package]]
 name = "taskctl"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",

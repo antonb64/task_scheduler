@@ -83,6 +83,7 @@ parameters_schema:
       type: string
     bwp_password:
       type: string
+      writeOnly: true
 required_labels:
   os: windows
   capability: excel

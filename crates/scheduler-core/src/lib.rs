@@ -16,7 +16,7 @@ pub use bindings::{
     LateBindingSnapshot, ParameterBinding, ParameterBindingSource, ParameterBindingValueType,
     resolve_parameter_bindings, validate_parameter_bindings,
 };
-pub use blueprint::{resolve_snapshot, validate_parameters};
+pub use blueprint::{resolve_snapshot, sensitive_parameter_paths, validate_parameters};
 pub use collection::*;
 pub use crypto::SnapshotCipher;
 pub use dashboard::{DashboardConfig, DashboardWidget};
