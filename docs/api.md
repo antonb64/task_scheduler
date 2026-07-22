@@ -202,7 +202,7 @@ POST /api/v1/schedules/{schedule_id}/pause
 POST /api/v1/schedules/{schedule_id}/resume
 ```
 
-Success is `204 No Content`. Pausing increments the schedule revision and prevents cron/manual/webhook run creation; it does not cancel already queued/running runs.
+Success is `204 No Content`. Pausing increments the schedule revision and prevents cron/manual/webhook run creation; it does not cancel already queued/running runs or collection batches. Resuming advances the cron cursor to the resume time, so occurrences missed during the paused interval are not created. The next cron occurrence is strictly after resume. Repeating pause or resume when the schedule is already in that state is an idempotent no-op and does not increment the revision or move the cursor. Schedules that remain enabled still catch up occurrences missed during coordinator downtime.
 
 ### Rotate a webhook
 

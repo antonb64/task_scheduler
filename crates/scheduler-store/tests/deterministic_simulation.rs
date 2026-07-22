@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, HashMap};
 use chrono::{Duration, TimeZone, Utc};
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use scheduler_core::{
-    ArtifactRef, BatchItemState, ExecutionOutcome, ExecutionResult, OutputMetadata, RunState,
-    ScheduleSpec,
+    ArtifactRef, BatchItemState, CronSpec, ExecutionOutcome, ExecutionResult, OutputMetadata,
+    RunState, ScheduleSpec,
 };
 use scheduler_store::{
     AttemptRecord, CommitCollectionPage, CommitPageOutcome, FinalizeBatchOutcome, NewBatch,
@@ -1266,5 +1266,68 @@ async fn cron_occurrence_cursor_is_monotonic_across_out_of_order_delivery_and_re
             .expect("schedule")
             .expect("present");
         assert_eq!(record.last_cron_at, Some(fixed_time(900)), "seed={seed}");
+    }
+}
+
+#[tokio::test]
+async fn resumed_schedule_skips_the_paused_window_across_restart() {
+    for seed in simulation_seeds() {
+        let mut database = Database::new(seed ^ 0x5a17_5e5a).await;
+        let schedule_id = deterministic_uuid(seed ^ 0x5a17_5e5a, 1);
+        let mut spec = schedule_spec("paused-cron");
+        let cron = CronSpec {
+            expression: "0 * * * * *".into(),
+            timezone: "UTC".into(),
+        };
+        spec.cron = Some(cron.clone());
+        database
+            .store
+            .create_schedule(NewSchedule {
+                id: schedule_id,
+                spec,
+                encrypted_snapshot: vec![0xa5, 0x5a],
+                snapshot_digest: format!("paused-cron-{seed}"),
+                key_id: "simulation-key".into(),
+                webhook_public_id: None,
+                webhook_secret_hash: None,
+            })
+            .await
+            .expect("create paused cron schedule");
+        let historical = Utc::now() - Duration::days(365) - Duration::seconds(seed as i64);
+        sqlx::query("UPDATE schedules SET last_cron_at=? WHERE id=?")
+            .bind(historical.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .bind(schedule_id.to_string())
+            .execute(database.store.pool())
+            .await
+            .expect("seed historical cron cursor");
+
+        database
+            .store
+            .set_schedule_enabled(schedule_id, false)
+            .await
+            .expect("pause schedule");
+        let before_resume = Utc::now() - Duration::milliseconds(2);
+        database
+            .store
+            .set_schedule_enabled(schedule_id, true)
+            .await
+            .expect("resume schedule");
+        let after_resume = Utc::now() + Duration::milliseconds(2);
+        database.reopen().await;
+
+        let resumed = database
+            .store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read resumed schedule")
+            .expect("resumed schedule exists");
+        let cursor = resumed.last_cron_at.expect("resume cursor");
+        assert!(
+            cursor >= before_resume && cursor <= after_resume,
+            "seed={seed}: resume cursor {cursor} outside {before_resume}..={after_resume}"
+        );
+        let first = scheduler_core::schedule::next_occurrences(&cron, cursor, 1)
+            .expect("first post-resume occurrence");
+        assert!(first[0] > cursor, "seed={seed}: paused cron was replayed");
     }
 }

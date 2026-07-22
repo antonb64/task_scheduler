@@ -460,7 +460,7 @@ Examples:
 
 Use an IANA timezone such as `UTC`, `Europe/Vienna`, or `America/New_York`. The UI previews the next five UTC occurrences. Nonexistent local times in a spring-forward gap are skipped. Both absolute instants of an ambiguous fall-back time are queued.
 
-The coordinator persists every occurrence under a unique `(schedule_id, scheduled_at)` key and does not coalesce overlap or downtime catch-up. It scans at most 1,000 next occurrences per schedule per one-second pass, so a large backlog drains in batches. Editing the cron expression or timezone resets the materialization cursor at edit time; other edits preserve it. Runs already committed keep their previous snapshot.
+The coordinator persists every occurrence under a unique `(schedule_id, scheduled_at)` key and does not coalesce overlapping occurrences. When a schedule remains enabled, occurrences missed during coordinator downtime are caught up individually. It scans at most 1,000 next occurrences per schedule per one-second pass, so a large outage backlog drains in batches. A deliberate pause is different: resuming advances the schedule's materialization cursor to the resume time, so cron occurrences missed while paused are skipped instead of caught up. The first new cron occurrence is strictly after the resume time. Repeating resume on an already enabled schedule is idempotent and does not advance the cursor again. Editing the cron expression or timezone resets the materialization cursor at edit time; other edits preserve it. Runs and collection batches already committed before the pause keep their previous snapshots and are not cancelled.
 
 Pause and resume:
 

@@ -8,12 +8,15 @@ A collection trigger first persists a batch containing the immutable schedule/bl
 
 Final collection parameters merge `base < item < trigger overrides`. Invalid items remain durable quarantined records while valid siblings become one run each. Provider keys and collection cursors are encrypted; keyed digests support duplicate detection/exact authenticated lookup without exposing them in telemetry. Per-batch active-run limits participate in work-conserving dispatch.
 
-Cron materialization queues every missed occurrence without coalescing and keeps the
-unique `(schedule_id, scheduled_at)` guarantee. The coordinator computes at most
-1,000 next instants in one timezone-aware batch per schedule cursor. Creating each
-cron run and advancing that cursor is one SQLite transaction fenced by the expected
-schedule revision, cron expression, and timezone. If an edit wins the race, a
-detached old schedule cannot insert an old-snapshot run or move the new cursor.
+Cron materialization queues every missed occurrence without coalescing while a
+schedule remains enabled and keeps the unique `(schedule_id, scheduled_at)`
+guarantee. Deliberately paused intervals are skipped: the paused-to-enabled
+transition atomically advances the cursor to the resume time. The coordinator
+computes at most 1,000 next instants in one timezone-aware batch per schedule
+cursor. Creating each cron run and advancing that cursor is one SQLite transaction
+fenced by the expected schedule revision, cron expression, and timezone. If an edit
+wins the race, a detached old schedule cannot insert an old-snapshot run or move the
+new cursor.
 Changing, adding, or removing the cron expression/timezone resets the cursor to the
 edit time, preventing the new identity from backfilling from `created_at` or the old
 identity. Other edits preserve the cursor. Runs committed before an edit retain their

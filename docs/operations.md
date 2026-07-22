@@ -376,7 +376,9 @@ taskctl batches items <batch-id> --limit 200
 - Expressions include seconds; `0 0 9 * * *` is 09:00, not a five-field expression.
 - Check the IANA timezone and the UI's next-five preview.
 - Spring-forward gaps are skipped; both fall-back folds are valid occurrences.
-- Restart catch-up does not coalesce missed or overlapping occurrences.
+- Restart catch-up for schedules that remained enabled does not coalesce missed or
+  overlapping occurrences. A deliberate pause is different: resume skips every
+  occurrence in the paused interval.
 - At-least-once execution can create duplicate attempts for one run, even though cron run creation is unique per scheduled instant.
 
 ### A webhook fails

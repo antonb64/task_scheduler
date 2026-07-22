@@ -266,7 +266,9 @@ impl Store {
         let snapshot_digest = digest.clone();
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
-            "UPDATE schedules SET name=?,spec_json=?,encrypted_snapshot=?,snapshot_digest=?,key_id=?,revision=revision+1,enabled=?,last_cron_at=CASE WHEN NOT (cron_expression IS ? AND cron_timezone IS ?) THEN ? ELSE last_cron_at END,cron_expression=?,cron_timezone=?,webhook_enabled=?,updated_at=? WHERE id=? AND revision=?",
+            "UPDATE schedules SET name=?,spec_json=?,encrypted_snapshot=?,snapshot_digest=?,key_id=?,revision=revision+1,enabled=?,last_cron_at=CASE \
+             WHEN enabled=0 AND ?=1 AND ? IS NOT NULL THEN CASE WHEN last_cron_at IS NULL OR last_cron_at<? THEN ? ELSE last_cron_at END \
+             WHEN NOT (cron_expression IS ? AND cron_timezone IS ?) THEN ? ELSE last_cron_at END,cron_expression=?,cron_timezone=?,webhook_enabled=?,updated_at=? WHERE id=? AND revision=?",
         )
         .bind(&spec.name)
         .bind(serde_json::to_string(&spec)?)
@@ -274,6 +276,10 @@ impl Store {
         .bind(digest)
         .bind(key_id)
         .bind(spec.enabled)
+        .bind(spec.enabled)
+        .bind(cron_expression)
+        .bind(&now)
+        .bind(&now)
         .bind(cron_expression)
         .bind(cron_timezone)
         .bind(&now)
@@ -320,21 +326,52 @@ impl Store {
     }
 
     pub async fn set_schedule_enabled(&self, id: Uuid, enabled: bool) -> Result<()> {
+        self.set_schedule_enabled_at(id, enabled, Utc::now()).await
+    }
+
+    async fn set_schedule_enabled_at(
+        &self,
+        id: Uuid,
+        enabled: bool,
+        transition_at: DateTime<Utc>,
+    ) -> Result<()> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT spec_json FROM schedules WHERE id=?")
+        let row = sqlx::query("SELECT spec_json,enabled,revision FROM schedules WHERE id=?")
             .bind(id.to_string())
             .fetch_optional(&mut *tx)
             .await?
             .context("schedule not found")?;
+        let was_enabled = row.get::<bool, _>("enabled");
+        if was_enabled == enabled {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let revision = row.get::<i64, _>("revision");
         let mut spec: ScheduleSpec = serde_json::from_str(row.get("spec_json"))?;
         spec.enabled = enabled;
-        sqlx::query("UPDATE schedules SET enabled=?,spec_json=?,revision=revision+1,updated_at=? WHERE id=?")
-            .bind(enabled)
-            .bind(serde_json::to_string(&spec)?)
-            .bind(now_string())
-            .bind(id.to_string())
-            .execute(&mut *tx)
-            .await?;
+        let transition_at = format_time(transition_at);
+        let advance_cron_cursor = enabled && !was_enabled && spec.cron.is_some();
+        let updated = sqlx::query(
+            "UPDATE schedules SET enabled=?,spec_json=?,revision=revision+1,\
+             last_cron_at=CASE WHEN ?=1 AND cron_expression IS NOT NULL AND \
+             (last_cron_at IS NULL OR last_cron_at<?) THEN ? ELSE last_cron_at END,\
+             updated_at=? WHERE id=? AND enabled=? AND revision=?",
+        )
+        .bind(enabled)
+        .bind(serde_json::to_string(&spec)?)
+        .bind(advance_cron_cursor)
+        .bind(&transition_at)
+        .bind(&transition_at)
+        .bind(&transition_at)
+        .bind(id.to_string())
+        .bind(was_enabled)
+        .bind(revision)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() != 1 {
+            tx.rollback().await?;
+            bail!("schedule revision conflict or schedule not found");
+        }
         append_audit_tx(
             &mut tx,
             "schedule",
@@ -2714,10 +2751,138 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pause_and_resume_update_the_trigger_facing_schedule_document() {
+    async fn pause_and_resume_skip_the_paused_cron_window_and_are_idempotent() {
         let (_directory, store) = test_store().await;
-        let schedule_id = create_schedule(&store).await;
+        let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
+        let previous_cursor = Utc.with_ymd_and_hms(2030, 1, 1, 7, 0, 0).unwrap();
+        let paused_at = Utc.with_ymd_and_hms(2030, 1, 1, 7, 30, 0).unwrap();
+        let resumed_at = Utc.with_ymd_and_hms(2030, 1, 1, 8, 0, 30).unwrap();
+        store
+            .advance_cron_cursor(schedule_id, previous_cursor)
+            .await
+            .expect("seed cron cursor");
 
+        store
+            .set_schedule_enabled_at(schedule_id, false, paused_at)
+            .await
+            .expect("pause");
+        let paused = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(!paused.view.spec.enabled);
+        assert_eq!(paused.last_cron_at, Some(previous_cursor));
+        let paused_revision = paused.view.revision;
+
+        store
+            .set_schedule_enabled_at(
+                schedule_id,
+                false,
+                Utc.with_ymd_and_hms(2030, 1, 1, 7, 45, 0).unwrap(),
+            )
+            .await
+            .expect("repeat pause");
+        let unchanged_pause = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert_eq!(unchanged_pause.view.revision, paused_revision);
+        assert_eq!(unchanged_pause.last_cron_at, Some(previous_cursor));
+
+        store
+            .set_schedule_enabled_at(schedule_id, true, resumed_at)
+            .await
+            .expect("resume");
+        let resumed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert!(resumed.view.spec.enabled);
+        assert_eq!(resumed.last_cron_at, Some(resumed_at));
+        let cron = resumed.view.spec.cron.as_ref().expect("cron");
+        let next = scheduler_core::schedule::next_occurrences(cron, resumed_at, 1)
+            .expect("next occurrence");
+        assert_eq!(
+            next,
+            vec![Utc.with_ymd_and_hms(2030, 1, 1, 8, 1, 0).unwrap()]
+        );
+
+        let resumed_revision = resumed.view.revision;
+        store
+            .set_schedule_enabled_at(
+                schedule_id,
+                true,
+                Utc.with_ymd_and_hms(2030, 1, 1, 9, 0, 0).unwrap(),
+            )
+            .await
+            .expect("repeat resume");
+        let unchanged = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert_eq!(unchanged.view.revision, resumed_revision);
+        assert_eq!(unchanged.last_cron_at, Some(resumed_at));
+
+        let resume_events = store
+            .audit_events("schedule", &schedule_id.to_string(), 20)
+            .await
+            .expect("audit events")
+            .iter()
+            .filter(|event| event["event_type"] == "schedule.resumed")
+            .count();
+        let pause_events = store
+            .audit_events("schedule", &schedule_id.to_string(), 20)
+            .await
+            .expect("audit events")
+            .iter()
+            .filter(|event| event["event_type"] == "schedule.paused")
+            .count();
+        assert_eq!(resume_events, 1);
+        assert_eq!(pause_events, 1);
+    }
+
+    #[tokio::test]
+    async fn resume_never_moves_a_future_cron_cursor_backwards() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
+        let future_cursor = Utc.with_ymd_and_hms(2035, 1, 1, 0, 0, 0).unwrap();
+        store
+            .advance_cron_cursor(schedule_id, future_cursor)
+            .await
+            .expect("seed future cursor");
+        store
+            .set_schedule_enabled_at(
+                schedule_id,
+                false,
+                Utc.with_ymd_and_hms(2030, 1, 1, 0, 0, 0).unwrap(),
+            )
+            .await
+            .expect("pause");
+        store
+            .set_schedule_enabled_at(
+                schedule_id,
+                true,
+                Utc.with_ymd_and_hms(2030, 2, 1, 0, 0, 0).unwrap(),
+            )
+            .await
+            .expect("resume");
+
+        let resumed = store
+            .get_schedule_record(schedule_id)
+            .await
+            .expect("read")
+            .expect("schedule");
+        assert_eq!(resumed.last_cron_at, Some(future_cursor));
+    }
+
+    #[tokio::test]
+    async fn schedule_update_resume_also_skips_the_paused_cron_window() {
+        let (_directory, store) = test_store().await;
+        let schedule_id = create_cron_schedule(&store, "0 * * * * *", "UTC").await;
         store
             .set_schedule_enabled(schedule_id, false)
             .await
@@ -2727,18 +2892,29 @@ mod tests {
             .await
             .expect("read")
             .expect("schedule");
-        assert!(!paused.view.spec.enabled);
-
+        let before_resume = Utc::now() - Duration::milliseconds(2);
+        let mut resumed_spec = paused.view.spec.clone();
+        resumed_spec.enabled = true;
         store
-            .set_schedule_enabled(schedule_id, true)
+            .update_schedule(
+                schedule_id,
+                paused.view.revision,
+                resumed_spec,
+                vec![2],
+                "resumed snapshot".into(),
+                "v2".into(),
+            )
             .await
-            .expect("resume");
+            .expect("resume through update");
+        let after_resume = Utc::now() + Duration::milliseconds(2);
+
         let resumed = store
             .get_schedule_record(schedule_id)
             .await
             .expect("read")
             .expect("schedule");
-        assert!(resumed.view.spec.enabled);
+        let cursor = resumed.last_cron_at.expect("resume cursor");
+        assert!(cursor >= before_resume && cursor <= after_resume);
     }
 
     #[tokio::test]

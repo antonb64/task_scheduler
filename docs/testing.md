@@ -37,7 +37,10 @@ where at-least-once delivery commonly fails.
   remain deterministic.
 - Focused store regressions verify cron cursor reset/preservation and prove that
   stale revisions or changed cron identities cannot insert or advance an occurrence.
-  A dense every-second fallback test guards the coordinator's single batch scan.
+  Pause/resume advances the cron cursor only on a real paused-to-enabled
+  transition, skips the paused interval, and preserves normal catch-up after
+  coordinator downtime. A dense every-second fallback test guards the
+  coordinator's single batch scan.
 - The coordinator protocol model uses the real coordinator store and agent
   ledger. It explores duplicate offers and acknowledgements, lost result
   acknowledgements, restarts on either side, and command, executor, Excel, and
