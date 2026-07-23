@@ -704,6 +704,7 @@ pub async fn collection_worker_pass(state: &AppState) -> Result<()> {
 
 #[instrument(
     name = "coordinator.collection.batch",
+    parent = None,
     skip_all,
     fields(
         batch_id = %batch.view.id,
@@ -713,6 +714,15 @@ pub async fn collection_worker_pass(state: &AppState) -> Result<()> {
 )]
 async fn process_claimed_batch(state: AppState, mut batch: BatchRecord) -> Result<()> {
     let batch_id = batch.view.id;
+    let trigger_context = state.store.batch_trigger_trace_context(batch_id).await?;
+    scheduler_telemetry::link_current_span(
+        trigger_context.traceparent.as_deref(),
+        trigger_context.tracestate.as_deref(),
+    );
+    state
+        .store
+        .capture_batch_trace_context(batch_id, &scheduler_telemetry::current_trace_context())
+        .await?;
     let result = process_claimed_batch_inner(&state, &mut batch).await;
     if let Err(error) = result {
         let code = collection_error_code(&error);
@@ -1596,6 +1606,7 @@ parameters_schema:
                 max_active_runs: 2,
                 poison_distinct_nodes: 2,
             }),
+            observability: Default::default(),
             required_labels: BTreeMap::new(),
             cron: None,
             webhook_enabled: false,
@@ -1794,6 +1805,7 @@ parameters_schema:
                 max_active_runs: 2,
                 poison_distinct_nodes: 2,
             }),
+            observability: Default::default(),
             required_labels: BTreeMap::new(),
             cron: None,
             webhook_enabled: false,

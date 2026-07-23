@@ -1,7 +1,8 @@
 use std::{path::Path, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SecondsFormat, Utc};
+use chrono_tz::Tz;
 use fs2::FileExt;
 use rand::Rng;
 use scheduler_core::{
@@ -19,10 +20,12 @@ mod blueprints;
 mod collection;
 mod dashboard;
 mod health;
+mod observability;
 pub use blueprints::*;
 pub use collection::*;
 pub use dashboard::*;
 pub use health::*;
+pub use observability::*;
 
 #[derive(Clone)]
 pub struct Store {
@@ -202,7 +205,12 @@ impl Store {
         Ok(())
     }
 
-    pub async fn create_schedule(&self, new: NewSchedule) -> Result<ScheduleView> {
+    pub async fn create_schedule(&self, mut new: NewSchedule) -> Result<ScheduleView> {
+        let settings = self.get_global_settings().await?;
+        new.spec
+            .observability
+            .resolve(settings.default_completion_deadline_seconds);
+        new.spec.observability.validate()?;
         let now = now_string();
         let id = new.id.to_string();
         let snapshot_digest = new.snapshot_digest.clone();
@@ -255,11 +263,15 @@ impl Store {
         &self,
         id: Uuid,
         expected_revision: i64,
-        spec: ScheduleSpec,
+        mut spec: ScheduleSpec,
         encrypted_snapshot: Vec<u8>,
         digest: String,
         key_id: String,
     ) -> Result<ScheduleView> {
+        let settings = self.get_global_settings().await?;
+        spec.observability
+            .resolve(settings.default_completion_deadline_seconds);
+        spec.observability.validate()?;
         let now = now_string();
         let cron_expression = spec.cron.as_ref().map(|cron| cron.expression.as_str());
         let cron_timezone = spec.cron.as_ref().map(|cron| cron.timezone.as_str());
@@ -534,15 +546,19 @@ impl Store {
             return Ok(CronOccurrenceResult::StaleSchedule);
         }
 
-        let trigger = sqlx::query(
-            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at) VALUES (?,?,'cron',?,NULL,'run',?,?)",
+        let trigger = insert_trigger_identity_tx(
+            &mut tx,
+            &trigger_identity_id,
+            &schedule_id,
+            "cron",
+            new.scheduled_at,
+            None,
+            "run",
+            &id,
+            &now,
+            None,
+            None,
         )
-        .bind(trigger_identity_id)
-        .bind(&schedule_id)
-        .bind(&occurrence)
-        .bind(&id)
-        .bind(&now)
-        .execute(&mut *tx)
         .await;
         if let Err(error) = trigger {
             if is_unique_violation(&error) {
@@ -622,18 +638,23 @@ impl Store {
         let id = new.id.to_string();
         let idempotency_key = new.idempotency_key.clone();
         let trigger_identity_id = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
-        let trigger_insert = sqlx::query(
-            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at) VALUES (?,?,?,?,?,'run',?,?)",
+        // Trigger policy is read before the identity write. IMMEDIATE prevents
+        // concurrent deferred transactions from all taking a read snapshot and
+        // then failing their write upgrade with SQLITE_BUSY.
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let trigger_insert = insert_trigger_identity_tx(
+            &mut tx,
+            &trigger_identity_id,
+            &new.schedule_id.to_string(),
+            &new.trigger_kind,
+            new.scheduled_at,
+            new.idempotency_key.as_deref(),
+            "run",
+            &id,
+            &now,
+            None,
+            None,
         )
-        .bind(trigger_identity_id)
-        .bind(new.schedule_id.to_string())
-        .bind(&new.trigger_kind)
-        .bind(format_time(new.scheduled_at))
-        .bind(&new.idempotency_key)
-        .bind(&id)
-        .bind(&now)
-        .execute(&mut *tx)
         .await;
         if let Err(error) = trigger_insert {
             if is_unique_violation(&error) {
@@ -1007,6 +1028,14 @@ impl Store {
             .execute(&mut *tx)
             .await?;
             collection::sync_batch_run_state_tx(&mut tx, &run_id, "queued", &now_string()).await?;
+            append_audit_tx(
+                &mut tx,
+                "run",
+                &run_id,
+                "attempt.offer_failed",
+                serde_json::json!({"attempt_id": attempt_id}),
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -1350,7 +1379,7 @@ impl Store {
         // if this UPDATE changes the state first, the heartbeat's `accepted`
         // predicate affects no row. This avoids a stale expiry scan revoking a
         // lease which was renewed while SQLite was scheduling the two writers.
-        let rows = sqlx::query("SELECT id,run_id,agent_id,attempt_number,lease_token,lease_expires_at FROM attempts WHERE state IN ('offered','accepted') ORDER BY lease_expires_at LIMIT ?")
+        let rows = sqlx::query("SELECT id,run_id,agent_id,attempt_number,lease_token,lease_expires_at,state FROM attempts WHERE state IN ('offered','accepted') ORDER BY lease_expires_at LIMIT ?")
             .bind(limit.min(500))
             .fetch_all(&self.pool)
             .await?;
@@ -1363,16 +1392,34 @@ impl Store {
             if lease_expires_at + grace >= now {
                 continue;
             }
+            let previous_state: String = row.get("state");
             let attempt = attempt_from_row(row)?;
+            let mut tx = self.pool.begin().await?;
             let result = sqlx::query("UPDATE attempts SET state='expiring',updated_at=? WHERE id=? AND lease_token=? AND state IN ('offered','accepted') AND lease_expires_at=?")
                 .bind(format_time(now))
                 .bind(attempt.id.to_string())
                 .bind(&attempt.lease_token)
                 .bind(lease_expires_at_text)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
             if result.rows_affected() == 1 {
+                append_audit_tx(
+                    &mut tx,
+                    "run",
+                    &attempt.run_id.to_string(),
+                    "attempt.lease_expired",
+                    serde_json::json!({
+                        "attempt_id": attempt.id,
+                        "agent_id": attempt.agent_id,
+                        "from": previous_state,
+                        "to": "expiring",
+                    }),
+                )
+                .await?;
+                tx.commit().await?;
                 claimed.push(attempt);
+            } else {
+                tx.rollback().await?;
             }
         }
         Ok(claimed)
@@ -1874,22 +1921,465 @@ impl Store {
         event_type: &str,
         metadata: Value,
     ) -> Result<()> {
-        sqlx::query("INSERT INTO audit_events(entity_type,entity_id,event_type,metadata_json,occurred_at) VALUES (?,?,?,?,?)")
-            .bind(entity_type).bind(entity_id).bind(event_type).bind(serde_json::to_string(&metadata)?).bind(now_string()).execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        append_audit_tx(&mut tx, entity_type, entity_id, event_type, metadata).await?;
+        tx.commit().await?;
         Ok(())
     }
 }
 
-async fn append_audit_tx(
+pub(crate) async fn append_audit_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     entity_type: &str,
     entity_id: &str,
     event_type: &str,
     metadata: Value,
 ) -> Result<()> {
-    sqlx::query("INSERT INTO audit_events(entity_type,entity_id,event_type,metadata_json,occurred_at) VALUES (?,?,?,?,?)")
-        .bind(entity_type).bind(entity_id).bind(event_type).bind(serde_json::to_string(&metadata)?).bind(now_string()).execute(&mut **tx).await?;
+    let occurred_at = now_string();
+    let metadata_json = serde_json::to_string(&metadata)?;
+    let audit_event_id: i64 = sqlx::query_scalar(
+        "INSERT INTO audit_events(entity_type,entity_id,event_type,metadata_json,occurred_at) \
+         VALUES (?,?,?,?,?) RETURNING id",
+    )
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(event_type)
+    .bind(&metadata_json)
+    .bind(&occurred_at)
+    .fetch_one(&mut **tx)
+    .await?;
+    let event_id = Uuid::new_v4().to_string();
+    let trace_context = scheduler_telemetry::current_trace_context();
+    let (state_from, state_to) = event_state_transition(event_type, &metadata);
+    let mut attributes =
+        authoritative_event_attributes_tx(tx, entity_type, entity_id, event_type, &metadata)
+            .await?;
+    attributes.insert("event.id".into(), Value::String(event_id.clone()));
+    attributes.insert(
+        "event.sequence".into(),
+        Value::Number(audit_event_id.into()),
+    );
+    attributes.insert("event.name".into(), Value::String(event_type.into()));
+    attributes.insert(
+        "event.occurred_at".into(),
+        Value::String(occurred_at.clone()),
+    );
+    attributes.insert("entity.type".into(), Value::String(entity_type.into()));
+    attributes.insert("entity.id".into(), Value::String(entity_id.into()));
+    attributes.insert(
+        "state.from".into(),
+        state_from.map_or(Value::Null, |state| Value::String(state.into())),
+    );
+    attributes.insert(
+        "state.to".into(),
+        state_to.map_or(Value::Null, |state| Value::String(state.into())),
+    );
+    sqlx::query(
+        "INSERT INTO observability_outbox(\
+         event_id,audit_event_id,entity_type,entity_id,event_name,attributes_json,\
+         occurred_at,traceparent,tracestate,next_attempt_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+    )
+    .bind(&event_id)
+    .bind(audit_event_id)
+    .bind(entity_type)
+    .bind(entity_id)
+    .bind(event_type)
+    .bind(serde_json::to_string(&Value::Object(attributes))?)
+    .bind(&occurred_at)
+    .bind(trace_context.traceparent)
+    .bind(trace_context.tracestate)
+    .bind(&occurred_at)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
+}
+
+async fn authoritative_event_attributes_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    entity_type: &str,
+    entity_id: &str,
+    _event_type: &str,
+    metadata: &Value,
+) -> Result<serde_json::Map<String, Value>> {
+    let mut attributes = serde_json::Map::new();
+
+    match entity_type {
+        "schedule" => insert_string(&mut attributes, "schedule.id", entity_id),
+        "agent" | "node" => insert_string(&mut attributes, "agent.id", entity_id),
+        "run" => {
+            if let Some(row) = sqlx::query(
+                "SELECT r.schedule_id,r.batch_id,r.batch_item_id,ti.id AS trigger_id,\
+                        ti.operations_timezone,ti.operations_day,ti.completion_deadline_at \
+                 FROM runs r LEFT JOIN trigger_identities ti \
+                   ON ti.target_kind='run' AND ti.target_id=r.id WHERE r.id=?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            {
+                insert_string(&mut attributes, "run.id", entity_id);
+                insert_optional_string(&mut attributes, "schedule.id", row.get("schedule_id"));
+                insert_optional_string(&mut attributes, "trigger.id", row.get("trigger_id"));
+                insert_optional_string(&mut attributes, "batch.id", row.get("batch_id"));
+                insert_optional_string(&mut attributes, "item.id", row.get("batch_item_id"));
+                insert_trigger_policy(&mut attributes, &row);
+            }
+        }
+        "batch" => {
+            if let Some(row) = sqlx::query(
+                "SELECT b.schedule_id,b.trigger_identity_id,t.operations_timezone,\
+                        t.operations_day,t.completion_deadline_at \
+                 FROM batches b JOIN trigger_identities t ON t.id=b.trigger_identity_id \
+                 WHERE b.id=?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            {
+                insert_string(&mut attributes, "batch.id", entity_id);
+                insert_optional_string(&mut attributes, "schedule.id", row.get("schedule_id"));
+                insert_optional_string(
+                    &mut attributes,
+                    "trigger.id",
+                    row.get("trigger_identity_id"),
+                );
+                insert_trigger_policy(&mut attributes, &row);
+            }
+        }
+        "batch_item" => {
+            if let Some(row) = sqlx::query(
+                "SELECT bi.batch_id,bi.run_id,b.schedule_id,b.trigger_identity_id,\
+                        t.operations_timezone,t.operations_day,t.completion_deadline_at \
+                 FROM batch_items bi JOIN batches b ON b.id=bi.batch_id \
+                 JOIN trigger_identities t ON t.id=b.trigger_identity_id WHERE bi.id=?",
+            )
+            .bind(entity_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            {
+                insert_string(&mut attributes, "item.id", entity_id);
+                insert_optional_string(&mut attributes, "batch.id", row.get("batch_id"));
+                insert_optional_string(&mut attributes, "run.id", row.get("run_id"));
+                insert_optional_string(&mut attributes, "schedule.id", row.get("schedule_id"));
+                insert_optional_string(
+                    &mut attributes,
+                    "trigger.id",
+                    row.get("trigger_identity_id"),
+                );
+                insert_trigger_policy(&mut attributes, &row);
+            }
+        }
+        _ => {}
+    }
+
+    if let Some(object) = metadata.as_object() {
+        for (source, destination) in [
+            ("schedule_id", "schedule.id"),
+            ("trigger_id", "trigger.id"),
+            ("batch_id", "batch.id"),
+            ("batch_item_id", "item.id"),
+            ("run_id", "run.id"),
+            ("attempt_id", "attempt.id"),
+            ("agent_id", "agent.id"),
+            ("source_batch_id", "source.batch.id"),
+        ] {
+            if let Some(Value::String(value)) = object.get(source) {
+                insert_string(&mut attributes, destination, value);
+            }
+        }
+        for key in [
+            "trigger",
+            "state",
+            "outcome",
+            "failure_code",
+            "reason_code",
+            "evidence_class",
+            "failure_family",
+            "classifier_version",
+            "schedule_revision",
+            "revision",
+            "desired_revision",
+            "applied_revision",
+            "capacity",
+            "generation",
+            "items",
+            "valid",
+            "invalid",
+            "runs",
+            "item_count",
+            "distinct_healthy_nodes",
+            "distinct_failed_inputs",
+            "distinct_schedules",
+            "considered_observations",
+            "failure_rate",
+            "duration_ms",
+            "exit_code",
+            "is_final",
+            "node_was_healthy",
+            "cluster_suppressed",
+            "acknowledged_success",
+            "current_error",
+        ] {
+            if let Some(value @ (Value::String(_) | Value::Number(_) | Value::Bool(_))) =
+                object.get(key)
+            {
+                attributes.insert(format!("event.{key}"), value.clone());
+            }
+        }
+    }
+
+    if let Some(Value::String(attempt_id)) = attributes.get("attempt.id") {
+        if let Some(agent_id) =
+            sqlx::query_scalar::<_, String>("SELECT agent_id FROM attempts WHERE id=?")
+                .bind(attempt_id)
+                .fetch_optional(&mut **tx)
+                .await?
+        {
+            insert_string(&mut attributes, "agent.id", &agent_id);
+        }
+    }
+    Ok(attributes)
+}
+
+fn insert_trigger_policy(
+    attributes: &mut serde_json::Map<String, Value>,
+    row: &sqlx::sqlite::SqliteRow,
+) {
+    insert_optional_string(
+        attributes,
+        "operations.timezone",
+        row.get("operations_timezone"),
+    );
+    insert_optional_string(attributes, "operations.day", row.get("operations_day"));
+    insert_optional_string(
+        attributes,
+        "completion.deadline_at",
+        row.get("completion_deadline_at"),
+    );
+}
+
+fn insert_string(attributes: &mut serde_json::Map<String, Value>, key: &str, value: &str) {
+    attributes.insert(key.into(), Value::String(value.into()));
+}
+
+fn insert_optional_string(
+    attributes: &mut serde_json::Map<String, Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    if let Some(value) = value {
+        insert_string(attributes, key, &value);
+    }
+}
+
+fn event_state_transition<'a>(
+    event_type: &str,
+    metadata: &'a Value,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let explicit = (
+        metadata.get("from").and_then(Value::as_str),
+        metadata.get("to").and_then(Value::as_str),
+    );
+    if explicit.0.is_some() || explicit.1.is_some() {
+        return explicit;
+    }
+    match event_type {
+        "run.queued" => (None, Some("queued")),
+        "attempt.offered" => (Some("queued"), Some("running")),
+        "attempt.offer_failed" | "attempt.rejected_before_acceptance" => {
+            (Some("running"), Some("queued"))
+        }
+        "attempt.accepted" => (Some("offered"), Some("accepted")),
+        "run.retry_scheduled" => (Some("running"), Some("queued")),
+        "run.succeeded" => (Some("running"), Some("succeeded")),
+        "run.failed" => (Some("running"), Some("failed")),
+        "run.cancelled" => (None, Some("cancelled")),
+        "run.retried" => (Some("failed"), Some("queued")),
+        "batch.scheduled" | "batch.retriggered" => (None, Some("scheduled")),
+        "batch.finalized" => (
+            Some("collecting"),
+            metadata.get("state").and_then(Value::as_str),
+        ),
+        "batch.failed" => (None, Some("failed")),
+        "batch.cancelled" => (None, Some("cancelled")),
+        "batch.reopened" => (Some("succeeded"), Some("running")),
+        "batch.completed" => (
+            Some("running"),
+            metadata.get("state").and_then(Value::as_str),
+        ),
+        "agent.connected" => (Some("disconnected"), Some("connected")),
+        "agent.disconnected" => (Some("connected"), Some("disconnected")),
+        _ => (None, None),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TriggerObservability {
+    pub timezone: String,
+    pub operations_day: String,
+    pub completion_deadline_at: String,
+}
+
+pub(crate) async fn trigger_observability_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    schedule_id: &str,
+    scheduled_at: DateTime<Utc>,
+) -> Result<TriggerObservability> {
+    let spec_json: String = sqlx::query_scalar("SELECT spec_json FROM schedules WHERE id=?")
+        .bind(schedule_id)
+        .fetch_one(&mut **tx)
+        .await?;
+    let spec: ScheduleSpec = serde_json::from_str(&spec_json)?;
+    let settings_json: String = sqlx::query_scalar(
+        "SELECT document_json FROM settings_documents WHERE document_key='global'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let settings: GlobalSettings = serde_json::from_str(&settings_json)?;
+    let timezone = spec
+        .cron
+        .as_ref()
+        .map(|cron| cron.timezone.as_str())
+        .unwrap_or(&settings.default_timezone);
+    let parsed_timezone = timezone
+        .parse::<Tz>()
+        .map_err(|_| anyhow::anyhow!("schedule observability timezone is invalid"))?;
+    let deadline_seconds = spec
+        .observability
+        .completion_deadline_seconds
+        .unwrap_or(settings.default_completion_deadline_seconds);
+    if deadline_seconds == 0 {
+        bail!("observability completion deadline must be at least one second");
+    }
+    let deadline = scheduled_at
+        .checked_add_signed(Duration::seconds(
+            i64::try_from(deadline_seconds).unwrap_or(i64::MAX),
+        ))
+        .context("observability completion deadline overflows timestamp")?;
+    Ok(TriggerObservability {
+        timezone: timezone.to_owned(),
+        operations_day: scheduled_at
+            .with_timezone(&parsed_timezone)
+            .date_naive()
+            .to_string(),
+        completion_deadline_at: deadline.to_rfc3339_opts(SecondsFormat::Millis, true),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn insert_trigger_identity_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    id: &str,
+    schedule_id: &str,
+    trigger_kind: &str,
+    scheduled_at: DateTime<Utc>,
+    idempotency_key: Option<&str>,
+    target_kind: &str,
+    target_id: &str,
+    created_at: &str,
+    traceparent: Option<&str>,
+    tracestate: Option<&str>,
+) -> std::result::Result<sqlx::sqlite::SqliteQueryResult, sqlx::Error> {
+    let observability = match trigger_observability_tx(tx, schedule_id, scheduled_at).await {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(sqlx::Error::Protocol(format!(
+                "cannot resolve trigger observability: {error:#}"
+            )));
+        }
+    };
+    let current_trace_context = scheduler_telemetry::current_trace_context();
+    let traceparent = traceparent.or(current_trace_context.traceparent.as_deref());
+    let tracestate = tracestate.or(current_trace_context.tracestate.as_deref());
+    sqlx::query(
+        "INSERT INTO trigger_identities(\
+         id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at,\
+         operations_timezone,operations_day,completion_deadline_at,\
+         observability_coverage_complete,traceparent,tracestate) \
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,1,?,?)",
+    )
+    .bind(id)
+    .bind(schedule_id)
+    .bind(trigger_kind)
+    .bind(format_time(scheduled_at))
+    .bind(idempotency_key)
+    .bind(target_kind)
+    .bind(target_id)
+    .bind(created_at)
+    .bind(observability.timezone)
+    .bind(observability.operations_day)
+    .bind(observability.completion_deadline_at)
+    .bind(traceparent)
+    .bind(tracestate)
+    .execute(&mut **tx)
+    .await
+}
+
+impl Store {
+    pub async fn batch_trigger_trace_context(
+        &self,
+        batch_id: Uuid,
+    ) -> Result<scheduler_telemetry::TraceContextFields> {
+        let row = sqlx::query(
+            "SELECT t.traceparent,t.tracestate FROM batches b \
+             JOIN trigger_identities t ON t.id=b.trigger_identity_id WHERE b.id=?",
+        )
+        .bind(batch_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map_or_else(scheduler_telemetry::TraceContextFields::default, |row| {
+                scheduler_telemetry::TraceContextFields {
+                    traceparent: row.get("traceparent"),
+                    tracestate: row.get("tracestate"),
+                }
+            }),
+        )
+    }
+
+    pub async fn capture_batch_trace_context(
+        &self,
+        batch_id: Uuid,
+        context: &scheduler_telemetry::TraceContextFields,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE batches SET \
+             observability_traceparent=COALESCE(observability_traceparent,?),\
+             observability_tracestate=COALESCE(observability_tracestate,?) WHERE id=?",
+        )
+        .bind(&context.traceparent)
+        .bind(&context.tracestate)
+        .bind(batch_id.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn run_trace_context(
+        &self,
+        run_id: Uuid,
+    ) -> Result<scheduler_telemetry::TraceContextFields> {
+        let row = sqlx::query(
+            "SELECT COALESCE(b.observability_traceparent,t.traceparent) AS traceparent,\
+                    COALESCE(b.observability_tracestate,t.tracestate) AS tracestate \
+             FROM runs r LEFT JOIN batches b ON b.id=r.batch_id \
+             LEFT JOIN trigger_identities t ON \
+               (t.target_kind='run' AND t.target_id=r.id) OR \
+               (t.target_kind='batch' AND t.target_id=r.batch_id) \
+             WHERE r.id=? ORDER BY t.created_at LIMIT 1",
+        )
+        .bind(run_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(
+            row.map_or_else(scheduler_telemetry::TraceContextFields::default, |row| {
+                scheduler_telemetry::TraceContextFields {
+                    traceparent: row.get("traceparent"),
+                    tracestate: row.get("tracestate"),
+                }
+            }),
+        )
+    }
 }
 
 async fn update_daily_schedule_stats_tx(
@@ -2256,6 +2746,7 @@ mod tests {
                 uri: "file:///parameters".into(),
             },
             parameter_collection: None,
+            observability: Default::default(),
             required_labels: BTreeMap::new(),
             cron: None,
             webhook_enabled: false,

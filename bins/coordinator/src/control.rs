@@ -422,6 +422,10 @@ impl SchedulerControl for ControlService {
         request: Request<ManagementRequest>,
     ) -> Result<Response<ManagementResponse>, Status> {
         let request = request.into_inner();
+        scheduler_telemetry::set_current_span_parent(
+            request.headers.get("traceparent").map(String::as_str),
+            request.headers.get("tracestate").map(String::as_str),
+        );
         if !request.path.starts_with('/') || request.path.starts_with("//") {
             return Err(Status::invalid_argument("management path must be local"));
         }
@@ -436,10 +440,23 @@ impl SchedulerControl for ControlService {
         for (name, value) in request.headers {
             if matches!(
                 name.to_ascii_lowercase().as_str(),
-                "content-type" | "cookie" | "if-match" | "idempotency-key" | "x-request-id"
+                "content-type"
+                    | "cookie"
+                    | "if-match"
+                    | "idempotency-key"
+                    | "x-request-id"
+                    | "traceparent"
+                    | "tracestate"
             ) {
                 outbound = outbound.header(name, value);
             }
+        }
+        let trace_context = scheduler_telemetry::current_trace_context();
+        if let Some(traceparent) = trace_context.traceparent {
+            outbound = outbound.header("traceparent", traceparent);
+        }
+        if let Some(tracestate) = trace_context.tracestate {
+            outbound = outbound.header("tracestate", tracestate);
         }
         if request.path.starts_with("/api/") {
             outbound = outbound.bearer_auth(&self.state.internal_admin_token);
@@ -575,6 +592,10 @@ async fn handle_agent_message(
             );
         }
         Some(agent_message::Payload::Accepted(accepted)) => {
+            scheduler_telemetry::set_current_span_parent(
+                accepted.traceparent.as_deref(),
+                accepted.tracestate.as_deref(),
+            );
             ensure_agent(expected_agent_id, &accepted.agent_id)?;
             tracing::Span::current().record("attempt_id", accepted.attempt_id.as_str());
             let lease_seconds = state.store.get_global_settings().await?.lease_seconds;
@@ -592,6 +613,10 @@ async fn handle_agent_message(
                 .add(1, &[KeyValue::new("result", "accepted")]);
         }
         Some(agent_message::Payload::Rejected(rejected)) => {
+            scheduler_telemetry::set_current_span_parent(
+                rejected.traceparent.as_deref(),
+                rejected.tracestate.as_deref(),
+            );
             ensure_agent(expected_agent_id, &rejected.agent_id)?;
             let attempt_id = Uuid::parse_str(&rejected.attempt_id)?;
             tracing::Span::current().record("attempt_id", tracing::field::display(attempt_id));
@@ -633,6 +658,10 @@ async fn handle_agent_message(
             );
         }
         Some(agent_message::Payload::Result(result)) => {
+            scheduler_telemetry::set_current_span_parent(
+                result.traceparent.as_deref(),
+                result.tracestate.as_deref(),
+            );
             ensure_agent(expected_agent_id, &result.agent_id)?;
             let attempt_id = Uuid::parse_str(&result.attempt_id)?;
             tracing::Span::current().record("attempt_id", tracing::field::display(attempt_id));

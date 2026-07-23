@@ -481,6 +481,7 @@ async fn create_schedule(store: &Store, seed: u64) -> Uuid {
                     uri: "file:///simulation-parameters".into(),
                 },
                 parameter_collection: None,
+                observability: Default::default(),
                 required_labels: BTreeMap::new(),
                 cron: None,
                 webhook_enabled: false,
@@ -510,6 +511,8 @@ fn assignment(
         lease_token: attempt.lease_token.clone(),
         lease_seconds: 60,
         snapshot: execution_snapshot(),
+        traceparent: None,
+        tracestate: None,
     }
 }
 

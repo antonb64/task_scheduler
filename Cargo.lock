@@ -2824,9 +2824,11 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "chrono-tz",
  "fs2",
  "rand 0.8.7",
  "scheduler-core",
+ "scheduler-telemetry",
  "serde",
  "serde_json",
  "sqlx",
@@ -2852,6 +2854,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tonic",
+ "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
 ]

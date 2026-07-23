@@ -310,6 +310,8 @@ mod tests {
                     bindings: BTreeMap::from([("credential".into(), binding)]),
                 }),
             },
+            traceparent: None,
+            tracestate: None,
         }
     }
 

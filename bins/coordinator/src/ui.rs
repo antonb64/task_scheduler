@@ -173,6 +173,15 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         .fetch_one(state.store.pool())
         .await?;
         let node_processing = node_processing_statistics(state.store.pool()).await?;
+        let now = Utc::now();
+        let current_daily = state
+            .store
+            .daily_observability_snapshot(now, scheduler_core::DailyWindow::Current)
+            .await?;
+        let previous_daily = state
+            .store
+            .daily_observability_snapshot(now, scheduler_core::DailyWindow::Previous)
+            .await?;
         Ok::<_, anyhow::Error>((
             schedules,
             agents,
@@ -183,6 +192,8 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
             recent_failures,
             quarantined,
             node_processing,
+            current_daily,
+            previous_daily,
         ))
     }
     .await;
@@ -196,12 +207,18 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         recent_failures,
         quarantined,
         node_processing,
+        current_daily,
+        previous_daily,
     ) = match result {
         Ok(data) => data,
         Err(error) => return error_page(&session.csrf, &error),
     };
     let online = agents.iter().filter(|agent| agent.connected).count();
     let telemetry = scheduler_telemetry::status();
+    let observability_outbox = match state.store.observability_outbox_status().await {
+        Ok(status) => status,
+        Err(error) => return error_page(&session.csrf, &error),
+    };
     let configured = dashboard
         .config
         .widgets
@@ -244,14 +261,16 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         ));
     }
     if configured.contains(&scheduler_core::DashboardWidget::TelemetryHealth) {
-        let health = if !telemetry.configured {
+        let health = if observability_outbox.coverage_gap {
+            "unknown"
+        } else if !telemetry.configured {
             "local only"
         } else if telemetry.last_error_class.is_some() {
             "degraded"
         } else {
             "configured"
         };
-        let class = if telemetry.last_error_class.is_some() {
+        let class = if telemetry.last_error_class.is_some() || observability_outbox.coverage_gap {
             "bad"
         } else {
             "good"
@@ -261,12 +280,53 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         } else {
             telemetry.failed_signals.join(", ")
         };
+        let signal_freshness = telemetry
+            .signals
+            .iter()
+            .map(|signal| {
+                let freshness = signal.last_success_unix_ms.map_or_else(
+                    || "never".to_owned(),
+                    |last| {
+                        format!(
+                            "{}s ago",
+                            Utc::now()
+                                .timestamp_millis()
+                                .saturating_sub(i64::try_from(last).unwrap_or(i64::MAX))
+                                / 1_000
+                        )
+                    },
+                );
+                format!(
+                    "{}: {}{}",
+                    signal.signal,
+                    freshness,
+                    if signal.failed {
+                        format!(" ({} failed items)", signal.failed_items)
+                    } else {
+                        String::new()
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let oldest_event_age = observability_outbox.oldest_pending_at.map_or_else(
+            || "none".to_owned(),
+            |oldest| format!("{}s", (Utc::now() - oldest).num_seconds().max(0)),
+        );
+        let last_snapshot = observability_outbox
+            .last_snapshot_at
+            .map_or_else(|| "never".into(), |value| value.to_rfc3339());
         metrics.push_str(&format!(
-            r#"<div class="metric">Telemetry<b class="{class}" style="font-size:18px">{health}</b><span class="muted">{} · {} dropped · {} export batches in flight · failed signals: {}. Collector outages never block scheduling.</span></div>"#,
+            r#"<div class="metric">Telemetry<b class="{class}" style="font-size:18px">{health}</b><span class="muted">{} · signals [{}] · {} dropped · {} export batches in flight · failed signals: {} · {} durable events pending (oldest {}) · coverage {} · last authoritative snapshot {}. Collector outages never block scheduling.</span></div>"#,
             esc(&telemetry.protocol),
+            esc(&signal_freshness),
             telemetry.dropped_telemetry,
             telemetry.export_batches_in_flight,
             esc(&failed_signals),
+            observability_outbox.pending_events,
+            esc(&oldest_event_age),
+            if observability_outbox.coverage_gap { "incomplete" } else { "complete" },
+            esc(&last_snapshot),
         ));
     }
     let mut schedule_cards = String::new();
@@ -288,12 +348,75 @@ async fn dashboard(State(state): State<AppState>, headers: HeaderMap) -> Respons
         let stats = node_processing.get(&agent.id).cloned().unwrap_or_default();
         node_rows.push_str(&node_processing_row(agent, &stats));
     }
+    let daily_health = format!(
+        "{}{}",
+        daily_observability_table("Today", &current_daily),
+        daily_observability_table("Previous operations day", &previous_daily)
+    );
     let content = format!(
-        r#"<div class="actions"><h1 style="margin-right:auto">Cluster overview</h1><a class="button" href="/dashboard/edit">Customize</a></div><div class="grid"><div class="metric">Schedules<b>{}</b></div><div class="metric">Queued<b>{queued}</b></div><div class="metric">Running<b>{running}</b></div>{metrics}</div><h2>Node throughput · lifetime</h2><div class="panel"><p class="muted">Processed tasks count completed execution attempts. A retry is additional work and counts again on the node that handled it.</p><table><thead><tr><th>Node</th><th>Connection</th><th>Active slots</th><th>Tasks processed</th><th>Outcomes</th><th>Last processed</th></tr></thead><tbody>{node_rows}</tbody></table></div><h2>Selected schedule health</h2><div class="grid">{schedule_cards}</div><h2>System posture</h2><div class="panel"><p><span class="badge good">Coordinator authoritative</span> Durable SQLite state and leased delivery are active.</p><p class="muted">Dashboard settings revision r{} is shared through every node UI.</p></div>"#,
+        r#"<div class="actions"><h1 style="margin-right:auto">Cluster overview</h1><a class="button" href="/dashboard/edit">Customize</a></div><div class="grid"><div class="metric">Schedules<b>{}</b></div><div class="metric">Queued<b>{queued}</b></div><div class="metric">Running<b>{running}</b></div>{metrics}</div>{daily_health}<h2>Node throughput · lifetime</h2><div class="panel"><p class="muted">Processed tasks count completed execution attempts. A retry is additional work and counts again on the node that handled it.</p><table><thead><tr><th>Node</th><th>Connection</th><th>Active slots</th><th>Tasks processed</th><th>Outcomes</th><th>Last processed</th></tr></thead><tbody>{node_rows}</tbody></table></div><h2>Selected schedule health</h2><div class="grid">{schedule_cards}</div><h2>System posture</h2><div class="panel"><p><span class="badge good">Coordinator authoritative</span> Durable SQLite state and leased delivery are active.</p><p class="muted">Dashboard settings revision r{} is shared through every node UI.</p></div>"#,
         schedules.len(),
         dashboard.revision,
     );
     page("Overview", &session.csrf, &content)
+}
+
+fn daily_observability_table(
+    title: &str,
+    snapshot: &scheduler_core::DailyObservabilitySnapshot,
+) -> String {
+    let mut rows = String::new();
+    for status in &snapshot.schedules {
+        let class = match status.verdict {
+            scheduler_core::DailyVerdict::Green => "good",
+            scheduler_core::DailyVerdict::Red | scheduler_core::DailyVerdict::Unknown => "bad",
+            _ => "",
+        };
+        rows.push_str(&format!(
+            r#"<tr><td><a href="/schedules/{}/edit">{}</a><br><span class="muted">{} · {}</span></td><td><span class="badge {}">{}</span></td><td>{}/{}/{}</td><td>{}s</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>"#,
+            status.schedule_id,
+            esc(&status.schedule_name),
+            esc(&status.operations_day),
+            esc(&status.operations_timezone),
+            class,
+            status.verdict.as_str(),
+            status.expected_triggers,
+            status.materialized_triggers,
+            status.succeeded,
+            status.completion_deadline_seconds,
+            status.pending,
+            status.overdue,
+            status.retries,
+            status
+                .invalid_items
+                .saturating_add(status.suspected_poison_items)
+                .saturating_add(status.poisoned_items)
+                .saturating_add(status.held_items),
+            status
+                .last_success_at
+                .map_or_else(|| "never".into(), |value| value.to_rfc3339()),
+            esc(&status.reasons.join("; ")),
+        ));
+    }
+    format!(
+        r#"<h2>{}</h2><div class="panel"><p>Cluster verdict <span class="badge {}">{}</span> · authoritative snapshot {}</p><table><thead><tr><th>Schedule/day</th><th>Verdict</th><th>Expected/observed/completed</th><th>Deadline</th><th>Pending</th><th>Overdue</th><th>Retries</th><th>Bad items</th><th>Last success</th><th>Reason</th></tr></thead><tbody>{rows}</tbody></table></div>"#,
+        esc(title),
+        if matches!(
+            snapshot.cluster_verdict,
+            scheduler_core::DailyVerdict::Green
+        ) {
+            "good"
+        } else if matches!(
+            snapshot.cluster_verdict,
+            scheduler_core::DailyVerdict::Red | scheduler_core::DailyVerdict::Unknown
+        ) {
+            "bad"
+        } else {
+            ""
+        },
+        snapshot.cluster_verdict.as_str(),
+        snapshot.generated_at,
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -908,7 +1031,12 @@ async fn new_schedule(State(state): State<AppState>, headers: HeaderMap) -> Resp
     page(
         "New schedule",
         &session.csrf,
-        &schedule_form(None, &session.csrf, &settings.default_timezone),
+        &schedule_form(
+            None,
+            &session.csrf,
+            &settings.default_timezone,
+            settings.default_completion_deadline_seconds,
+        ),
     )
 }
 
@@ -956,7 +1084,12 @@ async fn edit_schedule(
         &format!(
             "{}{}",
             schedule_statistics_table(&stats),
-            schedule_form(Some(&item), &session.csrf, &settings.default_timezone)
+            schedule_form(
+                Some(&item),
+                &session.csrf,
+                &settings.default_timezone,
+                settings.default_completion_deadline_seconds,
+            )
         ),
     )
 }
@@ -999,6 +1132,7 @@ struct ScheduleForm {
     collection_max_active_runs: Option<u32>,
     #[serde(default)]
     collection_poison_distinct_nodes: Option<u32>,
+    completion_deadline_seconds: Option<u64>,
     cron_expression: String,
     timezone: String,
     labels_json: String,
@@ -1045,6 +1179,9 @@ impl ScheduleForm {
                 uri: self.parameters_ref,
             },
             parameter_collection,
+            observability: scheduler_core::ScheduleObservabilityPolicy {
+                completion_deadline_seconds: self.completion_deadline_seconds,
+            },
             required_labels: labels,
             cron,
             webhook_enabled: self.webhook_enabled.is_some(),
@@ -3440,6 +3577,7 @@ fn schedule_form(
     item: Option<&scheduler_core::ScheduleView>,
     csrf: &str,
     default_timezone: &str,
+    default_completion_deadline_seconds: u64,
 ) -> String {
     let action = item
         .map(|item| format!("/ui/schedules/{}", item.id))
@@ -3454,6 +3592,9 @@ fn schedule_form(
         .unwrap_or_default();
     let collection = spec.and_then(|spec| spec.parameter_collection.as_ref());
     let cron = spec.and_then(|spec| spec.cron.as_ref());
+    let completion_deadline_seconds = spec
+        .and_then(|spec| spec.observability.completion_deadline_seconds)
+        .unwrap_or(default_completion_deadline_seconds);
     let labels = spec
         .map(|spec| serde_json::to_string_pretty(&spec.required_labels).unwrap_or_default())
         .unwrap_or_else(|| "{}".into());
@@ -3472,7 +3613,7 @@ fn schedule_form(
         .unwrap_or_default();
     let webhook_action = item.map(|item| format!(r#"<h2>Webhook</h2><p>Public ID: <code>{}</code></p><form method="post" action="/ui/schedules/{}/webhook"><input type="hidden" name="csrf" value="{}"><button type="submit">Rotate webhook secret</button></form>"#, esc(item.webhook_public_id.as_deref().unwrap_or("not created")), item.id, csrf)).unwrap_or_default();
     format!(
-        r##"<h1>{}</h1><form method="post" action="{}"><input type="hidden" name="csrf" value="{}">{}<label>Name<input name="name" value="{}" required></label><div class="row"><label>Blueprint URI<input name="blueprint_ref" value="{}" placeholder="file:///opt/tasks/example.yaml" required></label><label>Base parameters URI<input name="parameters_ref" value="{}" placeholder="file:///opt/tasks/example.json" required></label></div><h2>Optional parameter collection</h2><label>Collection source URI<input name="parameter_collection_uri" value="{}" placeholder="connector://reporting/daily-workbooks"></label><div class="row"><label>Page size<input type="number" min="1" max="1000" name="collection_page_size" value="{}"></label><label>Maximum items<input type="number" min="1" max="10000" name="collection_max_items" value="{}"></label><label>Maximum active child runs<input type="number" min="1" max="1000" name="collection_max_active_runs" value="{}"></label><label>Distinct healthy nodes to confirm poison<input type="number" min="2" max="32" name="collection_poison_distinct_nodes" value="{}"></label></div><p class="muted">Collection schedules create a durable batch for every cron, manual, future, or webhook trigger. Valid items continue when other items are quarantined.</p><div class="row"><label>Cron expression<input name="cron_expression" value="{}" placeholder="0 0 9 * * *"></label><label>IANA timezone<input name="timezone" value="{}" required></label></div><p><button type="button" hx-post="/ui/cron-preview" hx-include="closest form" hx-target="#cron-preview">Preview next five</button></p><div id="cron-preview"></div><label>Required labels (JSON object)<textarea name="labels_json">{}</textarea></label><label><input style="width:auto" type="checkbox" name="webhook_enabled" value="yes" {}> Enable HTTP webhook</label><div class="actions"><button type="submit">Save and validate</button><a href="/schedules">Cancel</a></div></form>{}"##,
+        r##"<h1>{}</h1><form method="post" action="{}"><input type="hidden" name="csrf" value="{}">{}<label>Name<input name="name" value="{}" required></label><div class="row"><label>Blueprint URI<input name="blueprint_ref" value="{}" placeholder="file:///opt/tasks/example.yaml" required></label><label>Base parameters URI<input name="parameters_ref" value="{}" placeholder="file:///opt/tasks/example.json" required></label></div><h2>Optional parameter collection</h2><label>Collection source URI<input name="parameter_collection_uri" value="{}" placeholder="connector://reporting/daily-workbooks"></label><div class="row"><label>Page size<input type="number" min="1" max="1000" name="collection_page_size" value="{}"></label><label>Maximum items<input type="number" min="1" max="10000" name="collection_max_items" value="{}"></label><label>Maximum active child runs<input type="number" min="1" max="1000" name="collection_max_active_runs" value="{}"></label><label>Distinct healthy nodes to confirm poison<input type="number" min="2" max="32" name="collection_poison_distinct_nodes" value="{}"></label></div><p class="muted">Collection schedules create a durable batch for every cron, manual, future, or webhook trigger. Valid items continue when other items are quarantined.</p><h2>Operations objective</h2><label>Completion deadline (seconds)<input type="number" min="1" name="completion_deadline_seconds" value="{}" required></label><p class="muted">A trigger that has not succeeded by scheduled_at plus this duration is overdue and makes its operations day red.</p><div class="row"><label>Cron expression<input name="cron_expression" value="{}" placeholder="0 0 9 * * *"></label><label>IANA timezone<input name="timezone" value="{}" required></label></div><p><button type="button" hx-post="/ui/cron-preview" hx-include="closest form" hx-target="#cron-preview">Preview next five</button></p><div id="cron-preview"></div><label>Required labels (JSON object)<textarea name="labels_json">{}</textarea></label><label><input style="width:auto" type="checkbox" name="webhook_enabled" value="yes" {}> Enable HTTP webhook</label><div class="actions"><button type="submit">Save and validate</button><a href="/schedules">Cancel</a></div></form>{}"##,
         if item.is_some() {
             "Edit schedule"
         } else {
@@ -3491,6 +3632,7 @@ fn schedule_form(
         collection.map_or(10_000, |collection| collection.max_items),
         collection.map_or(32, |collection| collection.max_active_runs),
         collection.map_or(2, |collection| collection.poison_distinct_nodes),
+        completion_deadline_seconds,
         esc(cron
             .map(|cron| cron.expression.as_str())
             .unwrap_or_default()),
@@ -4184,6 +4326,7 @@ mod tests {
             collection_max_items: Some(10_000),
             collection_max_active_runs: Some(16),
             collection_poison_distinct_nodes: Some(2),
+            completion_deadline_seconds: Some(7_200),
             cron_expression: "0 0 6 1 * *".into(),
             timezone: "Europe/Vienna".into(),
             labels_json: "{}".into(),
@@ -4211,6 +4354,7 @@ mod tests {
                     uri: "file:///p".into(),
                 },
                 parameter_collection: None,
+                observability: Default::default(),
                 required_labels: BTreeMap::new(),
                 cron: None,
                 webhook_enabled: false,

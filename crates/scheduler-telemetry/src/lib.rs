@@ -11,7 +11,11 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
-use opentelemetry::{global, trace::TracerProvider as _};
+use opentelemetry::{
+    KeyValue, global,
+    logs::AnyValue,
+    trace::{TraceContextExt as _, TracerProvider as _},
+};
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_otlp::{Protocol, WithExportConfig, WithHttpConfig, WithTonicConfig};
 use opentelemetry_sdk::{
@@ -25,6 +29,7 @@ use opentelemetry_sdk::{
         PeriodicReader, SdkMeterProvider, Temporality, data::ResourceMetrics,
         exporter::PushMetricExporter,
     },
+    propagation::TraceContextPropagator,
     trace::{
         BatchConfigBuilder as SpanBatchConfigBuilder, BatchSpanProcessor, SdkTracerProvider,
         SpanData, SpanExporter,
@@ -36,6 +41,7 @@ use tonic::{
     metadata::{Ascii, MetadataKey, MetadataMap, MetadataValue},
     transport::{Certificate, ClientTlsConfig, Identity},
 };
+use tracing_opentelemetry::OpenTelemetrySpanExt as _;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 const EXPORT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -45,6 +51,7 @@ const MAX_EXPORT_BATCH: usize = 512;
 const MAX_SECRET_FILE_BYTES: u64 = 64 * 1024;
 
 static GLOBAL_STATUS: OnceLock<Arc<TelemetryStatus>> = OnceLock::new();
+static DURABLE_LOG_ACKS: OnceLock<tokio::sync::broadcast::Sender<String>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -95,6 +102,7 @@ pub struct TelemetryConfig {
     metrics: Option<SignalConfig>,
     logs: Option<SignalConfig>,
     tls: TlsMaterial,
+    resource_attributes: Vec<KeyValue>,
 }
 
 impl fmt::Debug for TelemetryConfig {
@@ -115,6 +123,7 @@ impl fmt::Debug for TelemetryConfig {
                 "client_identity",
                 &(self.tls.client_certificate.is_some() && self.tls.client_key.is_some()),
             )
+            .field("resource_attribute_count", &self.resource_attributes.len())
             .finish()
     }
 }
@@ -153,6 +162,7 @@ impl TelemetryConfig {
                 metrics: None,
                 logs: None,
                 tls: TlsMaterial::default(),
+                resource_attributes: default_resource_attributes(None, None),
             });
         }
 
@@ -249,6 +259,7 @@ impl TelemetryConfig {
                 "/v1/logs",
             )?,
             tls,
+            resource_attributes: default_resource_attributes(None, None),
         })
     }
 
@@ -271,18 +282,29 @@ pub struct TelemetryStatusSnapshot {
     pub last_success_unix_ms: Option<u64>,
     pub last_error_class: Option<String>,
     pub failed_signals: Vec<String>,
+    pub signals: Vec<TelemetrySignalStatusSnapshot>,
     pub dropped_telemetry: u64,
     pub export_batches_in_flight: u64,
     pub span_queue_capacity: usize,
     pub log_queue_capacity: usize,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct TelemetrySignalStatusSnapshot {
+    pub signal: String,
+    pub last_success_unix_ms: Option<u64>,
+    pub failed: bool,
+    pub failed_items: u64,
+}
+
 struct TelemetryStatus {
     configured: bool,
     protocol: String,
     last_success_unix_ms: AtomicU64,
+    signal_last_success_unix_ms: [AtomicU64; 3],
     failed_signals: [AtomicBool; 3],
     dropped_telemetry: AtomicU64,
+    signal_dropped_telemetry: [AtomicU64; 3],
     export_batches_in_flight: AtomicU64,
 }
 
@@ -309,8 +331,10 @@ impl TelemetryStatus {
                 "mixed".into()
             },
             last_success_unix_ms: AtomicU64::new(0),
+            signal_last_success_unix_ms: std::array::from_fn(|_| AtomicU64::new(0)),
             failed_signals: std::array::from_fn(|_| AtomicBool::new(false)),
             dropped_telemetry: AtomicU64::new(0),
+            signal_dropped_telemetry: std::array::from_fn(|_| AtomicU64::new(0)),
             export_batches_in_flight: AtomicU64::new(0),
         }
     }
@@ -330,9 +354,13 @@ impl TelemetryStatus {
                 .as_millis() as u64;
             self.last_success_unix_ms
                 .store(unix_ms.max(1), Ordering::Relaxed);
+            self.signal_last_success_unix_ms[signal as usize]
+                .store(unix_ms.max(1), Ordering::Relaxed);
             self.failed_signals[signal as usize].store(false, Ordering::Relaxed);
         } else {
             self.dropped_telemetry
+                .fetch_add(items.max(1), Ordering::Relaxed);
+            self.signal_dropped_telemetry[signal as usize]
                 .fetch_add(items.max(1), Ordering::Relaxed);
             self.failed_signals[signal as usize].store(true, Ordering::Relaxed);
         }
@@ -346,12 +374,26 @@ impl TelemetryStatus {
             .filter(|(_, failed)| failed.load(Ordering::Relaxed))
             .map(|(signal, _)| signal.to_owned())
             .collect::<Vec<_>>();
+        let signals = ["traces", "metrics", "logs"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, signal)| {
+                let last_success = self.signal_last_success_unix_ms[index].load(Ordering::Relaxed);
+                TelemetrySignalStatusSnapshot {
+                    signal: signal.into(),
+                    last_success_unix_ms: (last_success != 0).then_some(last_success),
+                    failed: self.failed_signals[index].load(Ordering::Relaxed),
+                    failed_items: self.signal_dropped_telemetry[index].load(Ordering::Relaxed),
+                }
+            })
+            .collect();
         TelemetryStatusSnapshot {
             configured: self.configured,
             protocol: self.protocol.clone(),
             last_success_unix_ms: (last_success != 0).then_some(last_success),
             last_error_class: (!failed_signals.is_empty()).then(|| "export_failed".to_owned()),
             failed_signals,
+            signals,
             dropped_telemetry: self.dropped_telemetry.load(Ordering::Relaxed),
             export_batches_in_flight: self.export_batches_in_flight.load(Ordering::Relaxed),
             span_queue_capacity: SPAN_QUEUE_CAPACITY,
@@ -373,6 +415,15 @@ fn disabled_status() -> TelemetryStatusSnapshot {
         last_success_unix_ms: None,
         last_error_class: None,
         failed_signals: Vec::new(),
+        signals: ["traces", "metrics", "logs"]
+            .into_iter()
+            .map(|signal| TelemetrySignalStatusSnapshot {
+                signal: signal.into(),
+                last_success_unix_ms: None,
+                failed: false,
+                failed_items: 0,
+            })
+            .collect(),
         dropped_telemetry: 0,
         export_batches_in_flight: 0,
         span_queue_capacity: SPAN_QUEUE_CAPACITY,
@@ -412,6 +463,65 @@ pub fn init(service_name: &'static str, endpoint: Option<&str>) -> Result<Teleme
     init_with_config(config)
 }
 
+pub fn init_with_instance(
+    service_name: &'static str,
+    endpoint: Option<&str>,
+    service_instance_id: &str,
+    agent_id: Option<&str>,
+) -> Result<TelemetryGuard> {
+    let mut config = TelemetryConfig::from_environment(service_name, endpoint)?;
+    config.resource_attributes = default_resource_attributes(Some(service_instance_id), agent_id);
+    init_with_config(config)
+}
+
+pub fn subscribe_durable_log_acks() -> tokio::sync::broadcast::Receiver<String> {
+    DURABLE_LOG_ACKS
+        .get_or_init(|| tokio::sync::broadcast::channel(4_096).0)
+        .subscribe()
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TraceContextFields {
+    pub traceparent: Option<String>,
+    pub tracestate: Option<String>,
+}
+
+pub fn current_trace_context() -> TraceContextFields {
+    let mut carrier = HashMap::new();
+    let context = tracing::Span::current().context();
+    global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&context, &mut carrier);
+    });
+    TraceContextFields {
+        traceparent: carrier.remove("traceparent"),
+        tracestate: carrier.remove("tracestate"),
+    }
+}
+
+pub fn set_current_span_parent(traceparent: Option<&str>, tracestate: Option<&str>) {
+    let Some(traceparent) = traceparent.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let mut carrier = HashMap::from([("traceparent".to_owned(), traceparent.to_owned())]);
+    if let Some(tracestate) = tracestate.filter(|value| !value.is_empty()) {
+        carrier.insert("tracestate".into(), tracestate.to_owned());
+    }
+    let context = global::get_text_map_propagator(|propagator| propagator.extract(&carrier));
+    let _ = tracing::Span::current().set_parent(context);
+}
+
+pub fn link_current_span(traceparent: Option<&str>, tracestate: Option<&str>) {
+    let Some(traceparent) = traceparent.filter(|value| !value.is_empty()) else {
+        return;
+    };
+    let mut carrier = HashMap::from([("traceparent".to_owned(), traceparent.to_owned())]);
+    if let Some(tracestate) = tracestate.filter(|value| !value.is_empty()) {
+        carrier.insert("tracestate".into(), tracestate.to_owned());
+    }
+    let context = global::get_text_map_propagator(|propagator| propagator.extract(&carrier));
+    tracing::Span::current().add_link(context.span().span_context().clone());
+}
+
 pub fn init_with_config(config: TelemetryConfig) -> Result<TelemetryGuard> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let format = tracing_subscriber::fmt::layer().json();
@@ -439,6 +549,8 @@ pub fn init_with_config(config: TelemetryConfig) -> Result<TelemetryGuard> {
     if let Some(provider) = &meter_provider {
         global::set_meter_provider(provider.clone());
     }
+    global::set_text_map_propagator(TraceContextPropagator::new());
+    let _ = DURABLE_LOG_ACKS.get_or_init(|| tokio::sync::broadcast::channel(4_096).0);
     let _ = GLOBAL_STATUS.set(status.clone());
     Ok(TelemetryGuard {
         tracer: tracer_provider,
@@ -458,6 +570,10 @@ fn build_providers(
 )> {
     let resource = Resource::builder()
         .with_service_name(config.service_name)
+        .with_detector(Box::new(
+            opentelemetry_sdk::resource::EnvResourceDetector::new(),
+        ))
+        .with_attributes(config.resource_attributes.clone())
         .build();
     let tracer = config
         .traces
@@ -805,24 +921,44 @@ impl SpanExporter for ObservedSpanExporter {
     }
 }
 
-struct ObservedLogExporter {
-    inner: opentelemetry_otlp::LogExporter,
+struct ObservedLogExporter<E> {
+    inner: E,
     status: Arc<TelemetryStatus>,
 }
 
-impl fmt::Debug for ObservedLogExporter {
+impl<E> fmt::Debug for ObservedLogExporter<E> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("ObservedLogExporter(<redacted>)")
     }
 }
 
-impl LogExporter for ObservedLogExporter {
+impl<E: LogExporter> LogExporter for ObservedLogExporter<E> {
     async fn export(&self, batch: LogBatch<'_>) -> OTelSdkResult {
         let items = batch.iter().count() as u64;
+        let durable_event_ids = batch
+            .iter()
+            .flat_map(|(record, _)| record.attributes_iter())
+            .filter_map(|(key, value)| {
+                if !matches!(key.as_str(), "event.id" | "event_id") {
+                    return None;
+                }
+                match value {
+                    AnyValue::String(value) => Some(value.as_str().to_owned()),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
         self.status.begin_export();
         let result = self.inner.export(batch).await;
         self.status
             .finish_export(TelemetrySignal::Logs, &result, items);
+        if result.is_ok()
+            && let Some(acks) = DURABLE_LOG_ACKS.get()
+        {
+            for event_id in durable_event_ids {
+                let _ = acks.send(event_id);
+            }
+        }
         result
     }
 
@@ -842,6 +978,20 @@ impl LogExporter for ObservedLogExporter {
     fn set_resource(&mut self, resource: &Resource) {
         self.inner.set_resource(resource);
     }
+}
+
+fn default_resource_attributes(
+    service_instance_id: Option<&str>,
+    agent_id: Option<&str>,
+) -> Vec<KeyValue> {
+    let mut attributes = vec![KeyValue::new("service.version", env!("CARGO_PKG_VERSION"))];
+    if let Some(instance_id) = service_instance_id {
+        attributes.push(KeyValue::new("service.instance.id", instance_id.to_owned()));
+    }
+    if let Some(agent_id) = agent_id {
+        attributes.push(KeyValue::new("scheduler.agent.id", agent_id.to_owned()));
+    }
+    attributes
 }
 
 struct ObservedMetricExporter {
@@ -873,8 +1023,12 @@ impl PushMetricExporter for ObservedMetricExporter {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Instant;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Instant,
+    };
 
+    use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
     use opentelemetry_sdk::error::OTelSdkError;
 
     use super::*;
@@ -1121,6 +1275,59 @@ mod tests {
         assert_eq!(status.snapshot().last_error_class, None);
         assert!(status.snapshot().failed_signals.is_empty());
         assert_eq!(status.snapshot().export_batches_in_flight, 0);
+    }
+
+    #[derive(Debug)]
+    struct ToggleLogExporter {
+        succeeds: Arc<AtomicBool>,
+    }
+
+    impl LogExporter for ToggleLogExporter {
+        async fn export(&self, _batch: LogBatch<'_>) -> OTelSdkResult {
+            if self.succeeds.load(Ordering::Relaxed) {
+                Ok(())
+            } else {
+                Err(OTelSdkError::InternalFailure(
+                    "fake collector unavailable".into(),
+                ))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_event_is_acknowledged_only_after_collector_recovery() {
+        let succeeds = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(TelemetryStatus::new(&config(&[]).expect("configuration")));
+        let exporter = ObservedLogExporter {
+            inner: ToggleLogExporter {
+                succeeds: succeeds.clone(),
+            },
+            status,
+        };
+        let provider = SdkLoggerProvider::builder()
+            .with_simple_exporter(exporter)
+            .build();
+        let logger = provider.logger("durable-event-test");
+        let mut acknowledgements = subscribe_durable_log_acks();
+
+        let mut failed_record = logger.create_log_record();
+        failed_record.add_attribute("event.id", "stable-event-id");
+        logger.emit(failed_record);
+        assert!(
+            acknowledgements.try_recv().is_err(),
+            "failed exports must not acknowledge durable events"
+        );
+
+        succeeds.store(true, Ordering::Relaxed);
+        let mut recovered_record = logger.create_log_record();
+        recovered_record.add_attribute("event.id", "stable-event-id");
+        logger.emit(recovered_record);
+        let acknowledged = tokio::time::timeout(Duration::from_secs(1), acknowledgements.recv())
+            .await
+            .expect("ack timeout")
+            .expect("ack channel");
+        assert_eq!(acknowledged, "stable-event-id");
+        provider.shutdown().expect("provider shutdown");
     }
 
     #[tokio::test]

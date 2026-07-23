@@ -620,16 +620,30 @@ async fn reconcile_confirmed_collection_items_tx(
     // A result is stored before health attribution. Confirmation must fence a
     // retry that became queued in that gap, otherwise the poisoned input can
     // be immediately offered again.
-    sqlx::query(
+    let failed_runs = sqlx::query(
         "UPDATE runs SET state='failed',updated_at=? WHERE state='queued' AND id IN (\
          SELECT run_id FROM health_evidence WHERE blueprint_digest=? AND input_fingerprint=?\
-         )",
+         ) RETURNING id",
     )
     .bind(&now_text)
     .bind(blueprint_digest)
     .bind(input_fingerprint)
-    .execute(&mut **tx)
+    .fetch_all(&mut **tx)
     .await?;
+    for run in failed_runs {
+        append_audit_tx(
+            tx,
+            "run",
+            run.get::<String, _>("id").as_str(),
+            "run.failed",
+            serde_json::json!({
+                "from": "queued",
+                "to": "failed",
+                "failure_code": "collection_input_poisoned"
+            }),
+        )
+        .await?;
+    }
 
     let rows = sqlx::query(
         "UPDATE batch_items SET state='poisoned',failure_code='collection_input_poisoned',updated_at=? \
@@ -669,7 +683,7 @@ async fn reconcile_confirmed_collection_items_tx(
         .bind(&batch_id)
         .execute(&mut **tx)
         .await?;
-        sqlx::query(
+        let completed = sqlx::query(
             "UPDATE batches SET state='completed_with_errors',updated_at=? WHERE id=? \
              AND state='running' AND NOT EXISTS (\
                SELECT 1 FROM runs WHERE batch_id=? AND state IN ('queued','running')\
@@ -680,6 +694,16 @@ async fn reconcile_confirmed_collection_items_tx(
         .bind(&batch_id)
         .execute(&mut **tx)
         .await?;
+        if completed.rows_affected() == 1 {
+            append_audit_tx(
+                tx,
+                "batch",
+                &batch_id,
+                "batch.completed",
+                serde_json::json!({"state": "completed_with_errors"}),
+            )
+            .await?;
+        }
         append_audit_tx(
             tx,
             "batch",

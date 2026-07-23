@@ -108,6 +108,7 @@ The coordinator creates this document at revision 1:
   "default_timezone": "UTC",
   "default_max_attempts": 3,
   "default_timeout_seconds": 3600,
+  "default_completion_deadline_seconds": 86400,
   "lease_seconds": 60,
   "heartbeat_seconds": 10,
   "audit_retention_days": 90,
@@ -121,12 +122,13 @@ The coordinator creates this document at revision 1:
 | `default_timezone` | Valid IANA timezone. Used as the default shown by the schedule UI; a schedule stores its own timezone. |
 | `default_max_attempts` | At least 1. Applied while resolving a blueprint that omits `policy.max_attempts`. Existing schedules retain their resolved value. |
 | `default_timeout_seconds` | At least 1. Applied while resolving a blueprint that omits `policy.timeout_seconds`. |
+| `default_completion_deadline_seconds` | At least 1. Applied to a schedule that omits `observability.completion_deadline_seconds`; the effective timezone, operations day, and absolute deadline are captured on every trigger. |
 | `lease_seconds` | At least three times `heartbeat_seconds`. Used for new/renewed attempt leases. |
 | `heartbeat_seconds` | At least 5. Pushed to connected agents and hot-applied to their heartbeat interval. |
-| `audit_retention_days` | At least 1. Reserved configuration field; automatic audit pruning is not currently implemented. |
+| `audit_retention_days` | At least 1. Retention horizon for coordinator authoritative-event outbox rows. Expiring an undelivered row records a permanent coverage gap; internal audit-row pruning is not implemented. |
 | `otlp_endpoint` | Null or absolute HTTP(S) URL. Reserved synchronized field; telemetry is configured only from the bootstrap OTLP environment variables above. |
 
-Changing a policy default does not rewrite existing encrypted schedules. Edit and save a schedule to resolve it again under the new defaults.
+Changing a policy default does not rewrite existing encrypted schedules. Edit and save a schedule to resolve it again under the new defaults. Existing trigger identities always retain the timezone, operations day, and deadline captured when they were created.
 
 ## Node synchronized settings
 

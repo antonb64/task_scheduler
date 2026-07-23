@@ -33,6 +33,11 @@
       "default": null,
       "description": "Optional per-trigger collection expansion. When absent, the trigger creates one ordinary run."
     },
+    "observability": {
+      "$ref": "#/$defs/observability",
+      "default": {},
+      "description": "Per-schedule operational completion objective. Omitted values are resolved and persisted from cluster defaults when the schedule is created or updated."
+    },
     "required_labels": {
       "$ref": "#/$defs/labels",
       "default": {}
@@ -76,6 +81,17 @@
       "type": "object",
       "additionalProperties": {
         "type": "string"
+      }
+    },
+    "observability": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "completion_deadline_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Maximum time from scheduled_at until successful completion before the trigger is overdue."
+        }
       }
     },
     "parameter_collection": {

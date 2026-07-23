@@ -40,14 +40,46 @@ This endpoint requires administrator authentication and reports the coordinator 
   "protocol": "http/protobuf",
   "last_success_unix_ms": 1784606400123,
   "last_error_class": null,
+  "failed_signals": [],
+  "signals": [
+    {
+      "signal": "traces",
+      "last_success_unix_ms": 1784606400123,
+      "failed": false,
+      "failed_items": 0
+    },
+    {
+      "signal": "metrics",
+      "last_success_unix_ms": 1784606400123,
+      "failed": false,
+      "failed_items": 0
+    },
+    {
+      "signal": "logs",
+      "last_success_unix_ms": 1784606400123,
+      "failed": false,
+      "failed_items": 0
+    }
+  ],
   "dropped_telemetry": 0,
   "export_batches_in_flight": 0,
   "span_queue_capacity": 2048,
-  "log_queue_capacity": 2048
+  "log_queue_capacity": 2048,
+  "authoritative_state": {
+    "last_snapshot_at": "2026-07-23T08:00:00Z",
+    "coverage_gap": false,
+    "coverage_gap_reason": null,
+    "outbox_depth": 0,
+    "outbox_oldest_event_at": null,
+    "outbox_delivered_events": 4812,
+    "outbox_expired_events": 0,
+    "current_day_verdict": "green",
+    "previous_day_verdict": "green"
+  }
 }
 ```
 
-`protocol` can be `grpc`, `http/protobuf`, `mixed`, or `disabled`. The response never includes endpoints, headers, credentials, certificates, keys, or secret-file paths. It covers the coordinator exporter only; agent exporter status is logged locally at agent startup and is not aggregated here.
+`protocol` can be `grpc`, `http/protobuf`, `mixed`, or `disabled`. Signal entries provide independent freshness and cumulative failed-item counts. `authoritative_state` exposes the durable log outbox, irreversible coverage loss, last reconciled snapshot, and the shared current/previous daily verdict. The response never includes endpoints, headers, credentials, certificates, keys, or secret-file paths. Exporter signal status covers the coordinator process; agents project their ledger/outbox state with agent resource identity.
 
 ## Error envelope
 
@@ -407,7 +439,7 @@ Dashboard reads include an `ETag` and a versioned `{revision, config}` document.
 }
 ```
 
-At most 100 unique schedule IDs are allowed; order is display order and widgets must be unique. Update the dashboard through the same lock/revision protocol as settings, using document key `dashboard`, `If-Match`, `expected_revision`, and `lock_token`. The telemetry widget uses the safe live coordinator exporter status and shows local/configured/degraded, protocol, dropped count, and export batches in flight. The connector widget reports configuration/observed batch posture. Neither is an active readiness probe.
+At most 100 unique schedule IDs are allowed; order is display order and widgets must be unique. Update the dashboard through the same lock/revision protocol as settings, using document key `dashboard`, `If-Match`, `expected_revision`, and `lock_token`. The telemetry widget uses the safe live coordinator exporter status and durable outbox state. The dashboard's daily schedule table and cluster verdict use the same authoritative evaluator as the OTLP metric projection. The connector widget reports configuration/observed batch posture. See the [backend-neutral dashboard contract](observability.md#backend-neutral-dashboard-specification).
 
 ## Settings
 

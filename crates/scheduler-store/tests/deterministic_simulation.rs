@@ -119,6 +119,7 @@ fn schedule_spec(name: impl Into<String>) -> ScheduleSpec {
             uri: "file:///simulation/parameters.json".into(),
         },
         parameter_collection: None,
+        observability: Default::default(),
         required_labels: BTreeMap::new(),
         cron: None,
         webhook_enabled: true,

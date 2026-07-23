@@ -52,6 +52,8 @@ async fn run_macro(
             sensitive_parameter_paths: Vec::new(),
             late_bindings: None,
         },
+        traceparent: None,
+        tracestate: None,
     };
     let mut child = Command::new(env!("CARGO_BIN_EXE_task-executor"))
         .stdin(Stdio::piped())

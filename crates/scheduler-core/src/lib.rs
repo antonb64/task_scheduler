@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod dashboard;
 pub mod domain;
 pub mod health;
+pub mod observability;
 pub mod schedule;
 
 pub use adapter::{
@@ -21,3 +22,4 @@ pub use collection::*;
 pub use crypto::SnapshotCipher;
 pub use dashboard::{DashboardConfig, DashboardWidget};
 pub use domain::*;
+pub use observability::*;
