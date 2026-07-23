@@ -10,6 +10,8 @@ parameter_collection:
   max_items: 10000
   max_active_runs: 32
   poison_distinct_nodes: 2
+observability:
+  completion_deadline_seconds: 86400
 required_labels:
   os: windows
   capability: excel

@@ -3,6 +3,8 @@ blueprint_ref:
   uri: file:///absolute/path/to/task_scheduler/examples/blueprints/process-id-secure.yaml
 parameters_ref:
   uri: connector://process-id-odata/workbooks/2147483647/groups/daily
+observability:
+  completion_deadline_seconds: 86400
 required_labels: {}
 cron:
   expression: "0 0 6 * * * *"

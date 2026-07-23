@@ -3,6 +3,8 @@ blueprint_ref:
   uri: file:///absolute/path/to/task_scheduler/examples/blueprints/echo.yaml
 parameters_ref:
   uri: file:///absolute/path/to/task_scheduler/examples/parameters/echo.json
+observability:
+  completion_deadline_seconds: 86400
 required_labels: {}
 cron: null
 webhook_enabled: true

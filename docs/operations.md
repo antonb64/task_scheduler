@@ -1,6 +1,6 @@
 # Operations, observability, and troubleshooting
 
-The coordinator SQLite database and audit table are the authoritative control-plane record. OTLP export and task output telemetry are operational aids and remain non-blocking when the collector is unavailable.
+Coordinator SQLite and each agent ledger remain the durable storage engines, but operators do not need to query them to determine processing state. Durable `scheduler.state` OTLP logs reproduce lifecycle history, reconciled gauges project current state, and the shared daily evaluator produces freshness-gated schedule and cluster verdicts. Collector outages remain non-blocking; state events queue and replay with stable IDs. See the [authoritative observability contract](observability.md).
 
 ## Routine checks
 
@@ -106,7 +106,9 @@ SCHEDULER_OTLP_TLS_CLIENT_KEY_FILE=/etc/task-scheduler/otel-client.key
 
 The credential file contains the bare bearer token and produces an `Authorization: Bearer ...` header. `SCHEDULER_OTLP_BEARER_TOKEN_FILE` is an alias. The headers file uses the same `key=value,key2=value2` format as `OTEL_EXPORTER_OTLP_HEADERS`; environment headers override duplicate file keys. Standard TLS aliases `OTEL_EXPORTER_OTLP_CERTIFICATE`, `OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE`, and `OTEL_EXPORTER_OTLP_CLIENT_KEY` are also accepted. Client certificate/key must be configured together. Each secret file is capped at 64 KiB; endpoints may not contain credentials or query strings. Values and file paths are redacted from telemetry configuration debug output.
 
-The implementation exports traces, metrics, and bridged structured logs in bounded batches. Span/log queues hold 2,048 items and export at most 512 per batch; metrics export every 30 seconds; calls have five-second timeouts. Collector unavailability does not stop scheduling. Authenticated `GET /api/v1/telemetry/status` reports safe coordinator exporter state: configured flag, protocol (`grpc`, `http/protobuf`, `mixed`, or `disabled`), last-success Unix milliseconds, safe last-error class, failed-export item count, batches in flight, and queue capacities. The dashboard renders this as local/configured/degraded with dropped and in-flight counts. It never exposes endpoints, headers, credentials, certificate material, or file paths. Providers attempt to flush during normal shutdown.
+Diagnostic traces/logs use bounded best-effort queues. Span/log queues hold 2,048 items and export at most 512 per batch; metrics export every 30 seconds; calls have five-second timeouts. Authoritative `scheduler.state` logs first enter a separate durable SQLite outbox and are acknowledged only after exporter success. Collector unavailability does not stop scheduling; events replay with the same ID. Retention exhaustion creates a durable coverage gap and forces `unknown`.
+
+Authenticated `GET /api/v1/telemetry/status` reports safe per-signal freshness/failure state plus the authoritative snapshot time, outbox depth/oldest event, delivered/expired totals, coverage-gap state, and current/previous cluster verdict. The dashboard renders the same daily evaluator. Status never exposes endpoints, headers, credentials, certificate material, or file paths. Providers attempt to flush during normal shutdown.
 
 The currently emitted metrics are:
 
@@ -138,12 +140,24 @@ The currently emitted metrics are:
 | `scheduler.collection.page.commits` / `scheduler.collection.page.items` / `scheduler.collection.page.duration_ms` | coordinator | `source`, `outcome=applied|replayed|stale|error` |
 | `scheduler.collection.finalizations` / `scheduler.collection.finalization.duration_ms` | coordinator | `outcome=finalized|already_finalized|error` |
 | `scheduler.node_health.transitions` | coordinator | `state` |
+| `scheduler.state.entities` / `scheduler.state.overdue` | coordinator | reconciled `schedule.id`, bounded `entity`, `state`/`window` |
+| `scheduler.schedule.daily.triggers` / `scheduler.schedule.daily.items` | coordinator | `schedule.id`, `window`, bounded status/state |
+| `scheduler.schedule.daily.retries` / `scheduler.schedule.daily.attempt_anomalies` | coordinator | `schedule.id`, `window` |
+| `scheduler.schedule.daily.verdict` | coordinator | one-hot `schedule.id`, `window`, `verdict` |
+| `scheduler.schedule.daily.operations_day` / `scheduler.schedule.completion_deadline_seconds` | coordinator | schedule/window; operations day is `YYYYMMDD` and carries bounded timezone |
+| `scheduler.schedule.last_success_age_seconds` / `scheduler.cron.backlog` | coordinator | `schedule.id` and window where applicable |
+| `scheduler.cluster.agents` / `scheduler.cluster.agent.capacity` | coordinator | `agent.id`, bounded connection/health/settings/kind |
+| `scheduler.agent.assignment_state` / `scheduler.agent.pending_results` | agent | assignment state or none |
+| `scheduler.observability.snapshot.generated_at_unix_seconds` | coordinator/agent | none |
+| `scheduler.observability.outbox.depth` / `scheduler.observability.outbox.oldest_age_seconds` / `scheduler.observability.outbox.expired_events` | coordinator/agent | none |
+| `scheduler.observability.coverage_gap` | coordinator/agent | none |
+| `scheduler.observability.telemetry.export_failures` / `scheduler.observability.telemetry.dropped_items` | coordinator | signal where applicable |
 
 The synchronized global/node `otlp_endpoint` fields are currently reserved and do not hot-reconfigure the provider. All endpoint/protocol/credential/TLS changes require a process restart. Atomic runtime exporter reconfiguration is not implemented; a bad startup configuration fails startup rather than replacing a live exporter.
 
 Collection traces are `coordinator.collection.worker_pass`, `coordinator.collection.batch`, `coordinator.collection.source.fetch`, `coordinator.collection.page.commit`, and `coordinator.collection.batch.finalize`. They correlate batch/schedule/trigger, safe source kind/page size, page generation/count/finality/outcome, and finalization outcome without provider keys, cursors, resource queries, or parameters. `coordinator.health.classify_attempt` correlates run, attempt, and node in a trace; node IDs intentionally remain out of metric labels. Queue depth is observed inside `coordinator.dispatch.pass`, with each candidate in `coordinator.dispatch.candidate`.
 
-Useful alerts include sustained nonzero ready queue depth, delayed-queue growth, cron lag, collection source errors/latency, failed finalizations, invalid/poisoned/held item rates, automatic node-health transitions, lease expirations, repeated infrastructure failure codes, exhausted active/Excel slots, no results following dispatch offers, management 5xx latency, desired/applied settings divergence, and missing agent-connected logs. Exporter failures/dropped counts, in-flight batches, and configured queue capacities are available through telemetry status; the upstream SDK does not expose exact instantaneous queue occupancy.
+Daily, freshness-gated dashboard and alert recipes are specified in [Authoritative observability](observability.md#backend-neutral-dashboard-specification). In particular, stale or missing snapshots and coverage gaps are `unknown`, never green.
 
 ## Failure diagnostics
 
@@ -234,7 +248,7 @@ Every connected node proxies the coordinator-authoritative control panel. Schedu
 
 Global ID search accepts a canonical ID or unique/ambiguous prefix of at least eight safe characters and searches schedule, run, attempt, node, and loaded blueprint digest records. It shows all matches rather than selecting an ambiguous prefix. The runs page shows each schedule name and supports an exact schedule filter which is preserved across cursor pages. Failed and retrying runs show their latest safe code, origin, lifecycle stage, and summary in the list. Batch/provider-key search is deliberately local to an authenticated batch detail page and exact-match only.
 
-The cluster dashboard is revision-fenced and protected by the same two-minute edit lease as settings. Its lifetime node-throughput table is backed by a transactional rollup and shows completed task attempts, succeeded/failed/cancelled outcomes, active slots, and the latest completion time. A retry counts again on the node which processed it. Up to 100 schedule cards can be ordered. Cards show a 24-hour view of queued/running, success/business/infrastructure counts, invalid and poisoned/held items, retries, node diversity, p50/p95 duration (bounded to 10,000 sampled attempt durations), and last execution/success/failure. Daily schedule rollups are persisted transactionally for terminal outcomes, while the current dashboard combines live queries. The UI does not currently offer selectable 7-day/30-day windows.
+The cluster dashboard is revision-fenced and protected by the same two-minute edit lease as settings. Its lifetime node-throughput table is backed by a transactional rollup and shows completed task attempts, succeeded/failed/cancelled outcomes, active slots, and the latest completion time. A retry counts again on the node which processed it. Up to 100 schedule cards can be ordered. Cards retain the 24-hour operational view, while the daily table uses the shared schedule-local evaluator and shows current/previous operations day, deadline, expected/materialized/completed/pending/overdue work, retries, bad items, last success, and verdict. Telemetry coverage and outbox health are visible beside per-signal exporter freshness.
 
 Loaded-blueprint pages show metadata only: digest, redacted source, source version/load time, executor kind, labels, policy/schema/binding declarations, and current/retained usage. Collection/base parameter values and secret values are never shown.
 
@@ -416,8 +430,8 @@ taskctl batches items <batch-id> --limit 200
 - Synchronized OTLP endpoint fields do not currently hot-apply.
 - Node settings rejection errors are exposed in the API/UI. Rejected, stale, future, and late acknowledgements do not advance the applied revision or alter effective placement settings.
 - Built-in backup/checkpoint automation is not implemented.
-- Queue depth, cron lag, collection ingestion/state/items/errors/latency, node-health transitions, settings sync, management request latency/status class, and active total/Excel slot capacity have dedicated metrics. Exporter failure/drop state is exposed through telemetry status rather than a self-referential OTLP metric.
-- OTLP HTTP/protobuf, header/credential files, custom TLS files, per-signal endpoints, and safe coordinator exporter status are startup-supported. The status endpoint/dashboard cover the coordinator process, not each remote agent exporter; atomic runtime telemetry reconfiguration is not implemented.
+- Queue depth, cron backlog/lag, collection ingestion/state/items/errors/latency, node-health transitions, settings sync, management request latency/status class, capacity, pending results, daily verdict, and telemetry coverage have dedicated reconciled metrics.
+- OTLP HTTP/protobuf, header/credential files, custom TLS files, per-signal endpoints, safe per-signal status, and durable state-log replay are startup-supported. Atomic runtime telemetry reconfiguration is not implemented.
 - Readiness covers SQLite only.
 - Built-in direct HTTP artifact fetching has no production header configuration. Use a named connector when authentication is required.
 - Connector health/discovery and automatic connector-to-file fallback are not implemented.

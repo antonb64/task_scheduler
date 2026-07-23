@@ -129,7 +129,29 @@ async fn telemetry_status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&state, &headers)?;
-    Ok(Json(serde_json::to_value(scheduler_telemetry::status())?))
+    let mut status = serde_json::to_value(scheduler_telemetry::status())?;
+    let now = Utc::now();
+    let current = state
+        .store
+        .daily_observability_snapshot(now, scheduler_core::DailyWindow::Current)
+        .await?;
+    let previous = state
+        .store
+        .daily_observability_snapshot(now, scheduler_core::DailyWindow::Previous)
+        .await?;
+    let outbox = state.store.observability_outbox_status().await?;
+    status["authoritative_state"] = serde_json::json!({
+        "last_snapshot_at": outbox.last_snapshot_at,
+        "coverage_gap": outbox.coverage_gap,
+        "coverage_gap_reason": outbox.gap_reason,
+        "outbox_depth": outbox.pending_events,
+        "outbox_oldest_event_at": outbox.oldest_pending_at,
+        "outbox_delivered_events": outbox.delivered_events,
+        "outbox_expired_events": outbox.expired_events,
+        "current_day_verdict": current.cluster_verdict,
+        "previous_day_verdict": previous.cluster_verdict,
+    });
+    Ok(Json(status))
 }
 
 async fn get_agent_health(
@@ -1270,6 +1292,7 @@ fn validate_schedule_spec(spec: &ScheduleSpec) -> Result<()> {
     if spec.name.trim().is_empty() {
         bail!("schedule name is required");
     }
+    spec.observability.validate()?;
     if let Some(collection) = &spec.parameter_collection {
         collection.validate()?;
     }
@@ -2038,6 +2061,7 @@ parameters_schema:
                 uri: "connector://records/accounts/current?revision=17".into(),
             },
             parameter_collection: None,
+            observability: Default::default(),
             required_labels: Default::default(),
             cron: None,
             webhook_enabled: false,

@@ -78,4 +78,17 @@ mod tests {
         config.widgets.push(DashboardWidget::ClusterCapacity);
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn maximum_dashboard_schedule_set_is_bounded() {
+        let mut config = DashboardConfig {
+            schedule_ids: (0..MAX_DASHBOARD_SCHEDULES)
+                .map(|_| Uuid::new_v4())
+                .collect(),
+            ..DashboardConfig::default()
+        };
+        config.validate().expect("maximum schedule set");
+        config.schedule_ids.push(Uuid::new_v4());
+        assert!(config.validate().is_err());
+    }
 }

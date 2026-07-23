@@ -59,6 +59,7 @@ For Windows Excel execution, run the agent after interactive user logon, not as 
 - [Schedules, blueprints, collections, secure bindings, cron, webhooks, and Excel](docs/tasks.md)
 - [Artifact and parameter-collection connectors](docs/connectors.md)
 - [Operations, telemetry, backups, diagnostics, and troubleshooting](docs/operations.md)
+- [Authoritative observability, daily verdicts, dashboards, alerts, and runbook](docs/observability.md)
 - [HTTP API](docs/api.md)
 - [Architecture and delivery guarantees](docs/architecture.md)
 - [Tests and deterministic simulation](docs/testing.md)

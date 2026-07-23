@@ -6,7 +6,9 @@ use scheduler_core::{BatchItemState, BatchState, CronSpec};
 use sqlx::{Row, Sqlite, Transaction};
 use uuid::Uuid;
 
-use super::{Store, append_audit_tx, format_time, now_string, parse_time};
+use super::{
+    Store, append_audit_tx, format_time, insert_trigger_identity_tx, now_string, parse_time,
+};
 
 const START_CURSOR_DIGEST: &str = "start";
 
@@ -186,7 +188,7 @@ impl Store {
         let schedule_id = new.schedule_id.to_string();
         let batch_id = new.id.to_string();
         let trigger_id = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let fenced = sqlx::query(
             "UPDATE schedules SET last_cron_at=CASE WHEN last_cron_at IS NULL OR last_cron_at<? THEN ? ELSE last_cron_at END WHERE id=? AND revision=? AND enabled=1 AND cron_expression=? AND cron_timezone=?",
@@ -204,15 +206,19 @@ impl Store {
             return Ok(CronBatchOccurrenceResult::StaleSchedule);
         }
 
-        let trigger = sqlx::query(
-            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at) VALUES (?,?,'cron',?,NULL,'batch',?,?)",
+        let trigger = insert_trigger_identity_tx(
+            &mut tx,
+            &trigger_id,
+            &schedule_id,
+            "cron",
+            new.scheduled_at,
+            None,
+            "batch",
+            &batch_id,
+            &now,
+            None,
+            None,
         )
-        .bind(&trigger_id)
-        .bind(&schedule_id)
-        .bind(&occurrence)
-        .bind(&batch_id)
-        .bind(&now)
-        .execute(&mut *tx)
         .await;
         if let Err(error) = trigger {
             if error
@@ -260,7 +266,7 @@ impl Store {
         let batch_id = new.id.to_string();
         let schedule_id = new.schedule_id.to_string();
         let trigger_id = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let current_revision =
             sqlx::query_scalar::<_, i64>("SELECT revision FROM schedules WHERE id=?")
@@ -273,17 +279,19 @@ impl Store {
             bail!("schedule revision changed before batch creation");
         }
 
-        let trigger = sqlx::query(
-            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at) VALUES (?,?,?,?,?,'batch',?,?)",
+        let trigger = insert_trigger_identity_tx(
+            &mut tx,
+            &trigger_id,
+            &schedule_id,
+            &new.trigger_kind,
+            new.scheduled_at,
+            new.idempotency_key.as_deref(),
+            "batch",
+            &batch_id,
+            &now,
+            None,
+            None,
         )
-        .bind(&trigger_id)
-        .bind(&schedule_id)
-        .bind(&new.trigger_kind)
-        .bind(format_time(new.scheduled_at))
-        .bind(&new.idempotency_key)
-        .bind(&batch_id)
-        .bind(&now)
-        .execute(&mut *tx)
         .await;
         if let Err(error) = trigger {
             if error
@@ -339,7 +347,7 @@ impl Store {
     ) -> Result<BatchView> {
         let now = now_string();
         let trigger_id = Uuid::new_v4().to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let row = sqlx::query("SELECT * FROM batches WHERE id=?")
             .bind(source_batch_id.to_string())
             .fetch_optional(&mut *tx)
@@ -363,16 +371,19 @@ impl Store {
             poison_distinct_nodes: source.poison_distinct_nodes,
         };
         validate_batch_limits(&new)?;
-        sqlx::query(
-            "INSERT INTO trigger_identities(id,schedule_id,trigger_kind,scheduled_at,idempotency_key,target_kind,target_id,created_at) \
-             VALUES (?,?, 'retrigger',?,NULL,'batch',?,?)",
+        insert_trigger_identity_tx(
+            &mut tx,
+            &trigger_id,
+            &new.schedule_id.to_string(),
+            "retrigger",
+            scheduled_at,
+            None,
+            "batch",
+            &new_batch_id.to_string(),
+            &now,
+            None,
+            None,
         )
-        .bind(&trigger_id)
-        .bind(new.schedule_id.to_string())
-        .bind(format_time(scheduled_at))
-        .bind(new_batch_id.to_string())
-        .bind(&now)
-        .execute(&mut *tx)
         .await?;
         insert_batch_tx(&mut tx, &new, &trigger_id, &now).await?;
         append_audit_tx(
@@ -477,6 +488,7 @@ impl Store {
             let old_token: Option<String> = row.get("lease_token");
             let old_expiry: Option<String> = row.get("lease_expires_at");
             let token = Uuid::new_v4().to_string();
+            let mut tx = self.pool.begin().await?;
             let result = sqlx::query(
                 "UPDATE batches SET state='collecting',lease_owner=?,lease_token=?,lease_expires_at=?,updated_at=? WHERE id=? AND state=? AND lease_token IS ? AND lease_expires_at IS ?",
             )
@@ -485,18 +497,33 @@ impl Store {
             .bind(format_time(now + Duration::seconds(lease_seconds.max(1) as i64)))
             .bind(format_time(now))
             .bind(&id)
-            .bind(old_state)
+            .bind(&old_state)
             .bind(old_token)
             .bind(old_expiry)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
             if result.rows_affected() == 1 {
+                append_audit_tx(
+                    &mut tx,
+                    "batch",
+                    &id,
+                    if old_state == "scheduled" {
+                        "batch.collection_started"
+                    } else {
+                        "batch.collection_lease_recovered"
+                    },
+                    serde_json::json!({"from": old_state, "to": "collecting"}),
+                )
+                .await?;
+                tx.commit().await?;
                 let batch_id = Uuid::parse_str(&id)?;
                 claimed.push(
                     self.get_batch(batch_id)
                         .await?
                         .context("claimed batch missing")?,
                 );
+            } else {
+                tx.rollback().await?;
             }
         }
         Ok(claimed)
@@ -881,11 +908,24 @@ impl Store {
         .bind(&id)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("UPDATE runs SET state='cancelled',updated_at=? WHERE batch_id=? AND state IN ('queued','running')")
-            .bind(&now)
-            .bind(&id)
-            .execute(&mut *tx)
+        let cancelled_runs = sqlx::query(
+            "UPDATE runs SET state='cancelled',updated_at=? \
+             WHERE batch_id=? AND state IN ('queued','running') RETURNING id",
+        )
+        .bind(&now)
+        .bind(&id)
+        .fetch_all(&mut *tx)
+        .await?;
+        for run in cancelled_runs {
+            append_audit_tx(
+                &mut tx,
+                "run",
+                run.get::<String, _>("id").as_str(),
+                "run.cancelled",
+                serde_json::Value::Null,
+            )
             .await?;
+        }
         sqlx::query("UPDATE batch_items SET state='cancelled',updated_at=? WHERE batch_id=? AND state IN ('ready','queued','running')")
             .bind(&now)
             .bind(&id)
@@ -1301,6 +1341,7 @@ mod tests {
                 uri: "file:///base.json".into(),
             },
             parameter_collection: None,
+            observability: Default::default(),
             required_labels: BTreeMap::new(),
             cron: None,
             webhook_enabled: true,
@@ -1440,6 +1481,15 @@ mod tests {
             .create_batch(batch.clone())
             .await
             .expect("create batch");
+        let batch_trace = scheduler_telemetry::TraceContextFields {
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
+            tracestate: Some("vendor=value".into()),
+        };
+        database
+            .store
+            .capture_batch_trace_context(batch_id, &batch_trace)
+            .await
+            .expect("capture batch trace");
         let duplicate = database
             .store
             .create_batch(NewBatch {
@@ -1482,6 +1532,26 @@ mod tests {
                 .expect("replay page"),
             CommitPageOutcome::Replayed
         );
+        let item_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events \
+             WHERE entity_type='batch_item' AND event_type='batch_item.created'",
+        )
+        .fetch_one(database.store.pool())
+        .await
+        .expect("collection item event count");
+        assert_eq!(
+            item_events, 2,
+            "each durable item insertion must have exactly one state event"
+        );
+        let item_outbox_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observability_outbox o JOIN audit_events a \
+             ON a.id=o.audit_event_id WHERE a.entity_type='batch_item' \
+             AND a.event_type='batch_item.created'",
+        )
+        .fetch_one(database.store.pool())
+        .await
+        .expect("collection item outbox count");
+        assert_eq!(item_outbox_events, item_events);
 
         let token = token.to_owned();
         database.reopen().await;
@@ -1540,6 +1610,13 @@ mod tests {
         );
         let runs = database.store.queued_runs(10).await.expect("queued runs");
         assert_eq!(runs.len(), 1);
+        let child_trace = database
+            .store
+            .run_trace_context(runs[0].view.id)
+            .await
+            .expect("child trace context");
+        assert_eq!(child_trace.traceparent, batch_trace.traceparent);
+        assert_eq!(child_trace.tracestate, batch_trace.tracestate);
         let attempt = database
             .store
             .create_attempt(runs[0].view.id, "node-a", 60)
@@ -1569,6 +1646,72 @@ mod tests {
             .expect("batch")
             .expect("batch");
         assert_eq!(finished.view.state, BatchState::CompletedWithErrors);
+    }
+
+    #[tokio::test]
+    async fn maximum_size_batch_keeps_item_events_durable_and_bounded() {
+        let database = TestDatabase::new().await;
+        let schedule_id = create_schedule(&database.store).await;
+        let batch_id = Uuid::new_v4();
+        database
+            .store
+            .create_batch(new_batch(batch_id, schedule_id, None, 32))
+            .await
+            .expect("batch");
+        let claimed = database
+            .store
+            .claim_collection_batches("load-test", 60, 1)
+            .await
+            .expect("claim");
+        let token = claimed[0].lease_token.as_deref().expect("token");
+        let mut request_cursor = START_CURSOR_DIGEST.to_owned();
+        for generation in 0_u64..20 {
+            let first_index = u32::try_from(generation * 500).expect("index");
+            let items = (first_index..first_index + 500)
+                .map(|index| ready_item(index, &format!("load-key-{index}")))
+                .collect();
+            let next_cursor = format!("load-cursor-{}", generation + 1);
+            database
+                .store
+                .commit_collection_page(page(
+                    batch_id,
+                    token,
+                    generation,
+                    &request_cursor,
+                    &next_cursor,
+                    generation == 19,
+                    items,
+                ))
+                .await
+                .expect("commit maximum batch page");
+            request_cursor = next_cursor;
+        }
+
+        let batch = database
+            .store
+            .get_batch(batch_id)
+            .await
+            .expect("batch")
+            .expect("batch");
+        assert_eq!(batch.view.item_count, 10_000);
+        let item_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM observability_outbox \
+             WHERE entity_type='batch_item' AND event_name='batch_item.created'",
+        )
+        .fetch_one(database.store.pool())
+        .await
+        .expect("item event count");
+        assert_eq!(item_events, 10_000);
+        assert_eq!(
+            database
+                .store
+                .claim_observability_events(10_000)
+                .await
+                .expect("bounded publication claim")
+                .len(),
+            512,
+            "publication must enforce its fixed batch bound"
+        );
     }
 
     #[tokio::test]

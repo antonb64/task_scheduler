@@ -84,6 +84,14 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    scheduler_telemetry::set_current_span_parent(
+        headers
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok()),
+        headers
+            .get("tracestate")
+            .and_then(|value| value.to_str().ok()),
+    );
     let started = Instant::now();
     let request_id = headers
         .get(&REQUEST_ID_HEADER)
@@ -106,10 +114,19 @@ async fn proxy(
         "if-match",
         "idempotency-key",
         "x-request-id",
+        "traceparent",
+        "tracestate",
     ] {
         if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
             forwarded.insert(name.to_owned(), value.to_owned());
         }
+    }
+    let trace_context = scheduler_telemetry::current_trace_context();
+    if let Some(traceparent) = trace_context.traceparent {
+        forwarded.insert("traceparent".into(), traceparent);
+    }
+    if let Some(tracestate) = trace_context.tracestate {
+        forwarded.insert("tracestate".into(), tracestate);
     }
     let request = ManagementRequest {
         method: method.as_str().into(),

@@ -35,6 +35,8 @@ fn assignment(program: &str, args: Vec<String>, lease_seconds: u64) -> Execution
             sensitive_parameter_paths: Vec::new(),
             late_bindings: None,
         },
+        traceparent: None,
+        tracestate: None,
     }
 }
 

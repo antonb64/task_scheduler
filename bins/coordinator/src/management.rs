@@ -21,6 +21,16 @@ tokio::task_local! {
 }
 
 pub async fn request_context(mut request: Request, next: Next) -> Response {
+    scheduler_telemetry::set_current_span_parent(
+        request
+            .headers()
+            .get("traceparent")
+            .and_then(|value| value.to_str().ok()),
+        request
+            .headers()
+            .get("tracestate")
+            .and_then(|value| value.to_str().ok()),
+    );
     let request_id = request
         .headers()
         .get(&REQUEST_ID_HEADER)

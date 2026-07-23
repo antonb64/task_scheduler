@@ -26,6 +26,8 @@ blueprint_ref:
   uri: file:///srv/task-scheduler/artifacts/echo.yaml
 parameters_ref:
   uri: file:///srv/task-scheduler/artifacts/echo.json
+observability:
+  completion_deadline_seconds: 86400
 required_labels:
   pool: general
 cron:
@@ -41,12 +43,13 @@ enabled: true
 | `blueprint_ref.uri` | Required | Blueprint artifact URI. |
 | `parameters_ref.uri` | Required | Base parameter artifact URI. |
 | `parameter_collection` | `null` | Optional per-trigger collection source and ingestion/concurrency limits. When present, a trigger creates a batch rather than one run. |
+| `observability.completion_deadline_seconds` | Global default, initially `86400` | Maximum time from `scheduled_at` to complete successfully. The resolved deadline, operations timezone, and local day are captured on the trigger and do not change after schedule edits. |
 | `required_labels` | `{}` | Additional exact-match placement labels merged over the blueprint labels. Schedule values win on duplicate keys. |
 | `cron` | `null` | `{expression, timezone}` repeated trigger. |
 | `webhook_enabled` | `false` | Whether the schedule has an authenticated public webhook. |
 | `enabled` | `true` | Paused schedules do not create or accept new runs. |
 
-Creating or updating a schedule fails if either schedule-time artifact cannot be fetched, the blueprint is invalid, or the cron/timezone is invalid. Base parameters are validated immediately for ordinary schedules. Collection schedules and blueprints with late agent bindings defer final validation until collection-item merge or agent binding resolution respectively. Updates increment the schedule revision. Already queued/running runs and batches retain their old execution snapshots.
+Creating or updating a schedule fails if either schedule-time artifact cannot be fetched, the blueprint is invalid, the observability deadline is zero, or the cron/timezone is invalid. Base parameters are validated immediately for ordinary schedules. Collection schedules and blueprints with late agent bindings defer final validation until collection-item merge or agent binding resolution respectively. Updates increment the schedule revision. Already queued/running runs and batches retain their old execution snapshots and observability interpretation.
 
 Copyable examples:
 

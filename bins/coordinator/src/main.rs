@@ -29,8 +29,13 @@ use tracing::{info, info_span};
 #[tokio::main]
 async fn main() -> Result<()> {
     let config = Config::parse();
-    let telemetry =
-        scheduler_telemetry::init("scheduler-coordinator", config.otlp_endpoint.as_deref())?;
+    let service_instance_id = uuid::Uuid::new_v4().to_string();
+    let telemetry = scheduler_telemetry::init_with_instance(
+        "scheduler-coordinator",
+        config.otlp_endpoint.as_deref(),
+        &service_instance_id,
+        None,
+    )?;
     let telemetry_status = telemetry.status();
     info!(
         configured = telemetry_status.configured,

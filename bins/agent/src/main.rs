@@ -69,7 +69,12 @@ async fn main() -> Result<()> {
         &config.secret_roots,
         config.binding_max_bytes,
     )?);
-    let telemetry = scheduler_telemetry::init("scheduler-agent", config.otlp_endpoint.as_deref())?;
+    let telemetry = scheduler_telemetry::init_with_instance(
+        "scheduler-agent",
+        config.otlp_endpoint.as_deref(),
+        &config.agent_id,
+        Some(&config.agent_id),
+    )?;
     let telemetry_status = telemetry.status();
     info!(
         configured = telemetry_status.configured,
@@ -103,6 +108,7 @@ async fn main() -> Result<()> {
         heartbeat_seconds,
         parameter_bindings,
     };
+    spawn_observability(runtime.clone());
 
     let proxy_client = Arc::new(RwLock::new(None));
     let ui = proxy::router(proxy::ProxyState {
@@ -145,6 +151,164 @@ async fn main() -> Result<()> {
 
     tokio::try_join!(run_connections(runtime, proxy_client), ui_server)?;
     Ok(())
+}
+
+fn spawn_observability(runtime: Runtime) {
+    let mut durable_log_acks = scheduler_telemetry::subscribe_durable_log_acks();
+    let ack_ledger = runtime.ledger.clone();
+    tokio::spawn(async move {
+        loop {
+            match durable_log_acks.recv().await {
+                Ok(event_id) => {
+                    if let Err(error) = ack_ledger.acknowledge_observability_event(&event_id).await
+                    {
+                        error!(%event_id, %error, "cannot acknowledge exported agent state event");
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    warn!(
+                        skipped,
+                        "agent state-event acknowledgements lagged; events will replay"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+
+    let publisher_ledger = runtime.ledger.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            match publisher_ledger.claim_observability_events(256).await {
+                Ok(events) => {
+                    for event in events {
+                        let span = tracing::info_span!(
+                            "agent.observability.state_event",
+                            event.id = %event.event_id
+                        );
+                        let _entered = span.enter();
+                        scheduler_telemetry::set_current_span_parent(
+                            event.traceparent.as_deref(),
+                            event.tracestate.as_deref(),
+                        );
+                        tracing::info!(
+                            target: "scheduler.state",
+                            event_id = %event.event_id,
+                            event_sequence = event.sequence,
+                            event_name = %event.event_name,
+                            event_occurred_at = %event.occurred_at,
+                            entity.type = "assignment",
+                            entity.id = %event.entity_id,
+                            event_attributes_json = %event.attributes_json,
+                            "authoritative agent state transition"
+                        );
+                    }
+                }
+                Err(error) => error!(%error, "cannot publish durable agent state events"),
+            }
+        }
+    });
+
+    let projection_ledger = runtime.ledger.clone();
+    tokio::spawn(async move {
+        use opentelemetry::KeyValue;
+
+        const STATES: &[&str] = &[
+            "accepted",
+            "claimed",
+            "running",
+            "cancel_requested",
+            "cancelled",
+            "finished",
+            "acknowledged",
+            "quarantined",
+        ];
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        let mut retention_ticks = 0_u32;
+        loop {
+            interval.tick().await;
+            match projection_ledger.local_observability_snapshot().await {
+                Ok(snapshot) => {
+                    let counts = snapshot
+                        .assignment_states
+                        .into_iter()
+                        .collect::<HashMap<_, _>>();
+                    let meter = opentelemetry::global::meter("scheduler-agent");
+                    let state_gauge = meter.u64_gauge("scheduler.agent.assignment_state").build();
+                    for state in STATES {
+                        state_gauge.record(
+                            counts.get(*state).copied().unwrap_or(0),
+                            &[KeyValue::new("state", *state)],
+                        );
+                    }
+                    meter
+                        .u64_gauge("scheduler.agent.pending_results")
+                        .build()
+                        .record(snapshot.pending_results, &[]);
+                    meter
+                        .u64_gauge("scheduler.observability.outbox.depth")
+                        .build()
+                        .record(snapshot.outbox_depth, &[]);
+                    meter
+                        .u64_gauge("scheduler.observability.outbox.oldest_age_seconds")
+                        .build()
+                        .record(
+                            snapshot
+                                .oldest_outbox_at
+                                .map(|oldest| {
+                                    u64::try_from((Utc::now() - oldest).num_seconds().max(0))
+                                        .unwrap_or(u64::MAX)
+                                })
+                                .unwrap_or(0),
+                            &[],
+                        );
+                    meter
+                        .u64_gauge("scheduler.observability.coverage_gap")
+                        .build()
+                        .record(u64::from(snapshot.coverage_gap), &[]);
+                    meter
+                        .u64_gauge("scheduler.observability.outbox.expired_events")
+                        .build()
+                        .record(snapshot.expired_events, &[]);
+                    let telemetry = scheduler_telemetry::status();
+                    meter
+                        .u64_gauge("scheduler.observability.telemetry.dropped_items")
+                        .build()
+                        .record(telemetry.dropped_telemetry, &[]);
+                    let export_failures = meter
+                        .u64_gauge("scheduler.observability.telemetry.export_failures")
+                        .build();
+                    for signal in telemetry.signals {
+                        export_failures.record(
+                            signal.failed_items,
+                            &[KeyValue::new("signal", signal.signal)],
+                        );
+                    }
+                    meter
+                        .u64_gauge("scheduler.observability.snapshot.generated_at_unix_seconds")
+                        .build()
+                        .record(
+                            u64::try_from(Utc::now().timestamp()).unwrap_or_default(),
+                            &[],
+                        );
+                }
+                Err(error) => error!(%error, "agent observability projection failed"),
+            }
+            retention_ticks = retention_ticks.saturating_add(1);
+            if retention_ticks >= 120 {
+                retention_ticks = 0;
+                match projection_ledger.expire_observability_events(90).await {
+                    Ok(expired) if expired > 0 => {
+                        error!(expired, "undelivered agent state events expired");
+                    }
+                    Ok(_) => {}
+                    Err(error) => error!(%error, "agent state-event retention pass failed"),
+                }
+            }
+        }
+    });
 }
 
 #[instrument(name = "agent.connection.supervisor", skip_all)]
@@ -315,6 +479,10 @@ async fn handle_coordinator_message(
     tracing::Span::current().record("message.kind", coordinator_message_kind(&message));
     match message.payload {
         Some(coordinator_message::Payload::Assignment(offer)) => {
+            scheduler_telemetry::set_current_span_parent(
+                offer.traceparent.as_deref(),
+                offer.tracestate.as_deref(),
+            );
             let assignment: ExecutionAssignment = serde_json::from_str(&offer.assignment_json)?;
             tracing::Span::current().record("run_id", tracing::field::display(assignment.run_id));
             tracing::Span::current()
@@ -401,6 +569,8 @@ async fn handle_coordinator_message(
                         agent_id: runtime.config.agent_id.clone(),
                         attempt_id: assignment.attempt_id.to_string(),
                         lease_token: assignment.lease_token.clone(),
+                        traceparent: scheduler_telemetry::current_trace_context().traceparent,
+                        tracestate: scheduler_telemetry::current_trace_context().tracestate,
                     })),
                 },
             )
@@ -579,6 +749,10 @@ fn executor_kind(assignment: &ExecutionAssignment) -> &'static str {
     )
 )]
 async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
+    scheduler_telemetry::set_current_span_parent(
+        assignment.traceparent.as_deref(),
+        assignment.tracestate.as_deref(),
+    );
     let attempt_id = assignment.attempt_id.to_string();
     let (cancel_tx, cancel_rx) = watch::channel(false);
     let (lease_tx, lease_rx) = watch::channel(0_u64);
@@ -723,6 +897,7 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
                 }
             }
             runtime.active.write().await.remove(&attempt_id);
+            let result_trace_context = scheduler_telemetry::current_trace_context();
             if let Err(error) = send(
                 &runtime,
                 AgentMessage {
@@ -731,6 +906,8 @@ async fn execute_assignment(runtime: Runtime, assignment: ExecutionAssignment) {
                         attempt_id: attempt_id.clone(),
                         lease_token: assignment.lease_token,
                         result_json: json,
+                        traceparent: result_trace_context.traceparent,
+                        tracestate: result_trace_context.tracestate,
                     })),
                 },
             )
@@ -1225,6 +1402,8 @@ async fn send_pending(runtime: &Runtime, tx: &mpsc::Sender<AgentMessage>) -> Res
                 attempt_id: pending.attempt_id,
                 lease_token: pending.lease_token,
                 result_json: pending.result_json,
+                traceparent: pending.traceparent,
+                tracestate: pending.tracestate,
             })),
         })
         .await?;
@@ -1266,6 +1445,8 @@ async fn send_result(runtime: &Runtime, pending: ledger::PendingResult) -> Resul
                 attempt_id: pending.attempt_id,
                 lease_token: pending.lease_token,
                 result_json: pending.result_json,
+                traceparent: pending.traceparent,
+                tracestate: pending.tracestate,
             })),
         },
     )
@@ -1299,12 +1480,15 @@ fn assignment_rejection_message(
     assignment: &ExecutionAssignment,
     code: &'static str,
 ) -> AgentMessage {
+    let trace_context = scheduler_telemetry::current_trace_context();
     AgentMessage {
         payload: Some(agent_message::Payload::Rejected(AttemptRejected {
             agent_id: agent_id.to_owned(),
             attempt_id: assignment.attempt_id.to_string(),
             lease_token: assignment.lease_token.clone(),
             code: code.into(),
+            traceparent: trace_context.traceparent,
+            tracestate: trace_context.tracestate,
         })),
     }
 }

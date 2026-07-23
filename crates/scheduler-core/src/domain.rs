@@ -36,6 +36,11 @@ pub struct ScheduleSpec {
     pub parameters_ref: ArtifactRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameter_collection: Option<crate::ParameterCollectionSpec>,
+    #[serde(
+        default,
+        skip_serializing_if = "ScheduleObservabilityPolicy::is_default"
+    )]
+    pub observability: ScheduleObservabilityPolicy,
     #[serde(default)]
     pub required_labels: BTreeMap<String, String>,
     #[serde(default)]
@@ -45,6 +50,41 @@ pub struct ScheduleSpec {
     #[serde(default = "default_true")]
     pub enabled: bool,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ScheduleObservabilityPolicy {
+    /// Maximum wall-clock time from the trigger's scheduled timestamp until
+    /// successful completion. `None` is accepted only at the API boundary and
+    /// is resolved to the cluster default before the schedule is persisted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_deadline_seconds: Option<u64>,
+}
+
+impl ScheduleObservabilityPolicy {
+    pub fn is_default(&self) -> bool {
+        self.completion_deadline_seconds.is_none()
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.completion_deadline_seconds == Some(0) {
+            bail!("observability completion_deadline_seconds must be at least one");
+        }
+        Ok(())
+    }
+
+    pub fn resolve(&mut self, default_completion_deadline_seconds: u64) {
+        self.completion_deadline_seconds
+            .get_or_insert(default_completion_deadline_seconds);
+    }
+
+    pub fn effective_completion_deadline_seconds(&self) -> u64 {
+        self.completion_deadline_seconds
+            .unwrap_or(DEFAULT_COMPLETION_DEADLINE_SECONDS)
+    }
+}
+
+pub const DEFAULT_COMPLETION_DEADLINE_SECONDS: u64 = 86_400;
 
 fn default_true() -> bool {
     true
@@ -214,6 +254,10 @@ pub struct ExecutionAssignment {
     pub lease_token: String,
     pub lease_seconds: u64,
     pub snapshot: ExecutionSnapshot,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traceparent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tracestate: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -380,6 +424,8 @@ pub struct GlobalSettings {
     pub default_timezone: String,
     pub default_max_attempts: u32,
     pub default_timeout_seconds: u64,
+    #[serde(default = "default_completion_deadline_seconds")]
+    pub default_completion_deadline_seconds: u64,
     pub lease_seconds: u64,
     pub heartbeat_seconds: u64,
     pub audit_retention_days: u32,
@@ -393,6 +439,7 @@ impl Default for GlobalSettings {
             default_timezone: "UTC".into(),
             default_max_attempts: 3,
             default_timeout_seconds: 3_600,
+            default_completion_deadline_seconds: DEFAULT_COMPLETION_DEADLINE_SECONDS,
             lease_seconds: 60,
             heartbeat_seconds: 10,
             audit_retention_days: 90,
@@ -412,6 +459,9 @@ impl GlobalSettings {
         if self.default_timeout_seconds == 0 {
             bail!("default_timeout_seconds must be at least one");
         }
+        if self.default_completion_deadline_seconds == 0 {
+            bail!("default_completion_deadline_seconds must be at least one");
+        }
         if self.heartbeat_seconds < 5 {
             bail!("heartbeat_seconds must be at least five");
         }
@@ -430,6 +480,10 @@ impl GlobalSettings {
         }
         Ok(())
     }
+}
+
+const fn default_completion_deadline_seconds() -> u64 {
+    DEFAULT_COMPLETION_DEADLINE_SECONDS
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -531,6 +585,15 @@ mod tests {
         settings = GlobalSettings::default();
         settings.otlp_endpoint = Some("file:///tmp/collector".into());
         assert!(settings.validate().is_err());
+
+        settings = GlobalSettings::default();
+        settings.default_completion_deadline_seconds = 0;
+        assert!(settings.validate().is_err());
+
+        let policy = ScheduleObservabilityPolicy {
+            completion_deadline_seconds: Some(0),
+        };
+        assert!(policy.validate().is_err());
     }
 
     #[test]

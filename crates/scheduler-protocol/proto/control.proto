@@ -41,6 +41,8 @@ message AttemptAccepted {
   string agent_id = 1;
   string attempt_id = 2;
   string lease_token = 3;
+  optional string traceparent = 4;
+  optional string tracestate = 5;
 }
 
 message AttemptResult {
@@ -48,6 +50,8 @@ message AttemptResult {
   string attempt_id = 2;
   string lease_token = 3;
   string result_json = 4;
+  optional string traceparent = 5;
+  optional string tracestate = 6;
 }
 
 // Rejection happens before durable acceptance and therefore does not consume
@@ -58,6 +62,8 @@ message AttemptRejected {
   string attempt_id = 2;
   string lease_token = 3;
   string code = 4;
+  optional string traceparent = 5;
+  optional string tracestate = 6;
 }
 
 message SettingsApplied {
@@ -87,6 +93,8 @@ message CoordinatorMessage {
 
 message Assignment {
   string assignment_json = 1;
+  optional string traceparent = 2;
+  optional string tracestate = 3;
 }
 
 message CancelAttempt {
